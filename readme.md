@@ -157,10 +157,10 @@ emoji         2.11.0   (optional, for emoji stripping)
 Edit the constants near the top of the script before running:
 
 ```python
-BASE_MODEL   = "D:/HF_Models/phi-2"           # Path to your base model
-OUTPUT_DIR   = "D:/Trainer_Data/Merged_model"  # Where checkpoints and merged model are saved
-HF_ROOT      = r"D:\HF_Cache"                 # HuggingFace cache root
-TMP_ROOT     = r"D:\HF_Temp"                  # Temp directory
+BASE_MODEL   = "C:/Your/Path"           # Path to your base model
+OUTPUT_DIR   = ""C:/Your/Path"  # Where checkpoints and merged model are saved
+HF_ROOT      = r"C:\HF_Cache"                 # HuggingFace cache root
+TMP_ROOT     = r"C:\HF_Temp"                  # Temp directory
 
 BATCH_SIZE   = 1      # Per-device batch size
 GRAD_ACCUM   = 12     # Gradient accumulation steps (effective batch = 12)
