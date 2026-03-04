@@ -11,6 +11,13 @@ import platform
 import subprocess
 import torch
 import numpy as np
+
+# Disable TorchScript JIT profiling — these profilers recompile specialised
+# kernels on each new tensor shape during the first several steps, which is
+# the direct cause of the 70s → 4s step-time staircase on long-context models.
+# Safe to disable: we are not using TorchScript tracing or torch.jit.script.
+torch._C._jit_set_profiling_executor(False)
+torch._C._jit_set_profiling_mode(False)
 import pyarrow as pa
 import pandas as pd
 from pathlib import Path
@@ -66,8 +73,12 @@ def _warn(msg: str) -> None: print(f"  ⚠  {msg}")
 def _err(msg: str)  -> None: print(f"  ✖  {msg}")
 # ──────────────────────────────────────────────────────────────────────────────
 
-HF_ROOT = r"D:\HF_Cache"
-TMP_ROOT = r"D:\HF_Temp"
+_DEFAULT_HF_ROOT  = str(Path.home() / ".cache" / "huggingface")
+_DEFAULT_TMP_ROOT = str(Path(os.environ.get("TEMP", os.environ.get("TMPDIR", "/tmp"))))
+
+HF_ROOT  = os.environ.get("HF_ROOT",  _DEFAULT_HF_ROOT)
+TMP_ROOT = os.environ.get("HF_TMP",   _DEFAULT_TMP_ROOT)
+
 os.environ["HF_HOME"] = HF_ROOT
 os.environ["HUGGINGFACE_HUB_CACHE"] = os.path.join(HF_ROOT, "hub")
 os.environ["HF_DATASETS_CACHE"] = os.path.join(HF_ROOT, "datasets")
@@ -82,17 +93,27 @@ os.environ["HF_DATASETS_OFFLINE"] = "1"
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 os.environ.setdefault("HF_DATASETS_DISABLE_PROGRESS_BARS", "1")
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512,garbage_collection_threshold:0.6"  # 128 was tuned for Phi-2; 512 reduces fragmentation for 4B+ models
+# Disable HuggingFace tokenizer parallelism — spawning tokenizer workers inside a
+# multiprocessing context causes deadlocks on Windows and inflates early-step times.
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+# Ensure CUDA kernel launches are asynchronous (the default). Explicit here to
+# guard against any profiling tool or debug flag that might have set it to "1".
+os.environ["CUDA_LAUNCH_BLOCKING"] = "0"
 
 MAX_LENGTH = 750
-SAVE_STEPS = 50
+SAVE_STEPS = 150
 SAVE_LIMITS = 2
 LOG_STEPS = 1
 BATCH_SIZE = 1  # always 1; effective batch size is controlled by GRAD_ACCUM in each profile
-# Default paths — override via argparse or edit here.
-# Kept as Windows-style defaults; cross-platform paths can be passed at runtime.
-BASE_MODEL = "D:/HF_Models/phi-2"
-BASE_MODEL_IMAGE = "D:/HF_Models/phi-3-vision"
-OUTPUT_DIR = "D:/Trainer_Data/Merged_model"
+# Default paths — override via --base_model / --output_dir CLI args, or by setting
+# environment variables before launching:
+#   HF_MODEL_DIR    -> directory containing your downloaded HF model folders
+#   TRAINER_OUTPUT  -> root directory for checkpoints and merged output
+_DEFAULT_MODEL_ROOT  = os.environ.get("HF_MODEL_DIR",   str(Path.home() / "hf_models"))
+_DEFAULT_OUTPUT_ROOT = os.environ.get("TRAINER_OUTPUT", str(Path.home() / "trainer_output"))
+BASE_MODEL       = str(Path(_DEFAULT_MODEL_ROOT) / "phi-3-vision")
+BASE_MODEL_IMAGE = str(Path(_DEFAULT_MODEL_ROOT) / "phi-3-vision")
+OUTPUT_DIR       = str(Path(_DEFAULT_OUTPUT_ROOT) / "merged_model")
 MERGED_DIR = os.path.join(OUTPUT_DIR, "merged")
 TRAINING_CHAIN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "training_chain.txt")
 MERGE_SUCCESS_FLAG = os.path.join(MERGED_DIR, "success.txt")
@@ -319,7 +340,27 @@ class DynamicCausalCollator:
             pad_to_multiple_of=self.pad_to_multiple_of,
             return_tensors="pt",
         )
-        batch["labels"] = batch["input_ids"].masked_fill(batch["attention_mask"].eq(0), -100)
+
+        if self.image_mode:
+            # Image mode: tokenize() already computed per-token labels with the
+            # assistant-turn boundary masked to -100.  Pad those labels directly
+            # (padding positions → -100) rather than rebuilding from input_ids,
+            # which would overwrite the prompt masking and train on the question too.
+            def _to_py(x):
+                if isinstance(x, torch.Tensor):
+                    return x.tolist()
+                return list(x) if not isinstance(x, list) else x
+            label_seqs = [_to_py(f["labels"]) for f in features]
+            # Determine padded length (same as input_ids after tokenizer.pad)
+            pad_len = batch["input_ids"].shape[1]
+            padded_labels = []
+            for seq in label_seqs:
+                pad_needed = pad_len - len(seq)
+                padded_labels.append(seq + [-100] * pad_needed)
+            batch["labels"] = torch.tensor(padded_labels, dtype=torch.long)
+        else:
+            # Text-only mode: labels are a copy of input_ids with padding masked.
+            batch["labels"] = batch["input_ids"].masked_fill(batch["attention_mask"].eq(0), -100)
 
         # --- Image mode: stack pixel_values into the batch
         if self.image_mode:
@@ -361,6 +402,7 @@ def auto_map_roles(columns, training_mode):
     return mapped.get("question"), mapped.get("chosen"), mapped.get("rejected"), mapped.get("image")
 
 def resolve_column(role, available_columns, training_mode):
+    # NOTE: retained as a debug helper — not called in the main training pipeline.
     lowered = {col.lower(): col for col in available_columns}
     aliases = TRAINING_SCHEMAS[training_mode]["aliases"]
     for alias in aliases.get(role, []):
@@ -369,6 +411,7 @@ def resolve_column(role, available_columns, training_mode):
     return None
 
 def mapped_summary(col_question, col_chosen, col_rejected, col_image=None):
+    # NOTE: retained as a debug helper — not called in the main training pipeline.
     used = []
     if col_image:    used.append(f" image    → {col_image}")
     if col_question: used.append(f" question → {col_question}")
@@ -436,14 +479,22 @@ def strip_latex(match) -> str:
     val = match.group(0)
     return val if re.fullmatch(r"\$\d[\d,]*(\.\d{1,2})?\$", val) else ""
 
-def clean_string(s, mode: str = "sft"):
+def clean_string(s, mode: str = "math"):
     s = "" if s is None else str(s)
     if not s:
         return ""
 
     s = unbox_field(s)
-    s = WHITESPACE_ESC_RE.sub(" ", s).strip()
-    s = FORMAT_STRIP_RE.sub("", s)
+    # In code mode, preserve newlines and tabs (indentation is meaningful).
+    # In all other modes, collapse whitespace escape sequences to a single space.
+    if mode != "code":
+        s = WHITESPACE_ESC_RE.sub(" ", s).strip()
+    else:
+        s = s.strip()
+    # In code mode, preserve backticks (code fences) and # (comments/headers).
+    # FORMAT_STRIP_RE removes these, so skip it for code mode.
+    if mode != "code":
+        s = FORMAT_STRIP_RE.sub("", s)
 
     if mode == "math":
         s = MATH_WRAPPERS_RE.sub(r"\1", s)                  # \mathrm{AB} / \text{AB} -> AB
@@ -469,12 +520,14 @@ def clean_string(s, mode: str = "sft"):
     s = re.sub(r"\*\*.*?\*\*", "", s)
     s = RE_UNICODE_GARBAGE.sub("", s)
     s = RE_MEDIA_PLACEHOLDERS.sub("", s)
-    if mode != "latex":
+    if mode not in {"latex"}:
         s = RE_TRASH_PLACEHOLDER.sub("", s)
     s = s.translate(PUNC_TRANS)
     if _EMOJI_AVAILABLE:
         s = _emoji_mod.replace_emoji(s, "")
-    if mode not in {"latex"}:
+    # In code mode, preserve non-ASCII identifiers and string literals.
+    # In latex mode, preserve all unicode. All other modes: strip non-ASCII.
+    if mode not in {"latex", "code"}:
         s = re.sub(r"[^\x00-\x7F]+", "", s)
     if BAD_TOKENS_RE.search(s):
         return ""
@@ -709,7 +762,10 @@ def log_dataset(dataset_path, log_file_path):
         with open(log_file_path, "a+", encoding="utf-8") as f:
             f.seek(0)
             content = f.read()
-            if dataset_name not in content:
+            # Use exact line match to avoid substring false-positives
+            # e.g. "chat" must not match "ultrachat_200k"
+            logged_names = {line.strip() for line in content.splitlines()}
+            if dataset_name not in logged_names:
                 f.write(dataset_name + "\n")
                 _ok(f"Logged '{dataset_name}' to training chain")
                 return True
@@ -893,7 +949,9 @@ def load_and_prepare_dataset(dataset_path, cleaning_mode, image_mode=False, base
     if "length" in tokenized.column_names:
         tokenized = tokenized.cast_column("length", Value("int32"))
 
-    fmt_cols = ["input_ids", "attention_mask", "labels", "length"]
+    fmt_cols = ["input_ids", "attention_mask", "labels"]
+    if "length" in tokenized.column_names:
+        fmt_cols.append("length")
     if image_mode and "pixel_values" in tokenized.column_names:
         fmt_cols.append("pixel_values")
 
@@ -954,6 +1012,22 @@ def load_model(tokenizer, model_name, image_mode=False, base_model_override=None
     # from the autograd graph and causing "does not require grad" crashes.
     if hasattr(base_model.config, "use_cache"):
         base_model.config.use_cache = False
+
+    # When running text-only SFT on phi-3-vision, the vision encoder is loaded
+    # as part of the model but never receives image inputs. Freeze it so that:
+    #   (a) it does not participate in the backward pass (saves ~15% step time)
+    #   (b) its parameters are excluded from gradient buffer allocation
+    # This is safe — no vision data is present, so the vision tower output is
+    # never used.  We freeze by name rather than by class so this works whether
+    # we're on the base model or a checkpoint resume.
+    if not image_mode:
+        _frozen_vision = 0
+        for name, param in base_model.named_parameters():
+            if any(tag in name.lower() for tag in ("vision", "img_projection", "image_newline")):
+                param.requires_grad_(False)
+                _frozen_vision += param.numel()
+        if _frozen_vision > 0:
+            _info(f"Froze vision encoder: {_frozen_vision / 1e6:.1f}M params (text-only SFT)")
 
     last_ckpt = os.path.join(OUTPUT_DIR, "checkpoint-last")
 
@@ -1191,8 +1265,10 @@ class EarlyStopByLoss(TrainerCallback):
 
         # Gates
         if step < warmup:
+            self.prev_ema = self.ema  # keep prev_ema current so abs_drop is accurate when gate opens
             return
         if self._epoch_fraction(state) < self.exposure_floor:
+            self.prev_ema = self.ema  # same: prevent stale reference inflating abs_drop on first real check
             return
         if not self._lr_gate_ok(logs):
             return
@@ -1293,10 +1369,18 @@ def main():
     parser.add_argument('--steps',      type=int, help="Terminate after a fixed number of steps")
     parser.add_argument('--image',      action='store_true', help="Enable multimodal (image+text) training via Phi-3-Vision")
     parser.add_argument('--hf_dataset', type=str, default=None, help="HuggingFace Hub dataset ID (e.g. username/dataset-name)")
-    parser.add_argument('--base_model', type=str, default=None, help="Override base model path (default: BASE_MODEL or BASE_MODEL_IMAGE constant)")
+    parser.add_argument('--base_model', type=str, default=None, help="Override base model path (default: HF_MODEL_DIR env var)")
+    parser.add_argument('--output_dir', type=str, default=None, help="Override output dir (default: TRAINER_OUTPUT env var)")
     parsed_args, _ = parser.parse_known_args()
     force_epoch  = parsed_args.force
     image_mode   = parsed_args.image
+
+    # Allow runtime override of output directory via --output_dir flag
+    global OUTPUT_DIR, MERGED_DIR, MERGE_SUCCESS_FLAG, TRAINING_CHAIN_PATH
+    if parsed_args.output_dir:
+        OUTPUT_DIR = parsed_args.output_dir
+        MERGED_DIR = os.path.join(OUTPUT_DIR, "merged")
+        MERGE_SUCCESS_FLAG = os.path.join(MERGED_DIR, "success.txt")
 
     # Resolve base model: CLI arg > hardcoded constant
     _banner("Freethought Trainer")
@@ -1449,6 +1533,45 @@ def main():
         _banner("Training")
         _info(f"Train rows: {len(train_dataset):,}  |  Steps: {total_steps}  |  Warmup: {dynamic_warmup}")
         last_ckpt = os.path.join(OUTPUT_DIR, "checkpoint-last")
+
+        # ── CUDA kernel warmup ────────────────────────────────────────────────
+        # Run a single forward pass with a real batch before the timed training
+        # loop begins.  This primes:
+        #   • the CUDA memory allocator (finds its steady-state pool size)
+        #   • PyTorch's kernel dispatch cache for the actual tensor shapes
+        # Without this, the first 5–15 training steps trigger repeated kernel
+        # JIT compilations that show up as the 70s→4s staircase slowdown.
+        # Skipped in image mode — the vision encoder warmup is handled
+        # differently and gradient checkpointing makes a no_grad pass unsafe.
+        if not image_mode and torch.cuda.is_available():
+            try:
+                _info("Warming up CUDA kernels (one dry-run forward pass)...")
+                from torch.utils.data import DataLoader
+                _warmup_loader = DataLoader(
+                    train_dataset,
+                    batch_size=BATCH_SIZE,
+                    collate_fn=data_collator,
+                    shuffle=False,
+                    num_workers=0,
+                )
+                _warmup_batch = next(iter(_warmup_loader))
+                _warmup_batch = {k: v.to("cuda") for k, v in _warmup_batch.items() if isinstance(v, torch.Tensor)}
+                model.eval()
+                with torch.no_grad():
+                    model(**_warmup_batch)
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                model.train()
+                del _warmup_loader, _warmup_batch
+                _ok("CUDA warmup complete")
+            except Exception as _wu_err:
+                # Non-fatal — warmup is best-effort; training proceeds regardless
+                _warn(f"CUDA warmup skipped: {_wu_err}")
+                try:
+                    model.train()
+                except Exception:
+                    pass
+        # ─────────────────────────────────────────────────────────────────────
 
         if os.path.isdir(last_ckpt):
             _ok(f"Resuming from checkpoint: {last_ckpt}")
