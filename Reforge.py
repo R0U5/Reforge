@@ -13,8 +13,8 @@ import torch
 import numpy as np
 
 # Disable TorchScript JIT profiling — these profilers recompile specialised
-# kernels on each new tensor shape during the first several steps, which is
-# the direct cause of the 70s → 4s step-time staircase on long-context models.
+# kernels on each new tensor shape during the first several steps, which can
+# cause significant step-time variance during early training.
 # Safe to disable: we are not using TorchScript tracing or torch.jit.script.
 torch._C._jit_set_profiling_executor(False)
 torch._C._jit_set_profiling_mode(False)
@@ -92,7 +92,7 @@ os.environ["TRANSFORMERS_OFFLINE"] = "1"
 os.environ["HF_DATASETS_OFFLINE"] = "1"
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 os.environ.setdefault("HF_DATASETS_DISABLE_PROGRESS_BARS", "1")
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512,garbage_collection_threshold:0.6"  # 128 was tuned for Phi-2; 512 reduces fragmentation for 4B+ models
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512,garbage_collection_threshold:0.6"  # 512 reduces fragmentation for 4B+ models; lower to 128 for smaller models if needed
 # Disable HuggingFace tokenizer parallelism — spawning tokenizer workers inside a
 # multiprocessing context causes deadlocks on Windows and inflates early-step times.
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -111,8 +111,11 @@ BATCH_SIZE = 1  # always 1; effective batch size is controlled by GRAD_ACCUM in 
 #   TRAINER_OUTPUT  -> root directory for checkpoints and merged output
 _DEFAULT_MODEL_ROOT  = os.environ.get("HF_MODEL_DIR",   str(Path.home() / "hf_models"))
 _DEFAULT_OUTPUT_ROOT = os.environ.get("TRAINER_OUTPUT", str(Path.home() / "trainer_output"))
-BASE_MODEL       = str(Path(_DEFAULT_MODEL_ROOT) / "phi-3-vision")
-BASE_MODEL_IMAGE = str(Path(_DEFAULT_MODEL_ROOT) / "phi-3-vision")
+# Default base model — set via --base_model CLI arg or HF_MODEL_DIR env var.
+# There is no built-in default model: the user must provide one explicitly
+# or place a model directory under HF_MODEL_DIR.
+BASE_MODEL       = str(Path(_DEFAULT_MODEL_ROOT))
+BASE_MODEL_IMAGE = str(Path(_DEFAULT_MODEL_ROOT))
 OUTPUT_DIR       = str(Path(_DEFAULT_OUTPUT_ROOT) / "merged_model")
 MERGED_DIR = os.path.join(OUTPUT_DIR, "merged")
 TRAINING_CHAIN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "training_chain.txt")
@@ -157,8 +160,8 @@ MODEL_PROFILES = {
         "enable_input_grads":    False,
     },
     # phi-3-vision MUST appear before "phi-3" — first-match-wins.
-    # Phi3VForCausalLM (the vision model class) does not support SDPA in
-    # transformers 4.37.x even in text-only mode, so it must stay on eager.
+    # The Phi-3 vision model class does not support SDPA in some transformers
+    # versions even in text-only mode, so it must stay on eager.
     "phi-3-vision": {
         "attn_implementation":   "eager",
         "trust_remote_code":     True,
@@ -190,9 +193,66 @@ MODEL_PROFILES = {
         "enable_input_grads":    True,
     },
     # ── Add new models below this line ────────────────────────────────────────
-    # "mistral": { ... },
-    # "llama":   { ... },
-    # "qwen":    { ... },
+    "llama-3": {
+        "attn_implementation":   "sdpa",
+        "trust_remote_code":     False,
+        "use_fast_tokenizer":    True,
+        "inject_special_tokens": False,
+        "resize_embeddings":     False,
+        "lora_r":                16,
+        "lora_alpha":            32,
+        "lora_targets":          ["q_proj", "k_proj", "v_proj", "o_proj"],
+        "modules_to_save":       None,
+        "grad_accum":            8,
+        "learning_rate":         2e-5,
+        "safe_serialization":    True,
+        "enable_input_grads":    False,
+    },
+    "mistral": {
+        "attn_implementation":   "sdpa",
+        "trust_remote_code":     False,
+        "use_fast_tokenizer":    True,
+        "inject_special_tokens": False,
+        "resize_embeddings":     False,
+        "lora_r":                16,
+        "lora_alpha":            32,
+        "lora_targets":          ["q_proj", "k_proj", "v_proj", "o_proj"],
+        "modules_to_save":       None,
+        "grad_accum":            8,
+        "learning_rate":         2e-5,
+        "safe_serialization":    True,
+        "enable_input_grads":    False,
+    },
+    "qwen": {
+        "attn_implementation":   "sdpa",
+        "trust_remote_code":     True,
+        "use_fast_tokenizer":    True,
+        "inject_special_tokens": False,
+        "resize_embeddings":     False,
+        "lora_r":                16,
+        "lora_alpha":            32,
+        "lora_targets":          ["q_proj", "k_proj", "v_proj", "o_proj"],
+        "modules_to_save":       None,
+        "grad_accum":            8,
+        "learning_rate":         2e-5,
+        "safe_serialization":    True,
+        "enable_input_grads":    False,
+    },
+    "gemma": {
+        "attn_implementation":   "sdpa",
+        "trust_remote_code":     False,
+        "use_fast_tokenizer":    True,
+        "inject_special_tokens": False,
+        "resize_embeddings":     False,
+        "lora_r":                16,
+        "lora_alpha":            32,
+        "lora_targets":          ["q_proj", "k_proj", "v_proj", "o_proj"],
+        "modules_to_save":       None,
+        "grad_accum":            8,
+        "learning_rate":         2e-5,
+        "safe_serialization":    True,
+        "enable_input_grads":    False,
+    },
     # ─────────────────────────────────────────────────────────────────────────
 }
 
@@ -234,7 +294,8 @@ def _resolve_model_name(merged_dir: str, merge_success_flag: str, base_model: st
     return base_model
 
 
-def roc(label: str = "") -> None:
+def gpu_cleanup(label: str = "") -> None:
+    """Synchronize CUDA, run Python GC, and release cached GPU memory."""
     MiB = 1024 * 1024
 
     if not torch.cuda.is_available():
@@ -258,7 +319,7 @@ def roc(label: str = "") -> None:
     freed_reserved = (before_res   - after_res)   / MiB
     freed_driver   = (free_after   - free_before) / MiB
 
-    def log_roc(label, freed_objs, freed_alloc, freed_reserved, freed_driver, eps=0.05):
+    def log_gpu_cleanup(label, freed_objs, freed_alloc, freed_reserved, freed_driver, eps=0.05):
         parts = []
         if freed_objs > 0:
             parts.append(f"{freed_objs} objs")
@@ -272,7 +333,7 @@ def roc(label: str = "") -> None:
             tag = f" [{label}]" if label else ""
             _info(f"GC{tag}: " + "  |  ".join(parts))
 
-    log_roc(label, freed_objs, freed_alloc, freed_reserved, freed_driver)
+    log_gpu_cleanup(label, freed_objs, freed_alloc, freed_reserved, freed_driver)
 
 
 
@@ -374,19 +435,6 @@ class DynamicCausalCollator:
 
         return batch
 
-def compute_metrics(eval_pred):
-    """Reserved for future eval use. Not wired to Trainer by default (eval_dataset=None)."""
-    logits, labels = eval_pred
-    # Use from_numpy to avoid an unnecessary copy when inputs are already numpy arrays
-    shift_logits = torch.from_numpy(logits[..., :-1, :].copy())
-    shift_labels = torch.from_numpy(labels[..., 1:].copy()).long()
-    loss_fct = torch.nn.CrossEntropyLoss(ignore_index=-100)
-    loss = loss_fct(shift_logits.reshape(-1, shift_logits.size(-1)), shift_labels.reshape(-1))
-    try:
-        perplexity = math.exp(loss.item())
-    except OverflowError:
-        perplexity = float("inf")
-    return {"perplexity": perplexity, "eval_loss": loss.item()}
 
 def auto_map_roles(columns, training_mode):
     lowered = {col.lower(): col for col in columns}
@@ -401,30 +449,8 @@ def auto_map_roles(columns, training_mode):
                 break
     return mapped.get("question"), mapped.get("chosen"), mapped.get("rejected"), mapped.get("image")
 
-def resolve_column(role, available_columns, training_mode):
-    # NOTE: retained as a debug helper — not called in the main training pipeline.
-    lowered = {col.lower(): col for col in available_columns}
-    aliases = TRAINING_SCHEMAS[training_mode]["aliases"]
-    for alias in aliases.get(role, []):
-        if alias in lowered:
-            return lowered[alias]
-    return None
 
-def mapped_summary(col_question, col_chosen, col_rejected, col_image=None):
-    # NOTE: retained as a debug helper — not called in the main training pipeline.
-    used = []
-    if col_image:    used.append(f" image    → {col_image}")
-    if col_question: used.append(f" question → {col_question}")
-    if col_chosen: used.append(f" chosen   → {col_chosen}")
-    if col_rejected: used.append(f" rejected → {col_rejected}")
-    if used:
-        print("\nMapped Roles:")
-        for line in used:
-            print(" ", line)
-    else:
-        print("No usable column roles mapped!")
-
-#Garbage in -> diamonds out
+# ── Text cleaning / normalization ─────────────────────────────────────────
 RE_LATEX_INLINE = re.compile(r"(?<!\$)\$(?:\\.|[^$\\])+\$(?!\$)")                   # $...$
 ANSWER_MARKER_RE = re.compile(r'^\s*#{3,6}\s*(?:final\s*answer\s*:)?\s*(?:answer\s*:)?\s*', re.I)
 RE_TEX_INLINE = re.compile(r"\\\((?:\\.|[^\\])+\\\)|\\\[(?:\\.|[^\\])+\\\]", re.DOTALL)  # \(...\) or \[...\]
@@ -564,6 +590,7 @@ def synthesize_prompt_dataset(raw_dataset, col_question, col_chosen, col_rejecte
             return result
 
         # num_proc=1: Arrow map with image columns is not fork-safe on Windows
+        # and some Linux configurations
         # writer_batch_size=50: flush to disk every 50 rows — prevents large RAM accumulation
         processed = raw_dataset.map(
             build_multimodal_row,
@@ -669,9 +696,18 @@ def tokenize(example, tokenizer, training_mode="sft", max_length=MAX_LENGTH, pro
             print(f"[WARN] Skipping unreadable image: {e}")
             return {"input_ids": [], "attention_mask": [], "labels": [], "pixel_values": None}
 
-        # Phi-3-Vision prompt format
+        # Build prompt using the model's chat template if available,
+        # falling back to a generic format.
         text = example.get("text", "")
-        prompt = f"<|user|>\n<|image_1|>\n{text}<|end|>\n<|assistant|>"
+        if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template:
+            messages = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": text}]}]
+            try:
+                prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            except Exception:
+                # Fallback for models whose chat template doesn't support image tokens
+                prompt = f"<|user|>\n<|image_1|>\n{text}<|end|>\n<|assistant|>"
+        else:
+            prompt = f"<|user|>\n<|image_1|>\n{text}<|end|>\n<|assistant|>"
         encoded = processor(
             text=prompt,
             images=image,
@@ -683,26 +719,30 @@ def tokenize(example, tokenizer, training_mode="sft", max_length=MAX_LENGTH, pro
         attention_mask = encoded["attention_mask"][0].tolist()
         pixel_values   = encoded["pixel_values"][0]
 
-        # --- Fix 5: mask question/image tokens so only the answer is supervised.
-        # Find the assistant turn boundary — everything from <|assistant|> onward
-        # is the answer we want to train on; everything before gets -100.
-        # Phi-3-Vision uses token ID for "<|assistant|>" as the boundary marker.
-        assistant_token_ids = tokenizer.encode("<|assistant|>", add_special_tokens=False)
+        # --- Mask question/image tokens so only the answer is supervised.
+        # Find the assistant turn boundary — everything after the assistant
+        # marker is the answer we want to train on; everything before gets -100.
+        # Common markers: "<|assistant|>" (Phi-3), "<|start_header_id|>assistant"
+        # (Llama 3), "<|im_start|>assistant" (Qwen/ChatML).
+        _assistant_markers = ["<|assistant|>", "<|start_header_id|>assistant", "<|im_start|>assistant"]
         labels = [-100] * len(input_ids)
-        if assistant_token_ids:
-            # Find last occurrence of the assistant marker (handles edge cases where
-            # the string "<|assistant|>" might appear in the question text)
-            a_id = assistant_token_ids[0]
-            boundary = -1
+        boundary = -1
+        for marker in _assistant_markers:
+            marker_ids = tokenizer.encode(marker, add_special_tokens=False)
+            if not marker_ids:
+                continue
+            a_id = marker_ids[0]
             for i in range(len(input_ids) - 1, -1, -1):
                 if input_ids[i] == a_id:
-                    boundary = i + 1  # supervise from the token AFTER <|assistant|>
+                    boundary = i + 1
                     break
             if boundary > 0:
-                labels[boundary:] = input_ids[boundary:]
-            else:
-                # Fallback: if marker not found, supervise full sequence
-                labels = list(input_ids)
+                break
+        if boundary > 0:
+            labels[boundary:] = input_ids[boundary:]
+        else:
+            # Fallback: if no assistant marker found, supervise full sequence
+            labels = list(input_ids)
 
         return {
             "input_ids":      [int(x) for x in input_ids],
@@ -846,7 +886,7 @@ def load_and_prepare_dataset(dataset_path, cleaning_mode, image_mode=False, base
     if os.path.exists(MERGE_SUCCESS_FLAG):
         _ok(f"Resuming from previous merged model: {MERGED_DIR}")
     else:
-        base_label = "image base (Phi-3-Vision)" if image_mode else f"text base ({os.path.basename(_default_base)})"
+        base_label = "image base (vision model)" if image_mode else f"text base ({os.path.basename(_default_base)})"
         if base_model_override:
             base_label = f"override: {base_model_override}"
         _info(f"Base model: {model_name}")
@@ -855,7 +895,7 @@ def load_and_prepare_dataset(dataset_path, cleaning_mode, image_mode=False, base
     profile = resolve_model_profile(model_name)
     processor = None
     if image_mode:
-        _info("Loading AutoProcessor (Phi-3-Vision)...")
+        _info("Loading AutoProcessor for vision model...")
         processor = AutoProcessor.from_pretrained(
             model_name,
             trust_remote_code=True,
@@ -956,7 +996,7 @@ def load_and_prepare_dataset(dataset_path, cleaning_mode, image_mode=False, base
         fmt_cols.append("pixel_values")
 
     tokenized.set_format(type="torch", columns=fmt_cols)
-    roc()
+    gpu_cleanup()
 
     train_dataset = tokenized
     eval_dataset = None
@@ -984,15 +1024,15 @@ def load_model(tokenizer, model_name, image_mode=False, base_model_override=None
 
     if image_mode:
         _banner("Model")
-        _info("Loading Phi-3-Vision (AutoModelForVision2Seq)...")
+        _info(f"Loading {os.path.basename(model_name)} (AutoModelForVision2Seq)...")
         base_model = AutoModelForVision2Seq.from_pretrained(
             model_name,
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
             local_files_only=True,
-            # Vision models stay on eager — Phi-3-Vision's vision encoder is
-            # incompatible with SDPA's dispatcher. flash_attention_2 is also
-            # unavailable on Windows 11.
+            # Vision models stay on eager — many vision encoders are
+            # incompatible with SDPA's dispatcher, and flash_attention_2
+            # is unavailable on Windows.
             _attn_implementation="eager",
         ).to("cuda")
     else:
@@ -1013,7 +1053,7 @@ def load_model(tokenizer, model_name, image_mode=False, base_model_override=None
     if hasattr(base_model.config, "use_cache"):
         base_model.config.use_cache = False
 
-    # When running text-only SFT on phi-3-vision, the vision encoder is loaded
+    # When running text-only SFT on a vision model, the vision encoder is loaded
     # as part of the model but never receives image inputs. Freeze it so that:
     #   (a) it does not participate in the backward pass (saves ~15% step time)
     #   (b) its parameters are excluded from gradient buffer allocation
@@ -1078,7 +1118,7 @@ def load_model(tokenizer, model_name, image_mode=False, base_model_override=None
 
         # Resize BEFORE wrapping with LoRA so new embedding rows are covered by
         # the adapter and the gradient graph stays intact. Only done for models
-        # that inject special tokens (currently Phi-2 only).
+        # that inject special tokens (see inject_special_tokens in model profiles).
         if profile["resize_embeddings"] and tokenizer.added_tokens_encoder:
             _info(f"Resizing embeddings: +{len(tokenizer.added_tokens_encoder)} new tokens")
             base_model.resize_token_embeddings(len(tokenizer))
@@ -1105,7 +1145,7 @@ def load_model(tokenizer, model_name, image_mode=False, base_model_override=None
 
     print_trainable_parameters(model)
 
-    # Gradient checkpointing for image mode — saves ~3-4 GB VRAM on 12 GB card
+    # Gradient checkpointing for image mode — trades compute for VRAM savings
     if image_mode:
         _info("Gradient checkpointing enabled (VRAM optimisation)")
         model.gradient_checkpointing_enable()
@@ -1336,8 +1376,10 @@ def dynamic_early_stop_cap(steps_total):
     return round(cap, 4)
     
 def select_file() -> str:
+    """Open a native file picker, falling back to text input on failure."""
     try:
-        if platform.system() == "Windows":
+        system = platform.system()
+        if system == "Windows":
             ps_script = r"""
 Add-Type -AssemblyName System.Windows.Forms | Out-Null
 $ofd = New-Object System.Windows.Forms.OpenFileDialog
@@ -1355,9 +1397,31 @@ if ($ofd.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
             path = (proc.stdout or "").strip()
             if path:
                 return path
-    except Exception as e:
-        _warn(f"PowerShell file picker failed — falling back to text input")
-    return input("Dataset path (.parquet): ").strip()
+        elif system == "Darwin":
+            proc = subprocess.run(
+                ["osascript", "-e",
+                 'POSIX path of (choose file of type {"parquet"} with prompt "Select a Parquet file")'],
+                capture_output=True, text=True, check=False
+            )
+            path = (proc.stdout or "").strip()
+            if path:
+                return path
+        elif system == "Linux":
+            # Try zenity (GTK), then kdialog (KDE)
+            for cmd in [
+                ["zenity", "--file-selection", "--file-filter=Parquet files | *.parquet", "--title=Select a Parquet file"],
+                ["kdialog", "--getopenfilename", ".", "*.parquet"],
+            ]:
+                try:
+                    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+                    path = (proc.stdout or "").strip()
+                    if path:
+                        return path
+                except FileNotFoundError:
+                    continue
+    except Exception:
+        _warn("File picker unavailable — falling back to text input")
+    return input("Dataset path (.parquet or HF Hub ID): ").strip()
 
 
 def main():
@@ -1367,7 +1431,7 @@ def main():
     parser.add_argument('--code',       action='store_true', help="Preserve code formatting and indentation")
     parser.add_argument('--epoch',      type=int, default=1, help="Number of training epochs (default: 1)")
     parser.add_argument('--steps',      type=int, help="Terminate after a fixed number of steps")
-    parser.add_argument('--image',      action='store_true', help="Enable multimodal (image+text) training via Phi-3-Vision")
+    parser.add_argument('--image',      action='store_true', help="Enable multimodal (image+text) training")
     parser.add_argument('--hf_dataset', type=str, default=None, help="HuggingFace Hub dataset ID (e.g. username/dataset-name)")
     parser.add_argument('--base_model', type=str, default=None, help="Override base model path (default: HF_MODEL_DIR env var)")
     parser.add_argument('--output_dir', type=str, default=None, help="Override output dir (default: TRAINER_OUTPUT env var)")
@@ -1383,7 +1447,7 @@ def main():
         MERGE_SUCCESS_FLAG = os.path.join(MERGED_DIR, "success.txt")
 
     # Resolve base model: CLI arg > hardcoded constant
-    _banner("Freethought Trainer")
+    _banner("Reforge")
     if parsed_args.base_model:
         resolved_base = parsed_args.base_model
         _info(f"Base model override: {resolved_base}")
@@ -1422,7 +1486,7 @@ def main():
             _warn(f"Could not auto-detect cleaning mode: {e}")
 
     if image_mode:
-        _info("Image mode enabled (Phi-3-Vision / multimodal)")
+        _info("Image mode enabled (multimodal vision+text)")
 
     train_dataset, eval_dataset, tokenizer, training_mode, model_name, processor = load_and_prepare_dataset(
         dataset_path, cleaning_mode, image_mode=image_mode, base_model_override=resolved_base
@@ -1528,7 +1592,7 @@ def main():
 
         if total_steps < 1:
             _err("Not enough data to train!")
-            exit()
+            sys.exit(1)
 
         _banner("Training")
         _info(f"Train rows: {len(train_dataset):,}  |  Steps: {total_steps}  |  Warmup: {dynamic_warmup}")
@@ -1539,8 +1603,8 @@ def main():
         # loop begins.  This primes:
         #   • the CUDA memory allocator (finds its steady-state pool size)
         #   • PyTorch's kernel dispatch cache for the actual tensor shapes
-        # Without this, the first 5–15 training steps trigger repeated kernel
-        # JIT compilations that show up as the 70s→4s staircase slowdown.
+        # Without this, the first several training steps trigger repeated kernel
+        # JIT compilations that show up as step-time variance during early training.
         # Skipped in image mode — the vision encoder warmup is handled
         # differently and gradient checkpointing makes a no_grad pass unsafe.
         if not image_mode and torch.cuda.is_available():
@@ -1578,7 +1642,7 @@ def main():
             trainer.train(resume_from_checkpoint=last_ckpt)
         else:
             trainer.train()
-        roc()
+        gpu_cleanup()
     except KeyboardInterrupt:
         _warn("Keyboard interrupt — saving current state...")
         if isinstance(model, PeftModel):
