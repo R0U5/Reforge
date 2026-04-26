@@ -30,13 +30,21 @@ warnings.filterwarnings("ignore", message="pkg_resources is deprecated", categor
 warnings.filterwarnings("ignore", message="TypedStorage is deprecated", category=UserWarning)
 warnings.filterwarnings("ignore", message="Special tokens have been added", category=UserWarning)
 
-import logging as _logging
+import logging
 # Silence the HuggingFace datasets "Generating train split" progress line and
 # the transformers "Special tokens have been added" warning — both bypass the
 # standard Python warnings system and must be suppressed via the logging module.
-_logging.getLogger("datasets").setLevel(_logging.ERROR)
-_logging.getLogger("transformers.tokenization_utils_base").setLevel(_logging.ERROR)
-_logging.getLogger("transformers").setLevel(_logging.ERROR)
+logging.getLogger("datasets").setLevel(logging.ERROR)
+logging.getLogger("transformers.tokenization_utils_base").setLevel(logging.ERROR)
+logging.getLogger("transformers").setLevel(logging.ERROR)
+
+# Module-level logger
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setLevel(logging.INFO)
+    logger.addHandler(handler)
 
 # Optional emoji stripping — imported once at module level
 try:
@@ -60,17 +68,24 @@ from PIL import Image as PILImage
 import io
 
 
-# ── CLI output helpers ────────────────────────────────────────────────────────
+# ── CLI output helpers (standard logging) ────────────────────────────────────
 def _banner(title: str) -> None:
     width = 60
     print(f"\n{'─' * width}")
     print(f"  {title}")
     print(f"{'─' * width}")
 
-def _ok(msg: str)   -> None: print(f"  ✔  {msg}")
-def _info(msg: str) -> None: print(f"  ·  {msg}")
-def _warn(msg: str) -> None: print(f"  ⚠  {msg}")
-def _err(msg: str)  -> None: print(f"  ✖  {msg}")
+def _ok(msg: str) -> None:
+    logger.info(f"  ✔  {msg}")
+
+def _info(msg: str) -> None:
+    logger.info(f"  ·  {msg}")
+
+def _warn(msg: str) -> None:
+    logger.warning(f"  ⚠  {msg}")
+
+def _err(msg: str) -> None:
+    logger.error(f"  ✖  {msg}")
 # ──────────────────────────────────────────────────────────────────────────────
 
 _DEFAULT_HF_ROOT  = str(Path.home() / ".cache" / "huggingface")
@@ -387,7 +402,7 @@ class DynamicCausalCollator:
         def _to_py(x):
             if isinstance(x, torch.Tensor):
                 return x.tolist()
-            return x
+            return list(x) if not isinstance(x, list) else x
         base_feats = []
         for f in features:
             base_feats.append({
@@ -407,10 +422,6 @@ class DynamicCausalCollator:
             # assistant-turn boundary masked to -100.  Pad those labels directly
             # (padding positions → -100) rather than rebuilding from input_ids,
             # which would overwrite the prompt masking and train on the question too.
-            def _to_py(x):
-                if isinstance(x, torch.Tensor):
-                    return x.tolist()
-                return list(x) if not isinstance(x, list) else x
             label_seqs = [_to_py(f["labels"]) for f in features]
             # Determine padded length (same as input_ids after tokenizer.pad)
             pad_len = batch["input_ids"].shape[1]
@@ -561,7 +572,7 @@ def clean_string(s, mode: str = "math"):
 
 def calc_floor(steps_total: int) -> float:
     if steps_total < 4000:
-        return 0.22  
+        return 0.22
     return 0.18
 
 
@@ -752,7 +763,7 @@ def tokenize(example, tokenizer, training_mode="sft", max_length=MAX_LENGTH, pro
             **({"length": len(input_ids)} if "length" not in example else {"length": int(example["length"])}),
         }
 
-    # --- Text-only path (unchanged)
+    # --- Text-only path
     tokens = tokenizer(
         example["text"],
         padding=False,
@@ -762,7 +773,6 @@ def tokenize(example, tokenizer, training_mode="sft", max_length=MAX_LENGTH, pro
     out = {
         "input_ids": [int(x) for x in tokens["input_ids"]],
         "attention_mask": [int(x) for x in tokens["attention_mask"]],
-        "labels": [int(x) for x in tokens["input_ids"]],
     }
     if "length" in example:
         try:
@@ -1206,7 +1216,6 @@ class EarlyStopByLoss(TrainerCallback):
         self.verbose_every = int(verbose_every)
 
         # State
-        self.losses: list[float] = []
         self.ema_series: list[float] = []
         self.ema: float | None = None
         self.prev_ema: float | None = None
@@ -1226,36 +1235,7 @@ class EarlyStopByLoss(TrainerCallback):
         mad = float(np.median(np.abs(a - med)))
         return 1.4826 * mad  # ≈ σ for normal
 
-    def _epoch_fraction(self, state) -> float:
-        step = max(0, int(getattr(state, "global_step", 0)))
-        return step / float(self.steps_total)
-
-    def _update_ema(self, loss: float) -> None:
-        if self.ema is None:
-            self.ema = loss
-        else:
-            b = self.ema_beta
-            self.ema = b * self.ema + (1.0 - b) * loss
-
-    def _lr_gate_ok(self, logs: dict) -> bool:
-        if self.quality_lr_frac >= 1.0:
-            return True
-        lr = logs.get("learning_rate", None)
-        if lr is None:
-            return True
-        try:
-            lr = float(lr)
-        except Exception:
-            return True
-        if lr > self.max_lr_seen:
-            self.max_lr_seen = lr
-        return lr <= (self.max_lr_seen * self.quality_lr_frac + 1e-12)
-
-    def _recent_slice(self, arr: list[float], k: int) -> list[float]:
-        k = max(1, int(k))
-        if len(arr) <= k:
-            return arr[:]
-        return arr[-k:]
+    # Helper methods removed, logic inlined into on_log for simplicity
 
     def _slope(self, series: list[float]) -> float:
         if len(series) < 8:
@@ -1269,7 +1249,7 @@ class EarlyStopByLoss(TrainerCallback):
         if not self.active or logs is None:
             return
 
-        # Optional hard cap (set None to fully disable)
+        # Hard cap check
         if self.hard_cap_steps is not None:
             if int(getattr(state, "global_step", 0)) >= int(self.hard_cap_steps):
                 control.should_training_stop = True
@@ -1287,8 +1267,12 @@ class EarlyStopByLoss(TrainerCallback):
         loss = float(logs["loss"])
         warmup = int(getattr(args, "warmup_steps", 0) or 0)
 
-        # Update EMA & series
-        self._update_ema(loss)
+        # Update EMA
+        if self.ema is None:
+            self.ema = loss
+        else:
+            self.ema = self.ema_beta * self.ema + (1.0 - self.ema_beta) * loss
+
         if self.prev_ema is None:
             self.prev_ema = self.ema
         self.ema_series.append(self.ema)
@@ -1303,15 +1287,29 @@ class EarlyStopByLoss(TrainerCallback):
             if self.cooldown > 0:
                 self.cooldown -= 1
 
-        # Gates
+        # Warmup gate
         if step < warmup:
-            self.prev_ema = self.ema  # keep prev_ema current so abs_drop is accurate when gate opens
+            self.prev_ema = self.ema
             return
-        if self._epoch_fraction(state) < self.exposure_floor:
-            self.prev_ema = self.ema  # same: prevent stale reference inflating abs_drop on first real check
+
+        # Exposure floor gate
+        epoch_frac = step / float(self.steps_total)
+        if epoch_frac < self.exposure_floor:
+            self.prev_ema = self.ema
             return
-        if not self._lr_gate_ok(logs):
-            return
+
+        # LR gate
+        if self.quality_lr_frac < 1.0:
+            lr = logs.get("learning_rate", None)
+            if lr is not None:
+                try:
+                    lr = float(lr)
+                    if lr > self.max_lr_seen:
+                        self.max_lr_seen = lr
+                    if lr > (self.max_lr_seen * self.quality_lr_frac + 1e-12):
+                        return
+                except Exception:
+                    pass
 
         # Need enough history
         min_history = max(24, self.window // 3)
@@ -1320,7 +1318,8 @@ class EarlyStopByLoss(TrainerCallback):
             return
 
         # Robust variability over EMA series
-        recent_ema = self._recent_slice(self.ema_series, self.window)
+        k = max(1, int(self.window))
+        recent_ema = self.ema_series[-k:] if len(self.ema_series) > k else self.ema_series[:]
         sigma = max(self._mad_sigma(recent_ema), self.std_floor)
 
         # Improvement tests
@@ -1329,23 +1328,21 @@ class EarlyStopByLoss(TrainerCallback):
         improved = (abs_drop >= self.min_abs_improve) or (sigma_drop >= self.min_sigma_improve)
 
         # Worsening / plateau tests on EMA slope
-        slope_win = self._recent_slice(self.ema_series, self.slope_window)
+        slope_k = max(1, int(self.slope_window))
+        slope_win = self.ema_series[-slope_k:] if len(self.ema_series) > slope_k else self.ema_series[:]
         slope = self._slope(slope_win)
 
         worsening = slope >= self.slope_thresh
-        # Plateau: long time since best, tiny slope magnitude, and low variability
         plateau = (self.since_best >= self.patience) and (abs(slope) <= self.slope_thresh) and (sigma <= max(0.5 * self.std_floor, 0.05))
 
         # Decision
         stop_now = False
         if improved:
-            # reset prev reference for next drop calc
             self.prev_ema = self.ema
         else:
-            # If not improved for a while and statistics say "flat", stop.
             stop_now = plateau or worsening
 
-        # Occasional debug (quiet by default)
+        # Debug output
         if self.verbose_every and (step % self.verbose_every == 0):
             print(f"[ES] step={step} ema={self.ema:.4f} best={self.best_ema:.4f} "
                   f"abs_drop={abs_drop:.4f} sigma_drop={sigma_drop:.2f} "
@@ -1355,7 +1352,6 @@ class EarlyStopByLoss(TrainerCallback):
         if stop_now:
             control.should_training_stop = True
             self.triggered = True
-            return
 
     def on_train_end(self, args, state, control, **kwargs):
         if self.hard_cap_steps is not None and int(getattr(state, "global_step", 0)) >= int(self.hard_cap_steps):
