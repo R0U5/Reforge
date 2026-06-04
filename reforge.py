@@ -13,8 +13,8 @@ import torch
 import numpy as np
 
 # Disable TorchScript JIT profiling — these profilers recompile specialised
-# kernels on each new tensor shape during the first several steps, which can
-# cause significant step-time variance during early training.
+# kernels on each new tensor shape during the first several steps, which is
+# the direct cause of the 70s → 4s step-time staircase on long-context models.
 # Safe to disable: we are not using TorchScript tracing or torch.jit.script.
 torch._C._jit_set_profiling_executor(False)
 torch._C._jit_set_profiling_mode(False)
@@ -30,21 +30,13 @@ warnings.filterwarnings("ignore", message="pkg_resources is deprecated", categor
 warnings.filterwarnings("ignore", message="TypedStorage is deprecated", category=UserWarning)
 warnings.filterwarnings("ignore", message="Special tokens have been added", category=UserWarning)
 
-import logging
+import logging as _logging
 # Silence the HuggingFace datasets "Generating train split" progress line and
 # the transformers "Special tokens have been added" warning — both bypass the
 # standard Python warnings system and must be suppressed via the logging module.
-logging.getLogger("datasets").setLevel(logging.ERROR)
-logging.getLogger("transformers.tokenization_utils_base").setLevel(logging.ERROR)
-logging.getLogger("transformers").setLevel(logging.ERROR)
-
-# Module-level logger
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
-if not logger.handlers:
-    handler = logging.StreamHandler()
-    handler.setLevel(logging.INFO)
-    logger.addHandler(handler)
+_logging.getLogger("datasets").setLevel(_logging.ERROR)
+_logging.getLogger("transformers.tokenization_utils_base").setLevel(_logging.ERROR)
+_logging.getLogger("transformers").setLevel(_logging.ERROR)
 
 # Optional emoji stripping — imported once at module level
 try:
@@ -66,34 +58,327 @@ from peft import (
 )
 from PIL import Image as PILImage
 import io
+import time
 
 
-# ── CLI output helpers (standard logging) ────────────────────────────────────
-def _banner(title: str) -> None:
-    width = 60
-    print(f"\n{'─' * width}")
-    print(f"  {title}")
-    print(f"{'─' * width}")
+# ── CLI output & color system ─────────────────────────────────────────────────
+# ANSI escape codes. Windows 10+ consoles need VT processing enabled
+# (done below); older terminals and non-TTY streams (e.g. redirected
+# output, CI logs) fall back to plain text automatically. Honors the
+# standard NO_COLOR=1 and FORCE_COLOR=1 environment variables.
 
-def _ok(msg: str) -> None:
-    logger.info(f"  ✔  {msg}")
+_ANSI_RESET   = "\033[0m"
+_ANSI_BOLD    = "\033[1m"
+_ANSI_DIM     = "\033[2m"
+_ANSI_RED     = "\033[31m"
+_ANSI_GREEN   = "\033[32m"
+_ANSI_YELLOW  = "\033[33m"
+_ANSI_BLUE    = "\033[34m"
+_ANSI_MAGENTA = "\033[35m"
+_ANSI_CYAN    = "\033[36m"
+_ANSI_WHITE   = "\033[37m"
+_ANSI_GRAY    = "\033[90m"
+_ANSI_BRED    = "\033[91m"
+_ANSI_BGREEN  = "\033[92m"
+_ANSI_BYELLOW = "\033[93m"
+_ANSI_BBLUE   = "\033[94m"
+_ANSI_BMAG    = "\033[95m"
+_ANSI_BCYAN   = "\033[96m"
+_ANSI_BWHITE  = "\033[97m"
 
-def _info(msg: str) -> None:
-    logger.info(f"  ·  {msg}")
+_ANSI_ESC_RE = re.compile(r"\033\[[0-9;]*m")
 
-def _warn(msg: str) -> None:
-    logger.warning(f"  ⚠  {msg}")
 
-def _err(msg: str) -> None:
-    logger.error(f"  ✖  {msg}")
+def _enable_windows_vt() -> bool:
+    """Enable ANSI escape codes on the Windows 10+ console. Returns True on success."""
+    if sys.platform != "win32":
+        return True
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+        mode = ctypes.c_uint32()
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return False
+        # ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+        kernel32.SetConsoleMode(handle, mode.value | 0x0004)
+        return True
+    except Exception:
+        return False
+
+
+def _enable_utf8_stdout() -> None:
+    """Reconfigure stdout/stderr to UTF-8 so box-drawing chars render on Windows."""
+    if sys.platform != "win32":
+        return
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+
+_enable_utf8_stdout()
+
+
+def _detect_color() -> bool:
+    if os.environ.get("NO_COLOR"):
+        return False
+    if os.environ.get("FORCE_COLOR"):
+        return True
+    if os.environ.get("TERM", "").lower() == "dumb":
+        return False
+    if not sys.stdout.isatty():
+        return False
+    return _enable_windows_vt()
+
+
+_USE_COLOR = _detect_color()
+
+
+def _c(code: str, text: str) -> str:
+    """Wrap text in an ANSI code, or return plain text if colors are disabled."""
+    if not _USE_COLOR or not text:
+        return text
+    return f"{code}{text}{_ANSI_RESET}"
+
+
+def _vlen(s: str) -> int:
+    """Visible length of a string, ignoring ANSI escape sequences."""
+    return len(_ANSI_ESC_RE.sub("", s))
+
+
+def _bold(text: str) -> str:
+    """Style a string as bold bright-white for emphasis."""
+    return _c(_ANSI_BOLD + _ANSI_BWHITE, text)
+
+
+def _banner(title: str, color: str = _ANSI_BCYAN, width: int = 64) -> None:
+    """Section header with heavy top border, bold title, and dim footer."""
+    print()
+    print(_c(color, "═" * width))
+    print(_c(_ANSI_BOLD + _ANSI_WHITE, f"  {title}"))
+    print(_c(_ANSI_GRAY, "─" * width))
+
+
+def _ok(msg: str)   -> None: print(f"  {_c(_ANSI_BGREEN, '✔')}  {msg}")
+def _info(msg: str) -> None: print(f"  {_c(_ANSI_BCYAN, '·')}  {msg}")
+def _warn(msg: str) -> None: print(f"  {_c(_ANSI_BYELLOW, '⚠')}  {msg}")
+def _err(msg: str)  -> None: print(f"  {_c(_ANSI_BRED, '✖')}  {msg}")
+
+
+def _title(app: str, info: list = None, subtitle: str = None,
+           color: str = _ANSI_BCYAN, width: int = 64) -> None:
+    """Startup title screen: boxed bold app name with key/value info rows beneath."""
+    print()
+    print(_c(color, "═" * width))
+    print()
+    app_padded = f"  {app.center(width - 2)}"
+    print(_c(_ANSI_BOLD + _ANSI_BWHITE, app_padded))
+    if subtitle:
+        sub_padded = f"  {subtitle.center(width - 2)}"
+        print(_c(_ANSI_DIM, sub_padded))
+    print()
+    if info:
+        key_w = max(_vlen(k) for k, _ in info)
+        for key, value in info:
+            key_styled = _c(_ANSI_GRAY, key.ljust(key_w + 2))
+            value_styled = _c(_ANSI_WHITE, str(value)) if _USE_COLOR else str(value)
+            print(f"  {key_styled}{value_styled}")
+    print()
+    print(_c(_ANSI_GRAY, "─" * width))
+
+
+def _table(title: str, rows: list, value_color: str = None,
+           key_color: str = _ANSI_BCYAN, width: int = 64) -> None:
+    """Titled two-column table with aligned key/value pairs."""
+    print()
+    print(_c(_ANSI_BOLD + _ANSI_WHITE, f"  {title}"))
+    print(_c(_ANSI_GRAY, "─" * width))
+    if not rows:
+        print(_c(_ANSI_DIM, "  (no data)"))
+    else:
+        key_w = max(_vlen(k) for k, _ in rows)
+        for key, value in rows:
+            value_str = value() if callable(value) else str(value)
+            key_styled = _c(key_color, key.ljust(key_w))
+            if value_color:
+                value_str = _c(value_color, value_str)
+            print(f"  {key_styled}    {value_str}")
+    print(_c(_ANSI_GRAY, "─" * width))
 # ──────────────────────────────────────────────────────────────────────────────
 
-_DEFAULT_HF_ROOT  = str(Path.home() / ".cache" / "huggingface")
-_DEFAULT_TMP_ROOT = str(Path(os.environ.get("TEMP", os.environ.get("TMPDIR", "/tmp"))))
 
-HF_ROOT  = os.environ.get("HF_ROOT",  _DEFAULT_HF_ROOT)
-TMP_ROOT = os.environ.get("HF_TMP",   _DEFAULT_TMP_ROOT)
+def _fmt_duration(seconds: float) -> str:
+    """Format seconds as '1h 02m 03s', '2m 15s', or '45s'."""
+    s = max(0, int(seconds))
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m {s % 60:02d}s"
+    return f"{s // 3600}h {(s % 3600) // 60:02d}m {s % 60:02d}s"
 
+
+def _loss_sparkline(values: list, width: int = 48) -> str:
+    """Render a list of floats as a unicode sparkline (resampled to width)."""
+    if not values:
+        return ""
+    if len(values) > width:
+        step = len(values) / width
+        sampled = [values[int(i * step)] for i in range(width)]
+    else:
+        sampled = list(values)
+    lo, hi = min(sampled), max(sampled)
+    span = hi - lo if hi > lo else 1.0
+    blocks = "▁▂▃▄▅▆▇█"
+    out = []
+    for v in sampled:
+        idx = int((v - lo) / span * (len(blocks) - 1))
+        out.append(blocks[max(0, min(len(blocks) - 1, idx))])
+    return "".join(out)
+
+
+def summarize_training(
+    trainer,
+    *,
+    dataset_size: int,
+    num_train_epochs: int,
+    batch_size: int,
+    grad_accum: int,
+    report_path: str | None = None,
+) -> dict:
+    """Print a post-training summary and write a JSON report. Returns the report dict."""
+    state = trainer.state
+    log = list(state.log_history or [])
+    steps = int(state.global_step or 0)
+
+    # Partition log entries
+    loss_steps: list[int] = []
+    loss_values: list[float] = []
+    eval_entries: list[dict] = []
+    train_runtime = 0.0
+    samples_per_sec = 0.0
+    steps_per_sec = 0.0
+    for entry in log:
+        if "loss" in entry and "eval_loss" not in entry:
+            loss_steps.append(int(entry.get("step", len(loss_steps) + 1)))
+            loss_values.append(float(entry["loss"]))
+        if "eval_loss" in entry:
+            eval_entries.append(entry)
+        if "train_runtime" in entry:
+            train_runtime = float(entry["train_runtime"])
+        if "train_samples_per_second" in entry:
+            samples_per_sec = float(entry["train_samples_per_second"])
+        if "train_steps_per_second" in entry:
+            steps_per_sec = float(entry["train_steps_per_second"])
+
+    # Loss statistics
+    first_loss = loss_values[0] if loss_values else None
+    final_loss = loss_values[-1] if loss_values else None
+    best_loss = min(loss_values) if loss_values else None
+    best_step = loss_steps[loss_values.index(best_loss)] if loss_values else None
+    worst_loss = max(loss_values) if loss_values else None
+
+    if loss_values:
+        tail_n = max(1, len(loss_values) // 10)
+        avg_recent = sum(loss_values[-tail_n:]) / tail_n
+        head_n = max(1, len(loss_values) // 5)
+        avg_head = sum(loss_values[:head_n]) / head_n
+        delta_recent = avg_recent - avg_head
+        if delta_recent < -0.02:
+            trend = f"improving  ({delta_recent:+.4f} vs first 20%)"
+        elif delta_recent > 0.02:
+            trend = f"worsening  ({delta_recent:+.4f} vs first 20%)"
+        else:
+            trend = f"plateau    ({delta_recent:+.4f} vs first 20%)"
+    else:
+        avg_recent = None
+        trend = "n/a"
+
+    effective_batch = batch_size * grad_accum
+    samples_seen = steps * effective_batch
+    epochs_completed = float(state.epoch or 0.0)
+
+    report = {
+        "total_steps":         steps,
+        "epochs_planned":      num_train_epochs,
+        "epochs_completed":    round(epochs_completed, 4),
+        "dataset_size":        dataset_size,
+        "batch_size":          batch_size,
+        "grad_accum":          grad_accum,
+        "effective_batch":     effective_batch,
+        "samples_seen":        samples_seen,
+        "training_time_sec":   round(train_runtime, 2),
+        "samples_per_sec":     round(samples_per_sec, 4),
+        "steps_per_sec":       round(steps_per_sec, 4),
+        "loss": {
+            "first":              round(first_loss, 6) if first_loss is not None else None,
+            "final":              round(final_loss, 6) if final_loss is not None else None,
+            "best":               round(best_loss, 6) if best_loss is not None else None,
+            "best_step":          best_step,
+            "worst":              round(worst_loss, 6) if worst_loss is not None else None,
+            "avg_last_10pct":     round(avg_recent, 6) if avg_recent is not None else None,
+            "delta_first_to_final": round(final_loss - first_loss, 6) if (final_loss is not None and first_loss is not None) else None,
+            "trend":              trend,
+        },
+        "eval": [
+            {k: v for k, v in e.items() if k.startswith("eval_") or k == "step"}
+            for e in eval_entries
+        ],
+    }
+
+    # Print
+    _banner("Training Results")
+    if steps:
+        _table("Run", [
+            ("Steps",        f"{steps:,}"),
+            ("Epochs",       f"{epochs_completed:.2f} / {num_train_epochs}"),
+            ("Samples seen", f"{samples_seen:,}"),
+        ])
+    if train_runtime:
+        _table("Throughput", [
+            ("Time",       _fmt_duration(train_runtime)),
+            ("Samples/s",  f"{samples_per_sec:.2f}"),
+            ("Steps/s",    f"{steps_per_sec:.2f}"),
+        ])
+    if loss_values:
+        delta_val = (final_loss - first_loss) if (final_loss is not None and first_loss is not None) else None
+        _table("Loss", [
+            ("First",           f"{first_loss:.4f}"),
+            ("Final",           f"{final_loss:.4f}"),
+            ("Best",            f"{best_loss:.4f} @ step {best_step}"),
+            ("Δ (first→final)", f"{delta_val:+.4f}" if delta_val is not None else "n/a"),
+            ("Avg (last 10%)",  f"{avg_recent:.4f}"),
+            ("Trend",           trend),
+        ], value_color=_ANSI_BCYAN)
+        print(f"  {_c(_ANSI_BCYAN, '·')}  Curve (n={len(loss_values)}): {_c(_ANSI_BCYAN, _loss_sparkline(loss_values))}")
+        print(f"  {_c(_ANSI_DIM, f'    range: min={best_loss:.4f}  max={worst_loss:.4f}  span={worst_loss - best_loss:.4f}')}")
+    else:
+        _warn("No loss entries found in log history — was logging_steps > 0?")
+    if eval_entries:
+        final_eval = eval_entries[-1]
+        ev_loss = final_eval.get("eval_loss")
+        if ev_loss is not None:
+            _table("Evaluation", [
+                ("Final eval loss", f"{float(ev_loss):.4f}"),
+                ("Eval points",     f"{len(eval_entries)}"),
+            ])
+    print()
+
+    if report_path:
+        try:
+            os.makedirs(os.path.dirname(report_path) or ".", exist_ok=True)
+            with open(report_path, "w", encoding="utf-8") as f:
+                json.dump(report, f, indent=2)
+            _ok(f"Report written: {report_path}")
+        except Exception as e:
+            _warn(f"Could not write training_report.json: {e}")
+
+    return report
+
+
+HF_ROOT = r"D:\HF_Cache"
+TMP_ROOT = r"D:\HF_Temp"
 os.environ["HF_HOME"] = HF_ROOT
 os.environ["HUGGINGFACE_HUB_CACHE"] = os.path.join(HF_ROOT, "hub")
 os.environ["HF_DATASETS_CACHE"] = os.path.join(HF_ROOT, "datasets")
@@ -107,7 +392,7 @@ os.environ["TRANSFORMERS_OFFLINE"] = "1"
 os.environ["HF_DATASETS_OFFLINE"] = "1"
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 os.environ.setdefault("HF_DATASETS_DISABLE_PROGRESS_BARS", "1")
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512,garbage_collection_threshold:0.6"  # 512 reduces fragmentation for 4B+ models; lower to 128 for smaller models if needed
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512,garbage_collection_threshold:0.6"  # 128 was tuned for Phi-2; 512 reduces fragmentation for 4B+ models
 # Disable HuggingFace tokenizer parallelism — spawning tokenizer workers inside a
 # multiprocessing context causes deadlocks on Windows and inflates early-step times.
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -120,18 +405,11 @@ SAVE_STEPS = 150
 SAVE_LIMITS = 2
 LOG_STEPS = 1
 BATCH_SIZE = 1  # always 1; effective batch size is controlled by GRAD_ACCUM in each profile
-# Default paths — override via --base_model / --output_dir CLI args, or by setting
-# environment variables before launching:
-#   HF_MODEL_DIR    -> directory containing your downloaded HF model folders
-#   TRAINER_OUTPUT  -> root directory for checkpoints and merged output
-_DEFAULT_MODEL_ROOT  = os.environ.get("HF_MODEL_DIR",   str(Path.home() / "hf_models"))
-_DEFAULT_OUTPUT_ROOT = os.environ.get("TRAINER_OUTPUT", str(Path.home() / "trainer_output"))
-# Default base model — set via --base_model CLI arg or HF_MODEL_DIR env var.
-# There is no built-in default model: the user must provide one explicitly
-# or place a model directory under HF_MODEL_DIR.
-BASE_MODEL       = str(Path(_DEFAULT_MODEL_ROOT))
-BASE_MODEL_IMAGE = str(Path(_DEFAULT_MODEL_ROOT))
-OUTPUT_DIR       = str(Path(_DEFAULT_OUTPUT_ROOT) / "merged_model")
+# Default paths — override via argparse or edit here.
+# Kept as Windows-style defaults; cross-platform paths can be passed at runtime.
+BASE_MODEL = r"D:\HF_Models\phi-3-vision"
+BASE_MODEL_IMAGE = r"D:\HF_Models\phi-3-vision"
+OUTPUT_DIR = "D:/Trainer_Data/Merged_model"
 MERGED_DIR = os.path.join(OUTPUT_DIR, "merged")
 TRAINING_CHAIN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "training_chain.txt")
 MERGE_SUCCESS_FLAG = os.path.join(MERGED_DIR, "success.txt")
@@ -175,14 +453,15 @@ MODEL_PROFILES = {
         "enable_input_grads":    False,
     },
     # phi-3-vision MUST appear before "phi-3" — first-match-wins.
-    # The Phi-3 vision model class does not support SDPA in some transformers
-    # versions even in text-only mode, so it must stay on eager.
+    # Phi3VForCausalLM (the vision model class) does not support SDPA in
+    # transformers 4.37.x even in text-only mode, so it must stay on eager.
     "phi-3-vision": {
         "attn_implementation":   "eager",
         "trust_remote_code":     True,
         "use_fast_tokenizer":    True,
         "inject_special_tokens": False,
         "resize_embeddings":     False,
+        "vision":                True,
         "lora_r":                16,
         "lora_alpha":            32,
         "lora_targets":          ["q_proj", "k_proj", "v_proj", "o_proj"],
@@ -208,66 +487,9 @@ MODEL_PROFILES = {
         "enable_input_grads":    True,
     },
     # ── Add new models below this line ────────────────────────────────────────
-    "llama-3": {
-        "attn_implementation":   "sdpa",
-        "trust_remote_code":     False,
-        "use_fast_tokenizer":    True,
-        "inject_special_tokens": False,
-        "resize_embeddings":     False,
-        "lora_r":                16,
-        "lora_alpha":            32,
-        "lora_targets":          ["q_proj", "k_proj", "v_proj", "o_proj"],
-        "modules_to_save":       None,
-        "grad_accum":            8,
-        "learning_rate":         2e-5,
-        "safe_serialization":    True,
-        "enable_input_grads":    False,
-    },
-    "mistral": {
-        "attn_implementation":   "sdpa",
-        "trust_remote_code":     False,
-        "use_fast_tokenizer":    True,
-        "inject_special_tokens": False,
-        "resize_embeddings":     False,
-        "lora_r":                16,
-        "lora_alpha":            32,
-        "lora_targets":          ["q_proj", "k_proj", "v_proj", "o_proj"],
-        "modules_to_save":       None,
-        "grad_accum":            8,
-        "learning_rate":         2e-5,
-        "safe_serialization":    True,
-        "enable_input_grads":    False,
-    },
-    "qwen": {
-        "attn_implementation":   "sdpa",
-        "trust_remote_code":     True,
-        "use_fast_tokenizer":    True,
-        "inject_special_tokens": False,
-        "resize_embeddings":     False,
-        "lora_r":                16,
-        "lora_alpha":            32,
-        "lora_targets":          ["q_proj", "k_proj", "v_proj", "o_proj"],
-        "modules_to_save":       None,
-        "grad_accum":            8,
-        "learning_rate":         2e-5,
-        "safe_serialization":    True,
-        "enable_input_grads":    False,
-    },
-    "gemma": {
-        "attn_implementation":   "sdpa",
-        "trust_remote_code":     False,
-        "use_fast_tokenizer":    True,
-        "inject_special_tokens": False,
-        "resize_embeddings":     False,
-        "lora_r":                16,
-        "lora_alpha":            32,
-        "lora_targets":          ["q_proj", "k_proj", "v_proj", "o_proj"],
-        "modules_to_save":       None,
-        "grad_accum":            8,
-        "learning_rate":         2e-5,
-        "safe_serialization":    True,
-        "enable_input_grads":    False,
-    },
+    # "mistral": { ... },
+    # "llama":   { ... },
+    # "qwen":    { ... },
     # ─────────────────────────────────────────────────────────────────────────
 }
 
@@ -309,8 +531,7 @@ def _resolve_model_name(merged_dir: str, merge_success_flag: str, base_model: st
     return base_model
 
 
-def gpu_cleanup(label: str = "") -> None:
-    """Synchronize CUDA, run Python GC, and release cached GPU memory."""
+def roc(label: str = "") -> None:
     MiB = 1024 * 1024
 
     if not torch.cuda.is_available():
@@ -334,7 +555,7 @@ def gpu_cleanup(label: str = "") -> None:
     freed_reserved = (before_res   - after_res)   / MiB
     freed_driver   = (free_after   - free_before) / MiB
 
-    def log_gpu_cleanup(label, freed_objs, freed_alloc, freed_reserved, freed_driver, eps=0.05):
+    def log_roc(label, freed_objs, freed_alloc, freed_reserved, freed_driver, eps=0.05):
         parts = []
         if freed_objs > 0:
             parts.append(f"{freed_objs} objs")
@@ -348,7 +569,7 @@ def gpu_cleanup(label: str = "") -> None:
             tag = f" [{label}]" if label else ""
             _info(f"GC{tag}: " + "  |  ".join(parts))
 
-    log_gpu_cleanup(label, freed_objs, freed_alloc, freed_reserved, freed_driver)
+    log_roc(label, freed_objs, freed_alloc, freed_reserved, freed_driver)
 
 
 
@@ -402,7 +623,7 @@ class DynamicCausalCollator:
         def _to_py(x):
             if isinstance(x, torch.Tensor):
                 return x.tolist()
-            return list(x) if not isinstance(x, list) else x
+            return x
         base_feats = []
         for f in features:
             base_feats.append({
@@ -422,6 +643,10 @@ class DynamicCausalCollator:
             # assistant-turn boundary masked to -100.  Pad those labels directly
             # (padding positions → -100) rather than rebuilding from input_ids,
             # which would overwrite the prompt masking and train on the question too.
+            def _to_py(x):
+                if isinstance(x, torch.Tensor):
+                    return x.tolist()
+                return list(x) if not isinstance(x, list) else x
             label_seqs = [_to_py(f["labels"]) for f in features]
             # Determine padded length (same as input_ids after tokenizer.pad)
             pad_len = batch["input_ids"].shape[1]
@@ -446,6 +671,19 @@ class DynamicCausalCollator:
 
         return batch
 
+def compute_metrics(eval_pred):
+    """Reserved for future eval use. Not wired to Trainer by default (eval_dataset=None)."""
+    logits, labels = eval_pred
+    # Use from_numpy to avoid an unnecessary copy when inputs are already numpy arrays
+    shift_logits = torch.from_numpy(logits[..., :-1, :].copy())
+    shift_labels = torch.from_numpy(labels[..., 1:].copy()).long()
+    loss_fct = torch.nn.CrossEntropyLoss(ignore_index=-100)
+    loss = loss_fct(shift_logits.reshape(-1, shift_logits.size(-1)), shift_labels.reshape(-1))
+    try:
+        perplexity = math.exp(loss.item())
+    except OverflowError:
+        perplexity = float("inf")
+    return {"perplexity": perplexity, "eval_loss": loss.item()}
 
 def auto_map_roles(columns, training_mode):
     lowered = {col.lower(): col for col in columns}
@@ -460,8 +698,30 @@ def auto_map_roles(columns, training_mode):
                 break
     return mapped.get("question"), mapped.get("chosen"), mapped.get("rejected"), mapped.get("image")
 
+def resolve_column(role, available_columns, training_mode):
+    # NOTE: retained as a debug helper — not called in the main training pipeline.
+    lowered = {col.lower(): col for col in available_columns}
+    aliases = TRAINING_SCHEMAS[training_mode]["aliases"]
+    for alias in aliases.get(role, []):
+        if alias in lowered:
+            return lowered[alias]
+    return None
 
-# ── Text cleaning / normalization ─────────────────────────────────────────
+def mapped_summary(col_question, col_chosen, col_rejected, col_image=None):
+    # NOTE: retained as a debug helper — not called in the main training pipeline.
+    used = []
+    if col_image:    used.append(f" image    → {col_image}")
+    if col_question: used.append(f" question → {col_question}")
+    if col_chosen: used.append(f" chosen   → {col_chosen}")
+    if col_rejected: used.append(f" rejected → {col_rejected}")
+    if used:
+        print("\nMapped Roles:")
+        for line in used:
+            print(" ", line)
+    else:
+        print("No usable column roles mapped!")
+
+#Garbage in -> diamonds out
 RE_LATEX_INLINE = re.compile(r"(?<!\$)\$(?:\\.|[^$\\])+\$(?!\$)")                   # $...$
 ANSWER_MARKER_RE = re.compile(r'^\s*#{3,6}\s*(?:final\s*answer\s*:)?\s*(?:answer\s*:)?\s*', re.I)
 RE_TEX_INLINE = re.compile(r"\\\((?:\\.|[^\\])+\\\)|\\\[(?:\\.|[^\\])+\\\]", re.DOTALL)  # \(...\) or \[...\]
@@ -572,7 +832,7 @@ def clean_string(s, mode: str = "math"):
 
 def calc_floor(steps_total: int) -> float:
     if steps_total < 4000:
-        return 0.22
+        return 0.22  
     return 0.18
 
 
@@ -601,7 +861,6 @@ def synthesize_prompt_dataset(raw_dataset, col_question, col_chosen, col_rejecte
             return result
 
         # num_proc=1: Arrow map with image columns is not fork-safe on Windows
-        # and some Linux configurations
         # writer_batch_size=50: flush to disk every 50 rows — prevents large RAM accumulation
         processed = raw_dataset.map(
             build_multimodal_row,
@@ -707,18 +966,9 @@ def tokenize(example, tokenizer, training_mode="sft", max_length=MAX_LENGTH, pro
             print(f"[WARN] Skipping unreadable image: {e}")
             return {"input_ids": [], "attention_mask": [], "labels": [], "pixel_values": None}
 
-        # Build prompt using the model's chat template if available,
-        # falling back to a generic format.
+        # Phi-3-Vision prompt format
         text = example.get("text", "")
-        if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template:
-            messages = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": text}]}]
-            try:
-                prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-            except Exception:
-                # Fallback for models whose chat template doesn't support image tokens
-                prompt = f"<|user|>\n<|image_1|>\n{text}<|end|>\n<|assistant|>"
-        else:
-            prompt = f"<|user|>\n<|image_1|>\n{text}<|end|>\n<|assistant|>"
+        prompt = f"<|user|>\n<|image_1|>\n{text}<|end|>\n<|assistant|>"
         encoded = processor(
             text=prompt,
             images=image,
@@ -730,30 +980,26 @@ def tokenize(example, tokenizer, training_mode="sft", max_length=MAX_LENGTH, pro
         attention_mask = encoded["attention_mask"][0].tolist()
         pixel_values   = encoded["pixel_values"][0]
 
-        # --- Mask question/image tokens so only the answer is supervised.
-        # Find the assistant turn boundary — everything after the assistant
-        # marker is the answer we want to train on; everything before gets -100.
-        # Common markers: "<|assistant|>" (Phi-3), "<|start_header_id|>assistant"
-        # (Llama 3), "<|im_start|>assistant" (Qwen/ChatML).
-        _assistant_markers = ["<|assistant|>", "<|start_header_id|>assistant", "<|im_start|>assistant"]
+        # --- Fix 5: mask question/image tokens so only the answer is supervised.
+        # Find the assistant turn boundary — everything from <|assistant|> onward
+        # is the answer we want to train on; everything before gets -100.
+        # Phi-3-Vision uses token ID for "<|assistant|>" as the boundary marker.
+        assistant_token_ids = tokenizer.encode("<|assistant|>", add_special_tokens=False)
         labels = [-100] * len(input_ids)
-        boundary = -1
-        for marker in _assistant_markers:
-            marker_ids = tokenizer.encode(marker, add_special_tokens=False)
-            if not marker_ids:
-                continue
-            a_id = marker_ids[0]
+        if assistant_token_ids:
+            # Find last occurrence of the assistant marker (handles edge cases where
+            # the string "<|assistant|>" might appear in the question text)
+            a_id = assistant_token_ids[0]
+            boundary = -1
             for i in range(len(input_ids) - 1, -1, -1):
                 if input_ids[i] == a_id:
-                    boundary = i + 1
+                    boundary = i + 1  # supervise from the token AFTER <|assistant|>
                     break
             if boundary > 0:
-                break
-        if boundary > 0:
-            labels[boundary:] = input_ids[boundary:]
-        else:
-            # Fallback: if no assistant marker found, supervise full sequence
-            labels = list(input_ids)
+                labels[boundary:] = input_ids[boundary:]
+            else:
+                # Fallback: if marker not found, supervise full sequence
+                labels = list(input_ids)
 
         return {
             "input_ids":      [int(x) for x in input_ids],
@@ -763,7 +1009,7 @@ def tokenize(example, tokenizer, training_mode="sft", max_length=MAX_LENGTH, pro
             **({"length": len(input_ids)} if "length" not in example else {"length": int(example["length"])}),
         }
 
-    # --- Text-only path
+    # --- Text-only path (unchanged)
     tokens = tokenizer(
         example["text"],
         padding=False,
@@ -773,6 +1019,7 @@ def tokenize(example, tokenizer, training_mode="sft", max_length=MAX_LENGTH, pro
     out = {
         "input_ids": [int(x) for x in tokens["input_ids"]],
         "attention_mask": [int(x) for x in tokens["attention_mask"]],
+        "labels": [int(x) for x in tokens["input_ids"]],
     }
     if "length" in example:
         try:
@@ -896,7 +1143,7 @@ def load_and_prepare_dataset(dataset_path, cleaning_mode, image_mode=False, base
     if os.path.exists(MERGE_SUCCESS_FLAG):
         _ok(f"Resuming from previous merged model: {MERGED_DIR}")
     else:
-        base_label = "image base (vision model)" if image_mode else f"text base ({os.path.basename(_default_base)})"
+        base_label = "image base (Phi-3-Vision)" if image_mode else f"text base ({os.path.basename(_default_base)})"
         if base_model_override:
             base_label = f"override: {base_model_override}"
         _info(f"Base model: {model_name}")
@@ -905,7 +1152,7 @@ def load_and_prepare_dataset(dataset_path, cleaning_mode, image_mode=False, base
     profile = resolve_model_profile(model_name)
     processor = None
     if image_mode:
-        _info("Loading AutoProcessor for vision model...")
+        _info("Loading AutoProcessor (Phi-3-Vision)...")
         processor = AutoProcessor.from_pretrained(
             model_name,
             trust_remote_code=True,
@@ -1006,7 +1253,7 @@ def load_and_prepare_dataset(dataset_path, cleaning_mode, image_mode=False, base
         fmt_cols.append("pixel_values")
 
     tokenized.set_format(type="torch", columns=fmt_cols)
-    gpu_cleanup()
+    roc()
 
     train_dataset = tokenized
     eval_dataset = None
@@ -1034,15 +1281,15 @@ def load_model(tokenizer, model_name, image_mode=False, base_model_override=None
 
     if image_mode:
         _banner("Model")
-        _info(f"Loading {os.path.basename(model_name)} (AutoModelForVision2Seq)...")
+        _info("Loading Phi-3-Vision (AutoModelForVision2Seq)...")
         base_model = AutoModelForVision2Seq.from_pretrained(
             model_name,
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
             local_files_only=True,
-            # Vision models stay on eager — many vision encoders are
-            # incompatible with SDPA's dispatcher, and flash_attention_2
-            # is unavailable on Windows.
+            # Vision models stay on eager — Phi-3-Vision's vision encoder is
+            # incompatible with SDPA's dispatcher. flash_attention_2 is also
+            # unavailable on Windows 11.
             _attn_implementation="eager",
         ).to("cuda")
     else:
@@ -1063,7 +1310,7 @@ def load_model(tokenizer, model_name, image_mode=False, base_model_override=None
     if hasattr(base_model.config, "use_cache"):
         base_model.config.use_cache = False
 
-    # When running text-only SFT on a vision model, the vision encoder is loaded
+    # When running text-only SFT on phi-3-vision, the vision encoder is loaded
     # as part of the model but never receives image inputs. Freeze it so that:
     #   (a) it does not participate in the backward pass (saves ~15% step time)
     #   (b) its parameters are excluded from gradient buffer allocation
@@ -1128,7 +1375,7 @@ def load_model(tokenizer, model_name, image_mode=False, base_model_override=None
 
         # Resize BEFORE wrapping with LoRA so new embedding rows are covered by
         # the adapter and the gradient graph stays intact. Only done for models
-        # that inject special tokens (see inject_special_tokens in model profiles).
+        # that inject special tokens (currently Phi-2 only).
         if profile["resize_embeddings"] and tokenizer.added_tokens_encoder:
             _info(f"Resizing embeddings: +{len(tokenizer.added_tokens_encoder)} new tokens")
             base_model.resize_token_embeddings(len(tokenizer))
@@ -1155,7 +1402,7 @@ def load_model(tokenizer, model_name, image_mode=False, base_model_override=None
 
     print_trainable_parameters(model)
 
-    # Gradient checkpointing for image mode — trades compute for VRAM savings
+    # Gradient checkpointing for image mode — saves ~3-4 GB VRAM on 12 GB card
     if image_mode:
         _info("Gradient checkpointing enabled (VRAM optimisation)")
         model.gradient_checkpointing_enable()
@@ -1216,6 +1463,7 @@ class EarlyStopByLoss(TrainerCallback):
         self.verbose_every = int(verbose_every)
 
         # State
+        self.losses: list[float] = []
         self.ema_series: list[float] = []
         self.ema: float | None = None
         self.prev_ema: float | None = None
@@ -1235,7 +1483,36 @@ class EarlyStopByLoss(TrainerCallback):
         mad = float(np.median(np.abs(a - med)))
         return 1.4826 * mad  # ≈ σ for normal
 
-    # Helper methods removed, logic inlined into on_log for simplicity
+    def _epoch_fraction(self, state) -> float:
+        step = max(0, int(getattr(state, "global_step", 0)))
+        return step / float(self.steps_total)
+
+    def _update_ema(self, loss: float) -> None:
+        if self.ema is None:
+            self.ema = loss
+        else:
+            b = self.ema_beta
+            self.ema = b * self.ema + (1.0 - b) * loss
+
+    def _lr_gate_ok(self, logs: dict) -> bool:
+        if self.quality_lr_frac >= 1.0:
+            return True
+        lr = logs.get("learning_rate", None)
+        if lr is None:
+            return True
+        try:
+            lr = float(lr)
+        except Exception:
+            return True
+        if lr > self.max_lr_seen:
+            self.max_lr_seen = lr
+        return lr <= (self.max_lr_seen * self.quality_lr_frac + 1e-12)
+
+    def _recent_slice(self, arr: list[float], k: int) -> list[float]:
+        k = max(1, int(k))
+        if len(arr) <= k:
+            return arr[:]
+        return arr[-k:]
 
     def _slope(self, series: list[float]) -> float:
         if len(series) < 8:
@@ -1249,7 +1526,7 @@ class EarlyStopByLoss(TrainerCallback):
         if not self.active or logs is None:
             return
 
-        # Hard cap check
+        # Optional hard cap (set None to fully disable)
         if self.hard_cap_steps is not None:
             if int(getattr(state, "global_step", 0)) >= int(self.hard_cap_steps):
                 control.should_training_stop = True
@@ -1267,12 +1544,8 @@ class EarlyStopByLoss(TrainerCallback):
         loss = float(logs["loss"])
         warmup = int(getattr(args, "warmup_steps", 0) or 0)
 
-        # Update EMA
-        if self.ema is None:
-            self.ema = loss
-        else:
-            self.ema = self.ema_beta * self.ema + (1.0 - self.ema_beta) * loss
-
+        # Update EMA & series
+        self._update_ema(loss)
         if self.prev_ema is None:
             self.prev_ema = self.ema
         self.ema_series.append(self.ema)
@@ -1287,29 +1560,15 @@ class EarlyStopByLoss(TrainerCallback):
             if self.cooldown > 0:
                 self.cooldown -= 1
 
-        # Warmup gate
+        # Gates
         if step < warmup:
-            self.prev_ema = self.ema
+            self.prev_ema = self.ema  # keep prev_ema current so abs_drop is accurate when gate opens
             return
-
-        # Exposure floor gate
-        epoch_frac = step / float(self.steps_total)
-        if epoch_frac < self.exposure_floor:
-            self.prev_ema = self.ema
+        if self._epoch_fraction(state) < self.exposure_floor:
+            self.prev_ema = self.ema  # same: prevent stale reference inflating abs_drop on first real check
             return
-
-        # LR gate
-        if self.quality_lr_frac < 1.0:
-            lr = logs.get("learning_rate", None)
-            if lr is not None:
-                try:
-                    lr = float(lr)
-                    if lr > self.max_lr_seen:
-                        self.max_lr_seen = lr
-                    if lr > (self.max_lr_seen * self.quality_lr_frac + 1e-12):
-                        return
-                except Exception:
-                    pass
+        if not self._lr_gate_ok(logs):
+            return
 
         # Need enough history
         min_history = max(24, self.window // 3)
@@ -1318,8 +1577,7 @@ class EarlyStopByLoss(TrainerCallback):
             return
 
         # Robust variability over EMA series
-        k = max(1, int(self.window))
-        recent_ema = self.ema_series[-k:] if len(self.ema_series) > k else self.ema_series[:]
+        recent_ema = self._recent_slice(self.ema_series, self.window)
         sigma = max(self._mad_sigma(recent_ema), self.std_floor)
 
         # Improvement tests
@@ -1328,21 +1586,23 @@ class EarlyStopByLoss(TrainerCallback):
         improved = (abs_drop >= self.min_abs_improve) or (sigma_drop >= self.min_sigma_improve)
 
         # Worsening / plateau tests on EMA slope
-        slope_k = max(1, int(self.slope_window))
-        slope_win = self.ema_series[-slope_k:] if len(self.ema_series) > slope_k else self.ema_series[:]
+        slope_win = self._recent_slice(self.ema_series, self.slope_window)
         slope = self._slope(slope_win)
 
         worsening = slope >= self.slope_thresh
+        # Plateau: long time since best, tiny slope magnitude, and low variability
         plateau = (self.since_best >= self.patience) and (abs(slope) <= self.slope_thresh) and (sigma <= max(0.5 * self.std_floor, 0.05))
 
         # Decision
         stop_now = False
         if improved:
+            # reset prev reference for next drop calc
             self.prev_ema = self.ema
         else:
+            # If not improved for a while and statistics say "flat", stop.
             stop_now = plateau or worsening
 
-        # Debug output
+        # Occasional debug (quiet by default)
         if self.verbose_every and (step % self.verbose_every == 0):
             print(f"[ES] step={step} ema={self.ema:.4f} best={self.best_ema:.4f} "
                   f"abs_drop={abs_drop:.4f} sigma_drop={sigma_drop:.2f} "
@@ -1352,6 +1612,7 @@ class EarlyStopByLoss(TrainerCallback):
         if stop_now:
             control.should_training_stop = True
             self.triggered = True
+            return
 
     def on_train_end(self, args, state, control, **kwargs):
         if self.hard_cap_steps is not None and int(getattr(state, "global_step", 0)) >= int(self.hard_cap_steps):
@@ -1372,10 +1633,8 @@ def dynamic_early_stop_cap(steps_total):
     return round(cap, 4)
     
 def select_file() -> str:
-    """Open a native file picker, falling back to text input on failure."""
     try:
-        system = platform.system()
-        if system == "Windows":
+        if platform.system() == "Windows":
             ps_script = r"""
 Add-Type -AssemblyName System.Windows.Forms | Out-Null
 $ofd = New-Object System.Windows.Forms.OpenFileDialog
@@ -1393,31 +1652,164 @@ if ($ofd.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
             path = (proc.stdout or "").strip()
             if path:
                 return path
-        elif system == "Darwin":
-            proc = subprocess.run(
-                ["osascript", "-e",
-                 'POSIX path of (choose file of type {"parquet"} with prompt "Select a Parquet file")'],
-                capture_output=True, text=True, check=False
-            )
-            path = (proc.stdout or "").strip()
-            if path:
-                return path
-        elif system == "Linux":
-            # Try zenity (GTK), then kdialog (KDE)
-            for cmd in [
-                ["zenity", "--file-selection", "--file-filter=Parquet files | *.parquet", "--title=Select a Parquet file"],
-                ["kdialog", "--getopenfilename", ".", "*.parquet"],
-            ]:
-                try:
-                    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
-                    path = (proc.stdout or "").strip()
-                    if path:
-                        return path
-                except FileNotFoundError:
-                    continue
-    except Exception:
-        _warn("File picker unavailable — falling back to text input")
-    return input("Dataset path (.parquet or HF Hub ID): ").strip()
+    except Exception as e:
+        _warn(f"PowerShell file picker failed — falling back to text input")
+    return input("Dataset path (.parquet): ").strip()
+
+
+# ── Base model discovery & selection ──────────────────────────────────────────
+# Replaces the previous hardcoded BASE_MODEL default. Scans user-friendly
+# directories and the HF hub cache, then presents an interactive picker.
+# Override at any time with --base_model <path> on the command line.
+
+_LOCAL_MODEL_MARKERS = (
+    "config.json",
+    "model.safetensors",
+    "pytorch_model.bin",
+    "tokenizer_config.json",
+    "tokenizer.model",
+)
+
+
+def _match_profile_key(model_path: str) -> str:
+    """Return the first MODEL_PROFILES key whose name appears in the path basename."""
+    name = os.path.basename(model_path).lower()
+    for key in MODEL_PROFILES:
+        if key in name:
+            return key
+    return "default"
+
+
+def _inspect_model_dir(path: str) -> dict | None:
+    """Return {path, name, arch, size_gb} if path looks like a local model, else None."""
+    if not os.path.isdir(path):
+        return None
+    try:
+        entries = set(os.listdir(path))
+    except OSError:
+        return None
+    if not entries.intersection(_LOCAL_MODEL_MARKERS):
+        return None
+
+    size_bytes = 0
+    for root, _, files in os.walk(path):
+        for f in files:
+            try:
+                fp = os.path.join(root, f)
+                if os.path.isfile(fp):
+                    size_bytes += os.path.getsize(fp)
+            except OSError:
+                pass
+
+    return {
+        "path":    path,
+        "name":    os.path.basename(path),
+        "arch":    _match_profile_key(path),
+        "size_gb": size_bytes / (1024 ** 3),
+    }
+
+
+def _scan_local_models() -> list:
+    """Discover every local model under D:\\HF_Models\\ and the HF hub cache."""
+    candidates = []
+    seen = set()
+
+    # 1. User-friendly flat directories: D:\HF_Models\<model> and ~/HF_Models/<model>
+    for user_dir in (r"D:\HF_Models", os.path.join(os.path.expanduser("~"), "HF_Models")):
+        if not os.path.isdir(user_dir):
+            continue
+        for entry in os.listdir(user_dir):
+            full = os.path.join(user_dir, entry)
+            if not os.path.isdir(full) or full in seen:
+                continue
+            info = _inspect_model_dir(full)
+            if info:
+                candidates.append(info)
+                seen.add(full)
+
+    # 2. Standard HF hub cache layout: <root>/hub/models--<org>--<name>/snapshots/<hash>/
+    cache_roots = []
+    env_cache = os.environ.get("HF_HUB_CACHE", "").strip()
+    if env_cache:
+        cache_roots.append(env_cache)
+    if os.path.isdir(r"D:\HF_Cache\hub"):
+        cache_roots.append(r"D:\HF_Cache\hub")
+    cache_roots.append(os.path.join(os.path.expanduser("~"), ".cache", "huggingface", "hub"))
+
+    for cache_root in cache_roots:
+        if not os.path.isdir(cache_root):
+            continue
+        for entry in os.listdir(cache_root):
+            if not entry.startswith("models--"):
+                continue
+            snapshots_dir = os.path.join(cache_root, entry, "snapshots")
+            if not os.path.isdir(snapshots_dir):
+                continue
+            try:
+                snaps = os.listdir(snapshots_dir)
+            except OSError:
+                continue
+            if not snaps:
+                continue
+            snaps.sort(key=lambda s: os.path.getmtime(os.path.join(snapshots_dir, s)), reverse=True)
+            full = os.path.join(snapshots_dir, snaps[0])
+            if full in seen or not os.path.isdir(full):
+                continue
+            info = _inspect_model_dir(full)
+            if info:
+                # Display as <org>/<name>; e.g. "microsoft/Phi-3-vision-128k-instruct"
+                info["name"] = entry.replace("models--", "").replace("--", "/", 1).replace("--", "/")
+                candidates.append(info)
+                seen.add(full)
+
+    return candidates
+
+
+def select_base_model(image_mode: bool = False) -> str:
+    """Interactive picker. Returns the absolute path to the chosen local model."""
+    candidates = _scan_local_models()
+
+    if image_mode:
+        # Filter to vision-capable profiles only when --image is set
+        vision_archs = {k for k, v in MODEL_PROFILES.items() if v.get("vision")}
+        before = len(candidates)
+        candidates = [c for c in candidates if c["arch"] in vision_archs]
+        if not candidates and before:
+            _warn("--image was set but no vision-capable local models were found.")
+
+    print()
+    _info("Available local models:")
+    if not candidates:
+        _warn("No local models found in D:\\HF_Models\\ or the HF hub cache.")
+        print()
+        typed = input("  Enter a model path, or Ctrl+C to abort: ").strip()
+        if not typed:
+            raise RuntimeError("[ERROR] No model selected.")
+        if not os.path.isdir(typed):
+            raise RuntimeError(f"[ERROR] Path does not exist or is not a directory: {typed!r}")
+        return typed
+
+    print()
+    for i, c in enumerate(candidates, 1):
+        size = c["size_gb"]
+        size_str = f"{size:.2f} GB" if size < 100 else f"{size/1024:.2f} TB"
+        print(f"  [{i}] {c['name']}   arch={c['arch']}, {size_str}")
+        print(f"        {c['path']}")
+    print()
+
+    while True:
+        choice = input(f"  Select base model [1-{len(candidates)}] or paste a path: ").strip()
+        if not choice:
+            continue
+        if choice.isdigit():
+            idx = int(choice) - 1
+            if 0 <= idx < len(candidates):
+                return candidates[idx]["path"]
+            _warn(f"Enter a number between 1 and {len(candidates)}, or paste a path.")
+            continue
+        if os.path.isdir(choice):
+            return choice
+        raise RuntimeError(f"[ERROR] {choice!r} is not a valid number or existing directory.")
 
 
 def main():
@@ -1427,28 +1819,20 @@ def main():
     parser.add_argument('--code',       action='store_true', help="Preserve code formatting and indentation")
     parser.add_argument('--epoch',      type=int, default=1, help="Number of training epochs (default: 1)")
     parser.add_argument('--steps',      type=int, help="Terminate after a fixed number of steps")
-    parser.add_argument('--image',      action='store_true', help="Enable multimodal (image+text) training")
+    parser.add_argument('--image',      action='store_true', help="Enable multimodal (image+text) training via Phi-3-Vision")
     parser.add_argument('--hf_dataset', type=str, default=None, help="HuggingFace Hub dataset ID (e.g. username/dataset-name)")
-    parser.add_argument('--base_model', type=str, default=None, help="Override base model path (default: HF_MODEL_DIR env var)")
-    parser.add_argument('--output_dir', type=str, default=None, help="Override output dir (default: TRAINER_OUTPUT env var)")
+    parser.add_argument('--base_model', type=str, default=None, help="Override base model path (default: BASE_MODEL or BASE_MODEL_IMAGE constant)")
     parsed_args, _ = parser.parse_known_args()
     force_epoch  = parsed_args.force
     image_mode   = parsed_args.image
 
-    # Allow runtime override of output directory via --output_dir flag
-    global OUTPUT_DIR, MERGED_DIR, MERGE_SUCCESS_FLAG, TRAINING_CHAIN_PATH
-    if parsed_args.output_dir:
-        OUTPUT_DIR = parsed_args.output_dir
-        MERGED_DIR = os.path.join(OUTPUT_DIR, "merged")
-        MERGE_SUCCESS_FLAG = os.path.join(MERGED_DIR, "success.txt")
-
     # Resolve base model: CLI arg > hardcoded constant
-    _banner("Reforge")
+    _title("REFORGE", subtitle="LoRA fine-tuning pipeline")
     if parsed_args.base_model:
         resolved_base = parsed_args.base_model
         _info(f"Base model override: {resolved_base}")
     else:
-        resolved_base = BASE_MODEL_IMAGE if image_mode else BASE_MODEL
+        resolved_base = select_base_model(image_mode=image_mode)
 
     modes = []
     if parsed_args.latex:
@@ -1482,7 +1866,7 @@ def main():
             _warn(f"Could not auto-detect cleaning mode: {e}")
 
     if image_mode:
-        _info("Image mode enabled (multimodal vision+text)")
+        _info("Image mode enabled (Phi-3-Vision / multimodal)")
 
     train_dataset, eval_dataset, tokenizer, training_mode, model_name, processor = load_and_prepare_dataset(
         dataset_path, cleaning_mode, image_mode=image_mode, base_model_override=resolved_base
@@ -1531,10 +1915,16 @@ def main():
         _info("Early stop: disabled")
 
     selected_scheduler = select_scheduler(train_dataset.num_rows, num_train_epochs, min_stop_steps)
-    _banner("Training Config")
-    _info(f"Rows: {len(train_dataset):,}  |  Steps: {total_steps}  |  Epochs: {num_train_epochs}")
-    _info(f"Scheduler: {selected_scheduler.upper()}  |  LR: {profile['learning_rate']}  |  Batch: {BATCH_SIZE}  |  Grad accum: {profile['grad_accum']}")
     dynamic_warmup = max(75, int(0.01 * total_steps))
+    _table("Training Config", [
+        ("Rows",          f"{len(train_dataset):,}"),
+        ("Steps",         f"{total_steps:,}"),
+        ("Epochs",        f"{num_train_epochs}"),
+        ("Scheduler",     selected_scheduler.upper()),
+        ("Learning rate", f"{profile['learning_rate']}"),
+        ("Batch size",    f"{BATCH_SIZE}  (effective {BATCH_SIZE * profile['grad_accum']} with grad accum {profile['grad_accum']})"),
+        ("Warmup",        f"{dynamic_warmup} steps"),
+    ])
 
     args = TrainingArguments(
         output_dir=OUTPUT_DIR,
@@ -1588,7 +1978,7 @@ def main():
 
         if total_steps < 1:
             _err("Not enough data to train!")
-            sys.exit(1)
+            exit()
 
         _banner("Training")
         _info(f"Train rows: {len(train_dataset):,}  |  Steps: {total_steps}  |  Warmup: {dynamic_warmup}")
@@ -1599,8 +1989,8 @@ def main():
         # loop begins.  This primes:
         #   • the CUDA memory allocator (finds its steady-state pool size)
         #   • PyTorch's kernel dispatch cache for the actual tensor shapes
-        # Without this, the first several training steps trigger repeated kernel
-        # JIT compilations that show up as step-time variance during early training.
+        # Without this, the first 5–15 training steps trigger repeated kernel
+        # JIT compilations that show up as the 70s→4s staircase slowdown.
         # Skipped in image mode — the vision encoder warmup is handled
         # differently and gradient checkpointing makes a no_grad pass unsafe.
         if not image_mode and torch.cuda.is_available():
@@ -1638,7 +2028,15 @@ def main():
             trainer.train(resume_from_checkpoint=last_ckpt)
         else:
             trainer.train()
-        gpu_cleanup()
+        summarize_training(
+            trainer,
+            dataset_size=len(train_dataset),
+            num_train_epochs=num_train_epochs,
+            batch_size=BATCH_SIZE,
+            grad_accum=profile["grad_accum"],
+            report_path=os.path.join(MERGED_DIR, "training_report.json"),
+        )
+        roc()
     except KeyboardInterrupt:
         _warn("Keyboard interrupt — saving current state...")
         if isinstance(model, PeftModel):

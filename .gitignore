@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Runtime state / debug
+training_chain.txt
+bugreport.txt
+_runtime_check.py
+_runtime_check2.py
+_spot_check.py
+*.log
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
