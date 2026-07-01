@@ -90,8 +90,8 @@ def main():
         merge_dir=merge_dir,
     )
 
-    if model is None:
-        return
+    if training_error is not None:
+        raise training_error
 
     from peft import PeftModel
     if isinstance(model, PeftModel):
