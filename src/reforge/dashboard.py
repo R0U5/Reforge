@@ -1,18 +1,3 @@
-#!/usr/bin/env python3
-"""
-Reforge Dashboard — Unified UI for Reforge + Loss Analyzer.
-
-Single-window layout:
-  Left  — config editor for all trainer flags, start/stop, status
-  Right — live loss chart updated in real-time from trainer stdout
-
-Trainer stdout/stderr is piped through the dashboard and forwarded to the
-terminal line-by-line, so PowerShell still shows full CLI debug output.
-Loss-bearing lines are also parsed to feed the live chart.
-
-Usage:  Place next to reforge.py, then:  python reforge_dashboard.py
-"""
-
 import json
 import os
 import platform
@@ -28,8 +13,6 @@ from tkinter import filedialog, messagebox, ttk
 
 import numpy as np
 
-# Force UTF-8 on our own stdout/stderr so forwarded trainer output doesn't
-# crash on Windows terminals that default to cp1252
 if sys.stdout and hasattr(sys.stdout, "reconfigure"):
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -50,9 +33,9 @@ from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  SHARED HELPERS
-# ═══════════════════════════════════════════════════════════════════════════════
+def main():
+    ReforgeDashboard().run()
+
 
 try:
     from scipy.ndimage import uniform_filter1d as _uniform_filter1d
@@ -72,13 +55,9 @@ except Exception:
 
 
 def try_parse_loss_line(line: str) -> dict | None:
-    """Try to extract a loss dict from a single stdout line.
-    Only matches lines that look like dict literals: must contain { and 'loss'.
-    """
     line = line.strip()
     if not line or "{" not in line or "'loss'" not in line and '"loss"' not in line:
         return None
-    # Try JSON first
     for attempt in (line, re.sub(r"(?<!\\)'", '"', line)):
         try:
             obj = json.loads(attempt)
@@ -86,7 +65,6 @@ def try_parse_loss_line(line: str) -> dict | None:
                 return obj
         except Exception:
             pass
-    # Try extracting a {...} block from the line
     m = re.search(r"\{[^{}]+\}", line)
     if m:
         try:
@@ -99,7 +77,6 @@ def try_parse_loss_line(line: str) -> dict | None:
 
 
 def parse_loss_input(raw_input: str) -> list[dict]:
-    """Parse multi-line JSONL / pasted blobs into a list of log dicts."""
     parsed = []
     for line in raw_input.splitlines():
         entry = try_parse_loss_line(line)
@@ -118,7 +95,6 @@ def parse_loss_input(raw_input: str) -> list[dict]:
 
 
 def parse_trainer_state(path: str) -> list[dict]:
-    """Read HuggingFace trainer_state.json → log entries with 'loss'."""
     try:
         with open(path, "r", encoding="utf-8") as f:
             state = json.load(f)
@@ -151,37 +127,11 @@ def trend_label(norm: float) -> str:
     else:                  return "Strong Rise"
 
 
-# ─── Model profiles (display-only mirror) ─────────────────────────────────────
-MODEL_PROFILES = {
-    "phi-2":        {"lora_r": 16, "lora_alpha": 32, "targets": "q/k/v/o_proj",
-                     "grad_accum": 16, "lr": 2e-5, "attn": "sdpa"},
-    "phi-3-vision": {"lora_r": 16, "lora_alpha": 32, "targets": "q/k/v/o_proj",
-                     "grad_accum":  8, "lr": 1e-5, "attn": "eager"},
-    "phi-3":        {"lora_r": 16, "lora_alpha": 32, "targets": "q/k/v/o_proj",
-                     "grad_accum":  8, "lr": 1e-5, "attn": "sdpa"},
-}
-_DEFAULT_PROFILE = {"lora_r": 16, "lora_alpha": 32, "targets": "q/k/v/o_proj",
-                    "grad_accum": 8, "lr": 2e-5, "attn": "sdpa"}
-
-
-def resolve_profile_for_display(model_path: str) -> tuple[str, dict]:
-    name = os.path.basename(model_path).lower() if model_path else ""
-    for key in ("phi-3-vision", "phi-3", "phi-2"):
-        if key in name:
-            return key, MODEL_PROFILES[key]
-    return "(default)", _DEFAULT_PROFILE
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  DASHBOARD
-# ═══════════════════════════════════════════════════════════════════════════════
 class ReforgeDashboard:
-    _SCRIPT_DIR     = Path(__file__).resolve().parent
-    _TRAINER_SCRIPT = _SCRIPT_DIR / "reforge.py"
-
     _DEFAULTS = dict(
-        base_model = "D:/HF_Models/phi-3-vision",
-        output_dir = "D:/Trainer_Data/Merged_model",
+        base_model = "",
+        output_dir = os.environ.get("REFORGE_OUTPUT_DIR",
+                                     os.path.join(os.path.expanduser("~"), "Reforge_Output")),
         epoch      = "1",
         steps      = "",
     )
@@ -192,24 +142,20 @@ class ReforgeDashboard:
         self.root.geometry("1180x780")
         self.root.minsize(920, 600)
 
-        # Subprocess
         self._proc: subprocess.Popen | None = None
         self._running = False
         self._stdout_thread: threading.Thread | None = None
         self._stderr_thread: threading.Thread | None = None
 
-        # Live data (fed by stdout reader thread)
         self._line_queue: queue.Queue = queue.Queue()
-        self._live_logs: list[dict] = []     # parsed loss entries
+        self._live_logs: list[dict] = []
         self._step_count = 0
         self._loss_header_printed = False
 
         self._style_setup()
         self._build_ui()
-        self._update_profile_display()
         self._update_cmd_preview()
 
-        # Tick: drain the queue and refresh chart
         self.root.after(200, self._tick)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -224,9 +170,6 @@ class ReforgeDashboard:
         style.configure("Run.TButton",   font=("Segoe UI", 10, "bold"))
         style.configure("Stop.TButton",  font=("Segoe UI", 10, "bold"))
 
-    # ──────────────────────────────────────────────────────────────────────
-    #  UI
-    # ──────────────────────────────────────────────────────────────────────
     def _build_ui(self):
         main = ttk.Frame(self.root, padding=6)
         main.pack(fill="both", expand=True)
@@ -234,11 +177,9 @@ class ReforgeDashboard:
         paned = ttk.PanedWindow(main, orient="horizontal")
         paned.pack(fill="both", expand=True)
 
-        # ═══ LEFT: config (scrollable) + pinned buttons ═══
         left = ttk.Frame(paned, padding=4)
         paned.add(left, weight=1)
 
-        # Buttons first (pack bottom, claimed first)
         btn = ttk.Frame(left, padding=(6, 6))
         btn.pack(fill="x", side="bottom")
         ttk.Separator(left, orient="horizontal").pack(
@@ -257,7 +198,6 @@ class ReforgeDashboard:
         self._lbl_status = ttk.Label(btn, text="Idle", style="Status.TLabel")
         self._lbl_status.pack(side="left", padx=12)
 
-        # Scrollable config area (fills remaining space above buttons)
         scroll_frame = ttk.Frame(left)
         scroll_frame.pack(fill="both", expand=True)
 
@@ -277,13 +217,11 @@ class ReforgeDashboard:
         sb.pack(side="right", fill="y")
         canvas.pack(side="left", fill="both", expand=True)
 
-        # Scoped mousewheel
         def _on_mw(event):
             canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
         canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _on_mw))
         canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
 
-        # ── Config fields ──
         row = 0
 
         ttk.Label(cfg, text="Paths", style="Header.TLabel").grid(
@@ -293,18 +231,16 @@ class ReforgeDashboard:
         self._var_base_model = tk.StringVar(value=self._DEFAULTS["base_model"])
         ttk.Entry(cfg, textvariable=self._var_base_model, width=38).grid(
             row=row, column=1, sticky="ew", padx=4)
-        ttk.Button(cfg, text="…", width=3,
+        ttk.Button(cfg, text="\u2026", width=3,
                    command=lambda: self._browse_dir(self._var_base_model)).grid(
             row=row, column=2)
-        self._var_base_model.trace_add("write",
-                                        lambda *_: self._update_profile_display())
         row += 1
 
         ttk.Label(cfg, text="Output Dir:").grid(row=row, column=0, sticky="w")
         self._var_output_dir = tk.StringVar(value=self._DEFAULTS["output_dir"])
         e_out = ttk.Entry(cfg, textvariable=self._var_output_dir, width=38)
         e_out.grid(row=row, column=1, sticky="ew", padx=4)
-        e_out.configure(state="readonly")  # trainer hardcodes this — display only
+        e_out.configure(state="readonly")
         ttk.Label(cfg, text="(trainer)", foreground="gray").grid(
             row=row, column=2, sticky="w")
         row += 1
@@ -313,7 +249,7 @@ class ReforgeDashboard:
         self._var_dataset = tk.StringVar()
         ttk.Entry(cfg, textvariable=self._var_dataset, width=38).grid(
             row=row, column=1, sticky="ew", padx=4)
-        ttk.Button(cfg, text="…", width=3,
+        ttk.Button(cfg, text="\u2026", width=3,
                    command=self._browse_dataset).grid(row=row, column=2)
         row += 1
 
@@ -328,7 +264,6 @@ class ReforgeDashboard:
         ttk.Separator(cfg, orient="horizontal").grid(
             row=row, column=0, columnspan=3, sticky="ew", pady=8); row += 1
 
-        # Training params
         ttk.Label(cfg, text="Training", style="Header.TLabel").grid(
             row=row, column=0, columnspan=3, sticky="w", pady=(0, 4)); row += 1
 
@@ -350,7 +285,6 @@ class ReforgeDashboard:
         ttk.Separator(cfg, orient="horizontal").grid(
             row=row, column=0, columnspan=3, sticky="ew", pady=8); row += 1
 
-        # Flags
         ttk.Label(cfg, text="Flags", style="Header.TLabel").grid(
             row=row, column=0, columnspan=3, sticky="w", pady=(0, 4)); row += 1
 
@@ -367,26 +301,13 @@ class ReforgeDashboard:
                         variable=self._var_code).grid(
             row=row, column=0, columnspan=3, sticky="w"); row += 1
         self._var_image = tk.BooleanVar()
-        ttk.Checkbutton(cfg, text="--image  (multimodal Phi-3-Vision)",
+        ttk.Checkbutton(cfg, text="--image  (multimodal)",
                         variable=self._var_image).grid(
             row=row, column=0, columnspan=3, sticky="w"); row += 1
 
         ttk.Separator(cfg, orient="horizontal").grid(
             row=row, column=0, columnspan=3, sticky="ew", pady=8); row += 1
 
-        # Resolved profile
-        ttk.Label(cfg, text="Resolved Profile", style="Header.TLabel").grid(
-            row=row, column=0, columnspan=3, sticky="w", pady=(0, 4)); row += 1
-        self._profile_text = tk.Text(
-            cfg, height=6, width=44, font=("Consolas", 9),
-            state="disabled", bg="#f4f4f4", relief="groove", bd=1)
-        self._profile_text.grid(
-            row=row, column=0, columnspan=3, sticky="ew", padx=2); row += 1
-
-        ttk.Separator(cfg, orient="horizontal").grid(
-            row=row, column=0, columnspan=3, sticky="ew", pady=8); row += 1
-
-        # Command preview
         ttk.Label(cfg, text="Command Preview", style="Header.TLabel").grid(
             row=row, column=0, columnspan=3, sticky="w", pady=(0, 4)); row += 1
         self._cmd_preview = tk.Text(
@@ -395,7 +316,6 @@ class ReforgeDashboard:
         self._cmd_preview.grid(
             row=row, column=0, columnspan=3, sticky="ew", padx=2); row += 1
 
-        # Wire live-preview updates
         for v in (self._var_base_model, self._var_dataset,
                   self._var_hf_dataset, self._var_epoch, self._var_steps):
             v.trace_add("write", lambda *_: self._update_cmd_preview())
@@ -404,7 +324,6 @@ class ReforgeDashboard:
 
         cfg.columnconfigure(1, weight=1)
 
-        # ═══ RIGHT: live chart + analysis buttons ═══
         right = ttk.Frame(paned, padding=4)
         paned.add(right, weight=2)
 
@@ -414,13 +333,12 @@ class ReforgeDashboard:
         self._live_ax  = self._live_fig.add_subplot(111)
         self._live_ax.set_xlabel("Step")
         self._live_ax.set_ylabel("Loss")
-        self._live_ax.set_title("Waiting for training data…")
+        self._live_ax.set_title("Waiting for training data\u2026")
         self._live_fig.tight_layout()
 
         self._live_canvas = FigureCanvasTkAgg(self._live_fig, master=right)
         self._live_canvas.get_tk_widget().pack(fill="both", expand=True)
 
-        # Toolbar + analysis buttons
         tb_frame = ttk.Frame(right)
         tb_frame.pack(fill="x")
         NavigationToolbar2Tk(self._live_canvas, tb_frame)
@@ -434,9 +352,6 @@ class ReforgeDashboard:
         ttk.Button(chart_btn, text="Clear",
                    command=self._clear_live).pack(side="left", padx=4)
 
-    # ──────────────────────────────────────────────────────────────────────
-    #  CONFIG HELPERS
-    # ──────────────────────────────────────────────────────────────────────
     def _browse_dir(self, var: tk.StringVar):
         d = filedialog.askdirectory()
         if d:
@@ -448,23 +363,8 @@ class ReforgeDashboard:
         if p:
             self._var_dataset.set(p)
 
-    def _update_profile_display(self):
-        name, prof = resolve_profile_for_display(self._var_base_model.get())
-        lines = [
-            f"  Profile:    {name}",
-            f"  LoRA r/a:   {prof['lora_r']} / {prof['lora_alpha']}",
-            f"  Targets:    {prof['targets']}",
-            f"  Grad Accum: {prof['grad_accum']}",
-            f"  LR:         {prof['lr']}",
-            f"  Attention:  {prof['attn']}",
-        ]
-        self._profile_text.configure(state="normal")
-        self._profile_text.delete("1.0", "end")
-        self._profile_text.insert("1.0", "\n".join(lines))
-        self._profile_text.configure(state="disabled")
-
     def _build_cmd(self) -> list[str]:
-        cmd = [sys.executable, str(self._TRAINER_SCRIPT)]
+        cmd = [sys.executable, "-m", "reforge"]
         base = self._var_base_model.get().strip()
         if base:
             cmd += ["--base_model", base]
@@ -487,7 +387,7 @@ class ReforgeDashboard:
 
     def _update_cmd_preview(self):
         cmd = self._build_cmd()
-        display = ["python reforge.py"] + cmd[2:]
+        display = cmd[:]  # Show all including python -m reforge
         grouped = []
         i = 0
         while i < len(display):
@@ -505,9 +405,6 @@ class ReforgeDashboard:
         self._cmd_preview.insert("1.0", text)
         self._cmd_preview.configure(state="disabled")
 
-    # ──────────────────────────────────────────────────────────────────────
-    #  TRAINING — start / stop / reader threads
-    # ──────────────────────────────────────────────────────────────────────
     def _start_training(self):
         if self._running:
             messagebox.showwarning("Busy", "A training run is already active.")
@@ -521,7 +418,6 @@ class ReforgeDashboard:
                 "Select a .parquet file or enter a HuggingFace dataset ID.")
             return
 
-        # Validate: local paths must exist and be .parquet
         dataset_path = hf or ds
         is_local = os.path.exists(dataset_path)
         if is_local and not dataset_path.lower().endswith(".parquet"):
@@ -537,7 +433,6 @@ class ReforgeDashboard:
 
         cmd = self._build_cmd()
 
-        # Reset live data + drain any stale entries from a previous run
         self._live_logs.clear()
         while not self._line_queue.empty():
             try:
@@ -545,14 +440,10 @@ class ReforgeDashboard:
             except queue.Empty:
                 break
         self._live_ax.clear()
-        self._live_ax.set_title("Starting…")
+        self._live_ax.set_title("Starting\u2026")
         self._live_canvas.draw_idle()
 
         try:
-            # Force UTF-8 output from the trainer so unicode (─, ✔, ⚠) doesn't
-            # crash on Windows cp1252 pipes.
-            # PYTHONUNBUFFERED forces line-by-line flushing — without it, output
-            # gets stuck in a large internal buffer when stdout is a pipe.
             env = os.environ.copy()
             env["PYTHONIOENCODING"] = "utf-8"
             env["PYTHONUNBUFFERED"] = "1"
@@ -560,7 +451,6 @@ class ReforgeDashboard:
             kw = dict(
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                cwd=str(self._SCRIPT_DIR),
                 env=env,
             )
             if platform.system() == "Windows":
@@ -573,9 +463,8 @@ class ReforgeDashboard:
         self._running = True
         self._btn_start.configure(state="disabled")
         self._btn_stop.configure(state="normal")
-        self._lbl_status.configure(text="Training…")
+        self._lbl_status.configure(text="Training\u2026")
 
-        # Reader threads: forward to terminal + queue loss lines
         self._step_count = 0
         self._loss_header_printed = False
         self._stdout_thread = threading.Thread(
@@ -585,8 +474,6 @@ class ReforgeDashboard:
         self._stdout_thread.start()
         self._stderr_thread.start()
 
-    # Lines to suppress from terminal (noise that clutters debugging).
-    # Keep patterns specific to avoid hiding real tracebacks.
     _SUPPRESS_PATTERNS = (
         "FutureWarning: `tokenizer` is deprecated",
         "UserWarning: The PEFT config's `base_model_name_or_path` was renamed",
@@ -594,7 +481,6 @@ class ReforgeDashboard:
     )
 
     def _write_line(self, dest, line: str):
-        """Write a line to the terminal, handling encoding errors."""
         try:
             dest.write(line)
             dest.flush()
@@ -605,22 +491,15 @@ class ReforgeDashboard:
             pass
 
     def _reader_stdout(self, pipe):
-        """Read stdout: format loss lines cleanly, forward the rest as-is."""
         try:
             for raw in iter(pipe.readline, b""):
                 line = raw.decode("utf-8", errors="replace")
-
-                # Suppress known noisy lines
                 if any(p in line for p in self._SUPPRESS_PATTERNS):
                     continue
-
-                # Try to parse as a loss entry
                 entry = try_parse_loss_line(line)
                 if entry:
                     self._step_count += 1
                     self._line_queue.put(entry)
-
-                    # Print column header once
                     if not self._loss_header_printed:
                         self._loss_header_printed = True
                         hdr = (
@@ -629,23 +508,18 @@ class ReforgeDashboard:
                             f"{'lr':<12}  "
                             f"{'grad_norm':<10}  "
                             f"{'epoch'}\n"
-                            f"  {'─'*58}\n"
+                            f"  {'-'*58}\n"
                         )
                         self._write_line(sys.stdout, hdr)
-
-                    # Format a clean debug line
                     loss = entry.get("loss", 0)
                     lr   = entry.get("learning_rate", 0)
                     ep   = entry.get("epoch", 0)
                     gnorm = entry.get("grad_norm", 0)
                     step  = entry.get("step", self._step_count)
-
-                    # Compact LR display
                     if lr > 0:
                         lr_str = f"{lr:.2e}"
                     else:
                         lr_str = "0"
-
                     formatted = (
                         f"  step {step:<6}  "
                         f"loss {loss:<8.4f}  "
@@ -655,7 +529,6 @@ class ReforgeDashboard:
                     )
                     self._write_line(sys.stdout, formatted)
                 else:
-                    # Pass through all other trainer output as-is
                     self._write_line(sys.stdout, line)
         except Exception:
             pass
@@ -666,15 +539,12 @@ class ReforgeDashboard:
                 pass
 
     def _reader_stderr(self, pipe):
-        """Read stderr in small chunks so tqdm \\r progress bars display.
-        readline() would block until \\n, hiding all tqdm updates."""
         try:
             while True:
                 chunk = pipe.read(256)
                 if not chunk:
                     break
                 text = chunk.decode("utf-8", errors="replace")
-                # Suppress known noisy warnings
                 if any(p in text for p in self._SUPPRESS_PATTERNS):
                     continue
                 self._write_line(sys.stderr, text)
@@ -696,13 +566,9 @@ class ReforgeDashboard:
                 self._proc.send_signal(signal.SIGINT)
         except Exception as e:
             messagebox.showwarning("Stop", f"Could not send interrupt: {e}")
-        self._lbl_status.configure(text="Stopping (saving)…")
+        self._lbl_status.configure(text="Stopping (saving)\u2026")
 
-    # ──────────────────────────────────────────────────────────────────────
-    #  TICK — drain queue, refresh chart, check process
-    # ──────────────────────────────────────────────────────────────────────
     def _tick(self):
-        # Drain queue
         dirty = False
         while True:
             try:
@@ -715,7 +581,6 @@ class ReforgeDashboard:
         if dirty:
             self._refresh_live_chart()
 
-        # Check process
         if self._proc is not None:
             retcode = self._proc.poll()
             if retcode is not None:
@@ -741,15 +606,12 @@ class ReforgeDashboard:
         ax = self._live_ax
         ax.clear()
 
-        # Raw
         ax.plot(x, y, alpha=0.25, color="#1f77b4", linewidth=0.8)
 
-        # Smoothed
         if len(y) >= 5:
             k = min(max(5, len(y) // 20), 51)
             ax.plot(x, smooth_series(y, k), color="#1f77b4", linewidth=1.5)
 
-        # Best marker
         bi = int(np.argmin(y))
         ax.scatter([x[bi]], [y[bi]], color="green", s=30, zorder=5)
 
@@ -763,9 +625,6 @@ class ReforgeDashboard:
         self._live_fig.tight_layout()
         self._live_canvas.draw_idle()
 
-    # ──────────────────────────────────────────────────────────────────────
-    #  CHART ACTIONS
-    # ──────────────────────────────────────────────────────────────────────
     def _clear_live(self):
         self._live_logs.clear()
         self._loss_header_printed = False
@@ -777,14 +636,12 @@ class ReforgeDashboard:
         self._live_canvas.draw_idle()
 
     def _load_external_logs(self):
-        """Load a JSONL file or trainer_state.json into the live chart."""
         p = filedialog.askopenfilename(
             filetypes=[("JSONL", "*.jsonl"),
                        ("JSON", "*.json"),
                        ("All", "*.*")])
         if not p:
             return
-        # Try trainer_state.json format first
         logs = parse_trainer_state(p)
         if not logs:
             try:
@@ -799,9 +656,6 @@ class ReforgeDashboard:
         self._live_logs = logs
         self._refresh_live_chart()
 
-    # ──────────────────────────────────────────────────────────────────────
-    #  FULL ANALYSIS (opens detailed matplotlib window)
-    # ──────────────────────────────────────────────────────────────────────
     def _full_analysis(self):
         logs = self._live_logs
         if len(logs) < 3:
@@ -832,7 +686,6 @@ class ReforgeDashboard:
         imp_abs  = float(start - y_mean)
         imp_pct  = 100.0 * imp_abs / max(start, 1e-8)
 
-        # Global slope & SNR
         gc       = np.polyfit(x, smoothed, 1)
         gslope_n = float(gc[0]) * 100.0
         g_med    = float(np.median(y))
@@ -840,7 +693,6 @@ class ReforgeDashboard:
         g_noise  = g_mad if g_mad > 1e-8 else float(np.std(y))
         g_snr    = float(abs(gc[0]) / (g_noise + 1e-8))
 
-        # Recent window
         win = min(max(10, len(y) // 10), 200)
         xw  = x[-win:]; yw = smoothed[-win:]
         w   = np.linspace(0.5, 1.0, num=len(xw))
@@ -859,11 +711,10 @@ class ReforgeDashboard:
             to_t = max(0, int((y[-1] - (best_v + 0.05)) / -rc[0]))
             pred = f"step {steps[-1] + to_t} (~{to_t} more)"
         else:
-            pred = "—"
+            pred = "\u2014"
 
         grade = calculate_grade(rslope_n, r_snr, exposure_pct)
 
-        # ── Plot ──
         fig, ax = plt.subplots(figsize=(12, 4))
 
         ll, = ax.plot(x, y, alpha=0.25)
@@ -871,7 +722,6 @@ class ReforgeDashboard:
         ax.scatter([x[best_i]], [best_v], color="green", s=36, zorder=3)
         ax.axhspan(best_v, best_v + 0.05, color="green", alpha=0.08)
 
-        # Outlier highlights (in the recent window)
         outlier = False
         if len(yw) > 1:
             sd = float(np.std(yw))
@@ -885,14 +735,13 @@ class ReforgeDashboard:
                                        color="red", alpha=0.05)
                             outlier = True
 
-        # Epoch boundaries
         epoch_lines = False
         for j in range(1, len(epochs)):
             if int(epochs[j-1] * 100) != int(epochs[j] * 100):
                 ax.axvline(x=float(x[j]), color="gray", ls="--", alpha=0.25)
                 epoch_lines = True
 
-        ax.set_title("Loss Analysis — Best, trend, ideal zone")
+        ax.set_title("Loss Analysis \u2014 Best, trend, ideal zone")
         ax.set_xlabel("Step")
         ax.set_ylabel("Loss")
 
@@ -932,9 +781,6 @@ class ReforgeDashboard:
                    handlelength=2.2, handletextpad=0.6, ncol=nc)
         plt.show()
 
-    # ──────────────────────────────────────────────────────────────────────
-    #  LIFECYCLE
-    # ──────────────────────────────────────────────────────────────────────
     def _on_close(self):
         if self._running and self._proc:
             if not messagebox.askyesno(
@@ -942,7 +788,6 @@ class ReforgeDashboard:
                     "Training is still running.\nStop and exit?"):
                 return
             self._stop_training()
-            # Close pipes so the subprocess doesn't block on write()
             for pipe in (self._proc.stdout, self._proc.stderr):
                 try:
                     if pipe:
@@ -959,6 +804,5 @@ class ReforgeDashboard:
         self.root.mainloop()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     ReforgeDashboard().run()

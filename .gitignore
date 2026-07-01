@@ -5,6 +5,11 @@ __pycache__/
 .venv/
 venv/
 
+# Build
+dist/
+build/
+*.egg
+
 # Runtime state / debug
 training_chain.txt
 bugreport.txt
@@ -12,6 +17,9 @@ _runtime_check.py
 _runtime_check2.py
 _spot_check.py
 *.log
+
+# Output
+Reforge_Output/
 
 # Editor / OS
 .vscode/
