@@ -244,7 +244,7 @@ def run_training(train_dataset, tokenizer, training_mode, model_name, processor,
     try:
         if total_steps < 1:
             _err("Not enough data to train!")
-            return
+            raise RuntimeError("Not enough data to train!")
 
         _banner("Training")
         _info(f"Train rows: {len(train_dataset):,}  |  Steps: {total_steps}  |  Warmup: {dynamic_warmup}")

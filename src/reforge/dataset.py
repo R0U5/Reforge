@@ -302,7 +302,6 @@ def synthesize_prompt_dataset(raw_dataset, col_question, col_chosen, col_rejecte
 
 
 def load_and_prepare_dataset(dataset_path, cleaning_mode, image_mode=False, base_model_override=None, output_dir=None, merge_dir=None, merge_success_flag=None):
-    from .config import MAX_LENGTH
     from transformers import AutoTokenizer, AutoProcessor
 
     _num_proc = min(12, os.cpu_count() or 4)
