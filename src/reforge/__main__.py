@@ -1,16 +1,12 @@
 import argparse
 import os
-import sys
 
-import pandas as pd
-
-from .config import OUTPUT_DIR, MERGED_DIR, MERGE_SUCCESS_FLAG, BATCH_SIZE, TRAINING_CHAIN_PATH
+from .config import OUTPUT_DIR
 from .display import _title, _info, _ok, _err, _warn, _banner, _enable_utf8_stdout
 from .dataset import load_and_prepare_dataset, detect_training_mode
 from .profiles import resolve_model_profile
-from .training import run_training, load_model
+from .training import run_training
 from .utils import select_base_model, select_file
-from .reporting import summarize_training
 
 
 def main():
@@ -27,8 +23,7 @@ def main():
     parser.add_argument('--base_model', type=str, default=None, help="Override base model path")
     parser.add_argument('--output_dir', type=str, default=None, help="Override output directory")
     parsed_args, _ = parser.parse_known_args()
-    force_epoch  = parsed_args.force
-    image_mode   = parsed_args.image
+    image_mode = parsed_args.image
 
     _title("REFORGE", subtitle="LoRA fine-tuning pipeline")
 
@@ -64,10 +59,14 @@ def main():
                 _err("Please select a valid .parquet file")
                 return
 
-    if cleaning_mode in {"latex", "math"} and not image_mode:
+    # Pre-flight schema check: fail fast on undetectable schemas before any
+    # model/tokenizer loading. Reads only parquet metadata, not the data.
+    if not image_mode and os.path.isfile(dataset_path):
         try:
-            df_columns = pd.read_parquet(dataset_path, engine="pyarrow", columns=None).columns
-            detect_training_mode(df_columns)
+            import pyarrow.parquet as pq
+            detect_training_mode(pq.read_schema(dataset_path).names)
+        except ValueError:
+            raise
         except Exception as e:
             _warn(f"Could not peek dataset columns: {e}")
 
@@ -121,6 +120,7 @@ def main():
     except Exception as e:
         _err(f"save_pretrained failed: {e}")
         _warn("Retrying with rebuilt base model...")
+        import torch
         if image_mode:
             base = AutoModelForVision2Seq.from_pretrained(
                 resolved_base,

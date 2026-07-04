@@ -1,5 +1,5 @@
 torch>=2.1.0
-transformers>=4.37.0
+transformers>=4.41.0
 peft>=0.7.0
 datasets>=2.16.0
 pyarrow>=14.0.0
@@ -10,3 +10,7 @@ accelerate>=0.25.0
 
 # Optional — enables emoji stripping during data cleaning
 # emoji>=2.0.0
+
+# Optional — required for the Tkinter dashboard (reforge-dashboard)
+# matplotlib>=3.7.0
+# scipy>=1.10.0  # faster loss-curve smoothing (falls back to numpy)

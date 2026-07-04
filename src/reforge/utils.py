@@ -7,7 +7,7 @@ import subprocess
 
 import torch
 
-from .display import _info, _ok, _warn, _err
+from .display import _info, _ok, _warn
 from .config import DEFAULT_HF_MODELS_DIR
 from .profiles import MODEL_PROFILES, resolve_profile_key
 
@@ -116,7 +116,7 @@ if ($ofd.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
             path = (proc.stdout or "").strip()
             if path:
                 return path
-    except Exception as e:
+    except Exception:
         _warn("PowerShell file picker failed \u2014 falling back to text input")
     return input("Dataset path (.parquet): ").strip()
 

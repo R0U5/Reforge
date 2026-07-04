@@ -2,16 +2,14 @@ import os
 import random
 import re
 
-import numpy as np
 import pandas as pd
 from datasets import Dataset, load_dataset, Sequence, Value
 
-from .config import TRAINING_CHAIN_PATH, MERGED_DIR, MERGE_SUCCESS_FLAG
+from .config import TRAINING_CHAIN_PATH, MERGED_DIR, MERGE_SUCCESS_FLAG, OUTPUT_DIR
 from .display import _info, _ok, _warn, _err, _banner
 from .profiles import resolve_model_profile
-from .tokenization import tokenize, measure_lengths, _decode_image
+from .tokenization import tokenize, measure_lengths
 from .utils import roc, log_dataset, purge_checkpoints
-from .config import OUTPUT_DIR
 
 try:
     import emoji as _emoji_mod
@@ -77,6 +75,15 @@ PUNC_TRANS = str.maketrans({"\u201c": '"', "\u201d": '"', "\u2018": "'", "\u2019
 MATH_SPACING_RE   = re.compile(r'\\(?:,|;|:|!|quad|qquad)\s*')
 MATH_WRAPPERS_RE  = re.compile(r'\\(?:mathrm|text|operatorname)\{([^}]*)\}')
 DOLLAR_INLINE_RE  = re.compile(r'(?<!\$)\$([^\$]+)\$(?!\$)')
+RE_DOLLAR_AMOUNT  = re.compile(r"\$\d[\d,]*(\.\d{1,2})?\$")
+RE_MULTISPACE     = re.compile(r"\s{2,}")
+RE_MATHRM         = re.compile(r"\\mathrm\{.*?\}")
+RE_BOXED          = re.compile(r'(?:\$+)?\\boxed\{([^}]*)\}(?:\$+)?')
+RE_CHAT_TAGS      = re.compile(r"\[/?(?:INST|SYS|USER|ASSISTANT)\]")
+RE_DOUBLE_BRACE   = re.compile(r"\{\{.*?\}\}")
+RE_SPECIAL_TOKENS = re.compile(r"<\|.*?\|>")
+RE_BOLD_MD        = re.compile(r"\*\*.*?\*\*")
+RE_NON_ASCII      = re.compile(r"[^\x00-\x7F]+")
 
 _MATH_SIMPLE_MAP = {
     r'\cdot': '*',
@@ -178,7 +185,7 @@ def unbox_field(text: str) -> str:
 
 def strip_latex(match) -> str:
     val = match.group(0)
-    return val if re.fullmatch(r"\$\d[\d,]*(\.\d{1,2})?\$", val) else ""
+    return val if RE_DOLLAR_AMOUNT.fullmatch(val) else ""
 
 
 def clean_string(s, mode: str = "math"):
@@ -199,23 +206,23 @@ def clean_string(s, mode: str = "math"):
         s = DOLLAR_INLINE_RE.sub(r"\1", s)
         s = MATH_SIMPLE_MAP_RE.sub(lambda m: _MATH_SIMPLE_MAP[m.group(0)], s)
         s = MATH_SPACING_RE.sub(" ", s)
-        s = re.sub(r"\s{2,}", " ", s).strip()
+        s = RE_MULTISPACE.sub(" ", s).strip()
 
     if mode not in {"latex", "math"}:
         s = RE_LATEX_INLINE.sub(strip_latex, s)
         s = RE_TEX_INLINE.sub("", s)
-        s = re.sub(r"\\mathrm\{.*?\}", "", s)
+        s = RE_MATHRM.sub("", s)
     s = RE_LATEX_ENV.sub("", s)
     s = RE_HTML.sub("", s)
-    s = re.sub(r'(?:\$+)?\\boxed\{([^}]*)\}(?:\$+)?', r'\1', s)
-    s = re.sub(r"\[/?(?:INST|SYS|USER|ASSISTANT)\]", "", s)
+    s = RE_BOXED.sub(r'\1', s)
+    s = RE_CHAT_TAGS.sub("", s)
     s = ANSWER_MARKER_RE.sub("", s)
-    s = re.sub(r"\{\{.*?\}\}", "", s)
-    s = re.sub(r"<\|.*?\|>", "", s)
+    s = RE_DOUBLE_BRACE.sub("", s)
+    s = RE_SPECIAL_TOKENS.sub("", s)
     s = RE_MD_HEADER.sub("", s)
     s = RE_JUNK_WORDS.sub("", s)
     s = RE_ECOM_TAGS.sub("", s)
-    s = re.sub(r"\*\*.*?\*\*", "", s)
+    s = RE_BOLD_MD.sub("", s)
     s = RE_UNICODE_GARBAGE.sub("", s)
     s = RE_MEDIA_PLACEHOLDERS.sub("", s)
     if mode not in {"latex"}:
@@ -224,7 +231,7 @@ def clean_string(s, mode: str = "math"):
     if _EMOJI_AVAILABLE:
         s = _emoji_mod.replace_emoji(s, "")
     if mode not in {"latex", "code"}:
-        s = re.sub(r"[^\x00-\x7F]+", "", s)
+        s = RE_NON_ASCII.sub("", s)
     if BAD_TOKENS_RE.search(s):
         return ""
     return s.strip()
@@ -287,7 +294,7 @@ def synthesize_prompt_dataset(raw_dataset, col_question, col_chosen, col_rejecte
         _width = 58
         if q or a:
             print(f"\n  {'-' * _width}")
-            print(f"  Sample row")
+            print("  Sample row")
             print(f"  {'-' * _width}")
         if q:
             print(f"  Prompt   : {q[:120]}{chr(0x2026) if len(q) > 120 else ''}")
@@ -353,12 +360,6 @@ def load_and_prepare_dataset(dataset_path, cleaning_mode, image_mode=False, base
     if os.path.exists(merge_success_flag):
         _ok(f"Resuming from previous merged model: {merge_dir}")
     else:
-        if base_model_override:
-            base_label = f"override: {base_model_override}"
-        elif image_mode:
-            base_label = "image base (Phi-3-Vision)"
-        else:
-            base_label = f"text base ({os.path.basename(base_model_override) if base_model_override else 'selected'})"
         _info(f"Base model: {model_name}")
 
     profile = resolve_model_profile(model_name)
@@ -389,17 +390,18 @@ def load_and_prepare_dataset(dataset_path, cleaning_mode, image_mode=False, base
     tokenizer.pad_token = tokenizer.pad_token or tokenizer.eos_token or tokenizer.unk_token
 
     if training_mode == "causal":
-        _info("Causal mode \u2014 GPT-style synthesis will be applied")
-        def synth_gpt_prompt(example):
-            instruction = example.get("instruction", "").strip()
-            input_ = example.get("input", "").strip()
-            output = example.get("output", "").strip()
-            if instruction and input_:
-                text = f"### Instruction:\n{instruction}\n\n### Input:\n{input_}\n\n### Response:\n{output}"
-            else:
-                text = f"### Instruction:\n{instruction}\n\n### Response:\n{output}"
-            return {"text": clean(text)}
-        processed = raw_dataset.map(synth_gpt_prompt, num_proc=_num_proc)
+        _info(f"Causal mode \u2014 training on raw text column '{col_chosen}'")
+        text_col = col_chosen
+        def build_causal_row(example):
+            raw = example.get(text_col)
+            return {"text": clean(str(raw)) if raw is not None else ""}
+        processed = raw_dataset.map(build_causal_row, num_proc=_num_proc)
+        cols_to_drop = [c for c in processed.column_names if c != "text"]
+        if cols_to_drop:
+            processed = processed.remove_columns(cols_to_drop)
+        before = len(processed)
+        processed = processed.filter(lambda e: bool(e["text"].strip()), num_proc=_num_proc)
+        _info(f"Retained {len(processed):,} / {before:,} rows")
     else:
         processed = synthesize_prompt_dataset(
             raw_dataset, col_question, col_chosen, col_rejected,
