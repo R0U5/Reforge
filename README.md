@@ -30,6 +30,9 @@ python -m reforge
 pip install -e .
 reforge
 
+# Install with dashboard support (matplotlib)
+pip install -e ".[dashboard]"
+
 # Specify a Hugging Face Hub dataset
 python -m reforge --hf_dataset username/dataset-name
 

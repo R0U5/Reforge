@@ -5,13 +5,12 @@ import shutil
 import torch
 from peft import LoraConfig, get_peft_model, PeftModel
 from transformers import (
-    AutoTokenizer, AutoModelForCausalLM,
-    AutoProcessor, AutoModelForVision2Seq,
+    AutoModelForCausalLM, AutoModelForVision2Seq,
     TrainingArguments, Trainer
 )
 
 from .config import BATCH_SIZE, LOG_STEPS, SAVE_STEPS, SAVE_LIMITS, OUTPUT_DIR, MERGED_DIR
-from .display import _info, _ok, _warn, _banner, _table
+from .display import _info, _ok, _warn, _err, _banner, _table
 from .profiles import resolve_model_profile
 from .early_stopping import select_scheduler, EarlyStopByLoss, compute_min_steps, dynamic_early_stop_cap
 from .reporting import summarize_training
@@ -20,7 +19,6 @@ from .utils import roc
 
 
 def load_model(tokenizer, model_name, image_mode=False, output_dir=None):
-    from .profiles import resolve_model_profile
     profile = resolve_model_profile(model_name)
     if output_dir is None:
         output_dir = OUTPUT_DIR
@@ -137,7 +135,7 @@ def print_trainable_parameters(model):
 
 
 def run_training(train_dataset, tokenizer, training_mode, model_name, processor, parsed_args, resolved_base, output_dir=None, merge_dir=None):
-    from .config import BATCH_SIZE
+    image_mode = (training_mode == "multimodal")
     if output_dir is None:
         output_dir = OUTPUT_DIR
     if merge_dir is None:
@@ -186,7 +184,9 @@ def run_training(train_dataset, tokenizer, training_mode, model_name, processor,
         _info("Early stop: disabled")
 
     selected_scheduler = select_scheduler(train_dataset.num_rows, num_train_epochs, min_stop_steps)
-    dynamic_warmup = max(75, int(0.01 * total_steps))
+    # 1% of the run, but never below 75 steps nor above 10% of the run —
+    # otherwise short runs would spend their whole schedule in warmup.
+    dynamic_warmup = min(max(75, int(0.01 * total_steps)), max(1, total_steps // 10))
     _table("Training Config", [
         ("Rows",          f"{len(train_dataset):,}"),
         ("Steps",         f"{total_steps:,}"),
@@ -226,8 +226,8 @@ def run_training(train_dataset, tokenizer, training_mode, model_name, processor,
         gradient_checkpointing=False,
     )
 
-    model = load_model(tokenizer, model_name, image_mode=(training_mode == "multimodal"), output_dir=output_dir)
-    data_collator = DynamicCausalCollator(tokenizer, pad_to_multiple_of=8, image_mode=(training_mode == "multimodal"))
+    model = load_model(tokenizer, model_name, image_mode=image_mode, output_dir=output_dir)
+    data_collator = DynamicCausalCollator(tokenizer, pad_to_multiple_of=8, image_mode=image_mode)
 
     trainer = Trainer(
         model=model,
@@ -334,7 +334,7 @@ def run_training(train_dataset, tokenizer, training_mode, model_name, processor,
             except (OSError, NotImplementedError):
                 _warn("Could not create symlink \u2014 copying instead")
                 shutil.copytree(last_path, symlink_path)
-                _ok(f"checkpoint-last \u2192 {latest}")
+            _ok(f"checkpoint-last \u2192 {latest}")
 
             backup_path = os.path.join(output_dir, "last_good_ckpt")
             shutil.copytree(last_path, backup_path, dirs_exist_ok=True)

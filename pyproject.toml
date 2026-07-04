@@ -1,17 +1,17 @@
 [build-system]
 requires = ["setuptools>=64"]
-build-backend = "setuptools.backends._legacy:_Backend"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "reforge"
 version = "1.0.0"
-description = "A single-file LoRA fine-tuning pipeline for Hugging Face models"
+description = "A modular LoRA fine-tuning pipeline for Hugging Face models"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.10"
 dependencies = [
     "torch>=2.1.0",
-    "transformers>=4.37.0",
+    "transformers>=4.41.0",
     "peft>=0.7.0",
     "datasets>=2.16.0",
     "pyarrow>=14.0.0",
@@ -20,6 +20,10 @@ dependencies = [
     "Pillow>=10.0.0",
     "accelerate>=0.25.0",
 ]
+
+[project.optional-dependencies]
+dashboard = ["matplotlib>=3.7.0"]
+emoji = ["emoji>=2.0.0"]
 
 [project.urls]
 Homepage = "https://github.com/R0U5/Reforge"

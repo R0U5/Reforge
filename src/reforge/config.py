@@ -1,5 +1,4 @@
 import os
-import sys
 import warnings
 
 warnings.filterwarnings("ignore", message="pkg_resources is deprecated", category=UserWarning)
@@ -35,11 +34,6 @@ os.environ.setdefault("CUDA_LAUNCH_BLOCKING", "0")
 DEFAULT_HF_MODELS_DIR = os.environ.get(
     "REFORGE_MODELS_DIR",
     os.path.join(os.path.expanduser("~"), "HF_Models")
-)
-
-DEFAULT_OUTPUT_DIR = os.environ.get(
-    "REFORGE_OUTPUT_DIR",
-    os.path.join(os.path.expanduser("~"), "Reforge_Output")
 )
 
 MAX_LENGTH = 750

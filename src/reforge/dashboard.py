@@ -8,7 +8,6 @@ import subprocess
 import sys
 import threading
 import tkinter as tk
-from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 import numpy as np
@@ -682,16 +681,9 @@ class ReforgeDashboard:
 
         drop_abs = float(y_max - float(np.min(y)))
         drop_pct = 100.0 * drop_abs / max(y_max, 1e-8)
-        start    = float(y[0])
-        imp_abs  = float(start - y_mean)
-        imp_pct  = 100.0 * imp_abs / max(start, 1e-8)
 
         gc       = np.polyfit(x, smoothed, 1)
         gslope_n = float(gc[0]) * 100.0
-        g_med    = float(np.median(y))
-        g_mad    = float(1.4826 * np.median(np.abs(y - g_med)))
-        g_noise  = g_mad if g_mad > 1e-8 else float(np.std(y))
-        g_snr    = float(abs(gc[0]) / (g_noise + 1e-8))
 
         win = min(max(10, len(y) // 10), 200)
         xw  = x[-win:]; yw = smoothed[-win:]
@@ -752,7 +744,8 @@ class ReforgeDashboard:
             f"global slope {gslope_n:+.2f}/100 | recent {rslope_n:+.2f}/100 | "
             f"SNR {r_snr:.2f}\n"
             f"trend {trend_label(gslope_n)}/{trend_label(rslope_n)} | "
-            f"var {drop_pct:.1f}% | exposure {exposure_pct:.1f}%"
+            f"var {drop_pct:.1f}% | exposure {exposure_pct:.1f}%\n"
+            f"est. ideal zone: {pred}"
         )
         ax.text(0.99, 0.99, summary, transform=ax.transAxes,
                 va="top", ha="right", fontsize=8,

@@ -1,5 +1,4 @@
 import json
-import math
 import os
 
 from .display import _ok, _warn, _banner, _table, _c, _ANSI_BCYAN, _ANSI_DIM, _fmt_duration
