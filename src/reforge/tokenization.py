@@ -47,7 +47,14 @@ class DynamicCausalCollator:
                 padded_labels.append(seq + [-100] * pad_needed)
             batch["labels"] = torch.tensor(padded_labels, dtype=torch.long)
         else:
-            batch["labels"] = batch["input_ids"].masked_fill(batch["attention_mask"].eq(0), -100)
+            # SFT: preserve labels created by tokenize(), only pad with -100
+            label_seqs = [list(f["labels"]) for f in features]
+            pad_len = batch["input_ids"].shape[1]
+            padded_labels = []
+            for seq in label_seqs:
+                pad_needed = pad_len - len(seq)
+                padded_labels.append(seq + [-100] * pad_needed)
+            batch["labels"] = torch.tensor(padded_labels, dtype=torch.long)
 
         if self.image_mode:
             pixel_list = [f["pixel_values"] for f in features if "pixel_values" in f]
@@ -130,6 +137,77 @@ def tokenize(example, tokenizer, training_mode="sft", max_length=750, processor=
             **({"length": len(input_ids)} if "length" not in example else {"length": int(example["length"])}),
         }
 
+    # SFT mode: use chat template to format conversation, mask prompt tokens via exact token indexing
+    if training_mode == "sft":
+        text = example.get("text", "")
+        # The dataset has text = "question\n\nanswer"
+        sep = "\n\n"
+        sep_idx = text.find(sep)
+        if sep_idx >= 0:
+            question = text[:sep_idx].strip()
+            answer = text[sep_idx + len(sep):].strip()
+        else:
+            # No separator - treat as causal
+            question = ""
+            answer = text
+
+        if question and answer:
+            # Build full conversation messages
+            messages = [
+                {"role": "user", "content": question},
+                {"role": "assistant", "content": answer}
+            ]
+
+            # Tokenize the FULL conversation with chat template
+            full_tokens = tokenizer.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=False,
+                truncation=True,
+                max_length=max_length,
+                return_dict=True,
+            )
+            input_ids = full_tokens["input_ids"]
+            attention_mask = full_tokens.get("attention_mask", [1] * len(input_ids))
+
+            # Tokenize ONLY the user message (question) with same chat template to find boundary
+            # This gives us the EXACT token count of the prompt portion
+            user_messages = [{"role": "user", "content": question}]
+            user_tokens = tokenizer.apply_chat_template(
+                user_messages,
+                tokenize=True,
+                add_generation_prompt=True,  # Include assistant prompt marker
+                truncation=True,
+                max_length=max_length,
+                return_dict=True,
+            )
+            boundary = len(user_tokens["input_ids"])
+
+            # Sanity: boundary must be valid
+            if boundary <= 0 or boundary > len(input_ids):
+                # Fallback: causal on full text
+                tokens = tokenizer(text, padding=False, truncation=True, max_length=max_length)
+                input_ids = tokens["input_ids"]
+                attention_mask = tokens.get("attention_mask", [1] * len(input_ids))
+                boundary = 0
+        else:
+            # No separator or no question - treat as causal
+            tokens = tokenizer(text, padding=False, truncation=True, max_length=max_length)
+            input_ids = tokens["input_ids"]
+            attention_mask = tokens.get("attention_mask", [1] * len(input_ids))
+            boundary = 0
+
+        # Mask prompt tokens, train on assistant response only
+        labels = [-100] * boundary + input_ids[boundary:]
+        labels = labels[:len(input_ids)]
+
+        return {
+            "input_ids": [int(x) for x in input_ids],
+            "attention_mask": [int(x) for x in attention_mask],
+            "labels": [int(x) for x in labels],
+        }
+
+    # Causal / fallback
     tokens = tokenizer(
         example["text"],
         padding=False,
@@ -164,13 +242,17 @@ def measure_lengths(ds, tokenizer):
     ds = ds.map(_len_map, num_proc=_num_proc)
     lengths = ds["length"]
     if not lengths:
-        raise ValueError("[ERROR] Dataset is empty after processing \u2014 no rows to measure lengths from.")
+        raise ValueError("[ERROR] Dataset is empty after processing — no rows to measure lengths from.")
     p50 = int(np.percentile(lengths, 50))
     p95 = int(np.percentile(lengths, 95))
     p99 = int(np.percentile(lengths, 99))
-    auto_len = max(128, min(1024, p95))
-    _info(f"Lengths \u2014 p50: {p50}  p95: {p95}  p99: {p99}  \u2192  max_length set to {auto_len}")
+    # Explicit override wins (e.g. REFORGE_MAX_LENGTH=512) — needed on 12 GB
+    # cards where the P95-derived length oversubscribes VRAM via WDDM paging.
+    override = os.environ.get("REFORGE_MAX_LENGTH", "").strip()
+    if override:
+        auto_len = max(128, int(override))
+        _info(f"Lengths — p50: {p50}  p95: {p95}  p99: {p99}  →  max_length OVERRIDDEN to {auto_len}")
+    else:
+        auto_len = max(128, min(1024, p95))
+        _info(f"Lengths — p50: {p50}  p95: {p95}  p99: {p99}  →  max_length set to {auto_len}")
     return ds, auto_len
-
-
-
