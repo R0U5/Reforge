@@ -163,15 +163,15 @@ class EarlyStopByLoss(TrainerCallback):
         if self.prev_ema is None:
             self.prev_ema = self.ema
         self.ema_series.append(self.ema)
+        # Track peak LR on every logged step (not only after the exposure floor),
+        # so the LR gate compares against the true peak.
+        self._lr_gate_ok(logs)
 
         if self.ema < self.best_ema - 1e-12:
             self.best_ema = self.ema
             self.since_best = 0
-            self.cooldown = self.cooldown_after_best
         else:
             self.since_best += 1
-            if self.cooldown > 0:
-                self.cooldown -= 1
 
         if step < warmup:
             self.prev_ema = self.ema
