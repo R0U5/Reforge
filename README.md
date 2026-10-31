@@ -19,7 +19,7 @@ src/reforge/
 ├── early_stopping.py    # EMA-based early stopping callback
 ├── reporting.py         # Training summary, loss curves, reports
 ├── utils.py             # Model scanner, file picker, GC
-└── dashboard.py         # Tkinter GUI (also: reforge-dashboard)
+└── dashboard.py         # Tkinter GUI — `reforge dashboard` (also: reforge-dashboard)
 ```
 
 ## Quick Start
@@ -34,6 +34,11 @@ reforge
 
 # Install with dashboard support (matplotlib)
 pip install -e ".[dashboard]"
+
+# Launch the GUI dashboard
+reforge dashboard
+python -m reforge dashboard
+python -m reforge.dashboard
 
 # Specify a Hugging Face Hub dataset
 python -m reforge --hf_dataset username/dataset-name
@@ -55,9 +60,6 @@ python -m reforge --steps 500
 
 # Disable early stopping and run full epochs
 python -m reforge --force --epoch 3
-
-# Launch the GUI dashboard
-python -m reforge.dashboard
 ```
 
 ## CLI Arguments
@@ -101,7 +103,7 @@ python -m reforge.dashboard
 ### Interactive
 - **Local model picker** — scans `~/HF_Models/` and the Hugging Face hub cache, then presents an interactive numbered list.
 - **Post-training summary** — formatted report with loss statistics, trend, and unicode sparkline. Writes a full `training_report.json`.
-- **Tkinter dashboard** (`-m reforge.dashboard`) — config editor, start/stop, and a live loss chart.
+- **Tkinter dashboard** (`reforge dashboard`, `python -m reforge dashboard`, or `-m reforge.dashboard`) — config editor, start/stop, and a live loss chart.
 
 ## How It Works
 
