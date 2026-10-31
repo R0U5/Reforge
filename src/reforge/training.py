@@ -149,8 +149,20 @@ def run_training(train_dataset, tokenizer, training_mode, model_name, processor,
         merge_dir = MERGED_DIR
 
     profile = resolve_model_profile(model_name)
-    _info(f"Model profile: {os.path.basename(model_name)}  |  grad_accum: {profile['grad_accum']}  |  lr: {profile['learning_rate']}")
-    estimated_steps = len(train_dataset) // (BATCH_SIZE * profile["grad_accum"])
+
+    # CLI overrides win; blended defaults otherwise (config batch size, profile grad_accum).
+    batch_size = getattr(parsed_args, "batch_size", None) or BATCH_SIZE
+    grad_accum = getattr(parsed_args, "grad_accum", None) or profile["grad_accum"]
+    if grad_accum < 1:
+        _warn(f"grad_accum < 1 is invalid — falling back to profile value ({profile['grad_accum']})")
+        grad_accum = profile["grad_accum"]
+    if batch_size < 1:
+        _warn(f"batch_size < 1 is invalid — falling back to config value ({BATCH_SIZE})")
+        batch_size = BATCH_SIZE
+    _info(f"Model profile: {os.path.basename(model_name)}  |  grad_accum: {grad_accum}"
+          + ("" if grad_accum == profile["grad_accum"] else f"  (profile default: {profile['grad_accum']})")
+          + f"  |  lr: {profile['learning_rate']}")
+    estimated_steps = len(train_dataset) // (batch_size * grad_accum)
     use_steps = parsed_args.steps is not None
 
     if use_steps:
@@ -163,7 +175,7 @@ def run_training(train_dataset, tokenizer, training_mode, model_name, processor,
         _info(f"Estimated steps: {total_steps}")
 
     use_early_stop = not parsed_args.force and not use_steps
-    min_stop_steps = compute_min_steps(train_dataset, BATCH_SIZE, profile["grad_accum"])
+    min_stop_steps = compute_min_steps(train_dataset, batch_size, grad_accum)
     early_stop = None
 
     if use_early_stop:
@@ -200,14 +212,14 @@ def run_training(train_dataset, tokenizer, training_mode, model_name, processor,
         ("Epochs",        f"{num_train_epochs}"),
         ("Scheduler",     selected_scheduler.upper()),
         ("Learning rate", f"{profile['learning_rate']}"),
-        ("Batch size",    f"{BATCH_SIZE}  (effective {BATCH_SIZE * profile['grad_accum']} with grad accum {profile['grad_accum']})"),
+        ("Batch size",    f"{batch_size}  (effective {batch_size * grad_accum} with grad accum {grad_accum})"),
         ("Warmup",        f"{dynamic_warmup} steps"),
     ])
 
     args = TrainingArguments(
         output_dir=output_dir,
-        per_device_train_batch_size=BATCH_SIZE,
-        gradient_accumulation_steps=profile["grad_accum"],
+        per_device_train_batch_size=batch_size,
+        gradient_accumulation_steps=grad_accum,
         learning_rate=profile["learning_rate"],
         log_level="error",
         warmup_steps=dynamic_warmup,
@@ -263,7 +275,7 @@ def run_training(train_dataset, tokenizer, training_mode, model_name, processor,
                 from torch.utils.data import DataLoader
                 _warmup_loader = DataLoader(
                     train_dataset,
-                    batch_size=BATCH_SIZE,
+                    batch_size=batch_size,
                     collate_fn=data_collator,
                     shuffle=False,
                     num_workers=0,
@@ -294,8 +306,8 @@ def run_training(train_dataset, tokenizer, training_mode, model_name, processor,
             trainer,
             dataset_size=len(train_dataset),
             num_train_epochs=num_train_epochs,
-            batch_size=BATCH_SIZE,
-            grad_accum=profile["grad_accum"],
+            batch_size=batch_size,
+            grad_accum=grad_accum,
             report_path=os.path.join(merge_dir, "training_report.json"),
         )
         roc()

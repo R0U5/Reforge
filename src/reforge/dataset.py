@@ -281,9 +281,18 @@ def synthesize_prompt_dataset(raw_dataset, col_question, col_chosen, col_rejecte
                     parts.append(clean(str(row[col_chosen])))
             return "\n\n".join(parts)
 
+        def build_question(row):
+            if col_question and pd.notna(row.get(col_question, "")):
+                return clean(str(row[col_question]))
+            return ""
+
         df["text"] = df.apply(build_prompt, axis=1)
+        # Keep the cleaned question as its own column so tokenization can mask
+        # the prompt exactly, without re-splitting the merged text on "\n\n"
+        # (unsafe in --latex/--code modes where blank lines survive cleaning).
+        df["question"] = df.apply(build_question, axis=1)
         df = df[df["text"].str.strip().astype(bool)].reset_index(drop=True)
-        df = df[["text"]]
+        df = df[["text", "question"]]
         _info(f"Retained {len(df):,} / {original_count:,} rows")
         processed = Dataset.from_pandas(df)
 
