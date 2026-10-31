@@ -46,6 +46,9 @@ def main():
     parser.add_argument('--grad_accum', type=int, default=None,
                         help="Gradient accumulation steps override (default: model profile)")
     parser.add_argument('--image',      action='store_true', help="Enable multimodal (image+text) training")
+    parser.add_argument('--train_lm_head', action='store_true',
+                        help="Opt-in: fully train the lm_head (~5 GB VRAM on large-vocab models like Qwen3). "
+                             "Use for new-token vocab runs or head-capacity ablations. Ignored when resuming from checkpoint-last.")
     parser.add_argument('--hf_dataset', type=str, default=None, help="HuggingFace Hub dataset ID")
     parser.add_argument('--base_model', type=str, default=None, help="Override base model path")
     parser.add_argument('--output_dir', type=str, default=None, help="Override output directory")
