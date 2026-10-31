@@ -34,27 +34,15 @@ class DynamicCausalCollator:
             return_tensors="pt",
         )
 
-        if self.image_mode:
-            def _to_py(x):
-                if isinstance(x, torch.Tensor):
-                    return x.tolist()
-                return list(x) if not isinstance(x, list) else x
-            label_seqs = [_to_py(f["labels"]) for f in features]
-            pad_len = batch["input_ids"].shape[1]
-            padded_labels = []
-            for seq in label_seqs:
-                pad_needed = pad_len - len(seq)
-                padded_labels.append(seq + [-100] * pad_needed)
-            batch["labels"] = torch.tensor(padded_labels, dtype=torch.long)
-        else:
-            # SFT: preserve labels created by tokenize(), only pad with -100
-            label_seqs = [list(f["labels"]) for f in features]
-            pad_len = batch["input_ids"].shape[1]
-            padded_labels = []
-            for seq in label_seqs:
-                pad_needed = pad_len - len(seq)
-                padded_labels.append(seq + [-100] * pad_needed)
-            batch["labels"] = torch.tensor(padded_labels, dtype=torch.long)
+        # Both SFT and multimodal: preserve pre-masked labels, pad with -100.
+        # (The two branches used to be duplicated verbatim.)
+        label_seqs = [_to_py(f["labels"]) for f in features]
+        pad_len = batch["input_ids"].shape[1]
+        padded_labels = []
+        for seq in label_seqs:
+            pad_needed = pad_len - len(seq)
+            padded_labels.append(seq + [-100] * pad_needed)
+        batch["labels"] = torch.tensor(padded_labels, dtype=torch.long)
 
         if self.image_mode:
             pixel_list = [f["pixel_values"] for f in features if "pixel_values" in f]
@@ -140,16 +128,22 @@ def tokenize(example, tokenizer, training_mode="sft", max_length=750, processor=
     # SFT mode: use chat template to format conversation, mask prompt tokens via exact token indexing
     if training_mode == "sft":
         text = example.get("text", "")
-        # The dataset has text = "question\n\nanswer"
-        sep = "\n\n"
-        sep_idx = text.find(sep)
-        if sep_idx >= 0:
-            question = text[:sep_idx].strip()
-            answer = text[sep_idx + len(sep):].strip()
+        question = str(example.get("question") or "").strip()
+        if question and text.startswith(question) and len(text) > len(question):
+            # Preferred: the dataset carries the cleaned question separately,
+            # so the boundary between prompt and answer is unambiguous.
+            answer = text[len(question):].lstrip("\r\n").strip()
         else:
-            # No separator - treat as causal
-            question = ""
-            answer = text
+            # Legacy fallback: merged text only — split on the first "\n\n".
+            sep = "\n\n"
+            sep_idx = text.find(sep)
+            if sep_idx >= 0:
+                question = question or text[:sep_idx].strip()
+                answer = text[sep_idx + len(sep):].strip()
+            else:
+                # No separator - treat as causal
+                question = ""
+                answer = text
 
         if question and answer:
             # Build full conversation messages
