@@ -6,7 +6,8 @@ import torch
 from peft import LoraConfig, get_peft_model, PeftModel
 from transformers import (
     AutoModelForCausalLM, AutoModelForVision2Seq,
-    TrainingArguments, Trainer
+    TrainingArguments, Trainer,
+    BitsAndBytesConfig
 )
 
 from .config import BATCH_SIZE, LOG_STEPS, SAVE_STEPS, SAVE_LIMITS, OUTPUT_DIR, MERGED_DIR
@@ -36,13 +37,19 @@ def load_model(tokenizer, model_name, image_mode=False, output_dir=None):
     else:
         _banner("Model")
         _info(f"Loading {os.path.basename(model_name)} (AutoModelForCausalLM)...")
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True,
+        )
         base_model = AutoModelForCausalLM.from_pretrained(
             model_name,
-            torch_dtype=torch.bfloat16,
+            quantization_config=bnb_config,
             trust_remote_code=profile["trust_remote_code"],
             local_files_only=True,
             _attn_implementation=profile["attn_implementation"],
-        ).to("cuda")
+        )
 
     if hasattr(base_model.config, "use_cache"):
         base_model.config.use_cache = False
@@ -111,7 +118,7 @@ def load_model(tokenizer, model_name, image_mode=False, output_dir=None):
         if lora_modules_to_save:
             for name, param in model.named_parameters():
                 if any(
-                    f"modules_to_save.default.{m}" in name
+                    f"{m}.modules_to_save.default" in name
                     for m in lora_modules_to_save
                 ):
                     param.requires_grad_(False)

@@ -13,6 +13,7 @@ def main():
     _enable_utf8_stdout()
 
     parser = argparse.ArgumentParser(prog="reforge", description="LoRA fine-tuning pipeline")
+    parser.add_argument('dataset', nargs='?', default=None, help="Path to .parquet dataset (or pass --hf_dataset)")
     parser.add_argument('--force',      action='store_true', help="Disable early stopping")
     parser.add_argument('--latex',      action='store_true', help="Preserve LaTeX and scientific equations")
     parser.add_argument('--code',       action='store_true', help="Preserve code formatting and indentation")
@@ -45,19 +46,25 @@ def main():
         modes.append("code")
     cleaning_mode = "+".join(modes) if modes else "math"
 
-    if parsed_args.hf_dataset:
+    # dataset path: positional arg takes precedence, then --hf_dataset, then interactive
+    if parsed_args.dataset:
+        dataset_path = parsed_args.dataset
+    elif parsed_args.hf_dataset:
         dataset_path = parsed_args.hf_dataset
         _info(f"HF Hub dataset: {dataset_path}")
     else:
         dataset_path = select_file()
-        if image_mode and dataset_path and not dataset_path.lower().endswith(".parquet"):
-            if not ("/" in dataset_path and not os.path.exists(dataset_path)):
-                _err("Please select a valid .parquet file or pass --hf_dataset")
-                return
-        elif not image_mode:
-            if (not dataset_path) or (not dataset_path.lower().endswith(".parquet")):
-                _err("Please select a valid .parquet file")
-                return
+    from_hf_hub = bool(parsed_args.hf_dataset) and not parsed_args.dataset
+    if from_hf_hub:
+        pass  # Hub IDs are not local .parquet files; validated at load time
+    elif image_mode and dataset_path and not dataset_path.lower().endswith(".parquet"):
+        if not ("/" in dataset_path and not os.path.exists(dataset_path)):
+            _err("Please select a valid .parquet file or pass --hf_dataset")
+            return
+    elif not image_mode:
+        if (not dataset_path) or (not dataset_path.lower().endswith(".parquet")):
+            _err("Please select a valid .parquet file")
+            return
 
     # Pre-flight schema check: fail fast on undetectable schemas before any
     # model/tokenizer loading. Reads only parquet metadata, not the data.
