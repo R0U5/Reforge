@@ -1,5 +1,6 @@
 import argparse
 import os
+import sys
 
 from .config import OUTPUT_DIR
 from .display import _title, _info, _ok, _err, _warn, _banner, _enable_utf8_stdout
@@ -9,8 +10,29 @@ from .training import run_training
 from .utils import select_base_model, select_file
 
 
+def _launch_dashboard() -> int:
+    """Run the Tkinter dashboard in this process (`reforge dashboard`)."""
+    _banner("Dashboard")
+    _info("Starting Reforge Dashboard...")
+    try:
+        from .dashboard import main as dashboard_main
+    except ImportError as e:
+        _err(f"Dashboard needs matplotlib to run: {e}")
+        _info("Install dashboard extras:  pip install -e .[dashboard]")
+        return 1
+    dashboard_main()
+    return 0
+
+
 def main():
     _enable_utf8_stdout()
+
+    # Subcommand dispatch: `reforge dashboard` opens the Tk UI.
+    # Intercepted before argparse so it isn't mistaken for the dataset
+    # positional. (Dashboards are launched only from the first token;
+    # a dataset file is expected to keep its .parquet extension.)
+    if len(sys.argv) > 1 and sys.argv[1] == "dashboard":
+        raise SystemExit(_launch_dashboard())
 
     parser = argparse.ArgumentParser(prog="reforge", description="LoRA fine-tuning pipeline")
     parser.add_argument('dataset', nargs='?', default=None, help="Path to .parquet dataset (or pass --hf_dataset)")
