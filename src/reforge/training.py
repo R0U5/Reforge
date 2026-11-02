@@ -19,7 +19,7 @@ from .tokenization import DynamicCausalCollator
 from .utils import roc
 
 
-def load_model(tokenizer, model_name, image_mode=False, output_dir=None):
+def load_model(tokenizer, model_name, image_mode=False, output_dir=None, train_lm_head=False):
     profile = resolve_model_profile(model_name)
     if output_dir is None:
         output_dir = OUTPUT_DIR
@@ -96,7 +96,9 @@ def load_model(tokenizer, model_name, image_mode=False, output_dir=None):
             lora_r      = profile["lora_r"]
             lora_alpha  = profile["lora_alpha"]
             lora_targets = profile["lora_targets"]
-            lora_modules_to_save = profile["modules_to_save"]
+            # --train_lm_head opts the full output layer back into training
+            # (default profiles no longer clone it automatically).
+            lora_modules_to_save = ["lm_head"] if train_lm_head else profile["modules_to_save"]
 
         peft_config = LoraConfig(
             r=lora_r,
@@ -115,7 +117,9 @@ def load_model(tokenizer, model_name, image_mode=False, output_dir=None):
 
         model = get_peft_model(base_model, peft_config)
 
-        if lora_modules_to_save:
+        if lora_modules_to_save and not train_lm_head:
+            # Profiles that list modules_to_save without --train_lm_head keep
+            # the historical freeze-the-clone behaviour.
             for name, param in model.named_parameters():
                 if any(
                     f"{m}.modules_to_save.default" in name
@@ -242,10 +246,15 @@ def run_training(train_dataset, tokenizer, training_mode, model_name, processor,
         bf16=True,
         group_by_length=True,
         length_column_name="length",
-        gradient_checkpointing=False,
+        optim="paged_adamw_8bit",
+        gradient_checkpointing=True,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
     )
 
-    model = load_model(tokenizer, model_name, image_mode=image_mode, output_dir=output_dir)
+    model = load_model(
+        tokenizer, model_name, image_mode=image_mode, output_dir=output_dir,
+        train_lm_head=getattr(parsed_args, "train_lm_head", False),
+    )
     data_collator = DynamicCausalCollator(tokenizer, pad_to_multiple_of=8, image_mode=image_mode)
 
     trainer = Trainer(

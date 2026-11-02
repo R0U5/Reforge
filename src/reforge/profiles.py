@@ -58,7 +58,12 @@ MODEL_PROFILE_DEFAULT = {
     "lora_r":                16,
     "lora_alpha":            32,
     "lora_targets":          ["q_proj", "k_proj", "v_proj", "o_proj"],
-    "modules_to_save":       ["lm_head"],
+    # Kept None by default: on large-vocab models (e.g. Qwen3's 152k vocab) a
+    # fully train lm_head costs ~5 GB VRAM (bf16 clone + grad + optimizer
+    # states), which by itself pushes 12 GB GPUs into system-RAM spilling.
+    # Opt back in with --train_lm_head when teaching new tokens or abalating
+    # head capacity.
+    "modules_to_save":       None,
     "grad_accum":            8,
     "learning_rate":         2e-5,
     "safe_serialization":    False,
