@@ -2,6 +2,8 @@
 
 A modular LoRA fine-tuning pipeline for Hugging Face causal language models and vision-language models. Reforge handles dataset loading, automatic schema detection, text cleaning, tokenization, training with smart early stopping, LoRA merge, and final model export. Includes a Tkinter dashboard for interactive control.
 
+![Reforge Dashboard](docs/dashboard.png)
+
 ## Project Structure
 
 ```
@@ -69,6 +71,8 @@ python -m reforge.dashboard
 | `--code` | Preserve code formatting and indentation |
 | `--epoch N` | Number of training epochs (default: 1) |
 | `--steps N` | Train for exactly N steps (overrides epoch) |
+| `--batch_size N` | Per-device batch size override (default: 1) |
+| `--grad_accum N` | Gradient accumulation steps override (default: model profile) |
 | `--force` | Disable early stopping |
 
 ## Environment Variables

@@ -19,6 +19,10 @@ def main():
     parser.add_argument('--code',       action='store_true', help="Preserve code formatting and indentation")
     parser.add_argument('--epoch',      type=int, default=1, help="Number of training epochs (default: 1)")
     parser.add_argument('--steps',      type=int, help="Terminate after a fixed number of steps")
+    parser.add_argument('--batch_size', type=int, default=None,
+                        help="Per-device batch size override (default: 1)")
+    parser.add_argument('--grad_accum', type=int, default=None,
+                        help="Gradient accumulation steps override (default: model profile)")
     parser.add_argument('--image',      action='store_true', help="Enable multimodal (image+text) training")
     parser.add_argument('--hf_dataset', type=str, default=None, help="HuggingFace Hub dataset ID")
     parser.add_argument('--base_model', type=str, default=None, help="Override base model path")
