@@ -3,7 +3,7 @@ import os
 import sys
 
 from .config import OUTPUT_DIR
-from .display import _title, _info, _ok, _err, _warn, _banner, _enable_utf8_stdout, _redirect_output
+from .display import _title, _info, _ok, _err, _warn, _banner, _enable_utf8_stdout, _redirect_output, _install_safe_streams
 from .dataset import load_and_prepare_dataset, detect_training_mode
 from .profiles import resolve_model_profile
 from .training import run_training
@@ -55,11 +55,19 @@ def main():
     parser.add_argument('--log_file', type=str, default=None,
                         help="Redirect all console output to a text file (recommended for long runs; "
                              "immune to failing Windows console handles)")
+    parser.add_argument('--no_tqdm', action='store_true',
+                        help="Disable the tqdm progress bar and emit clean loss lines instead "
+                             "(the dashboard sets this automatically)")
     parsed_args, _ = parser.parse_known_args()
     image_mode = parsed_args.image
 
+    # Wrap stdout/stderr so a failing Windows console or pipe handle (OSError 22)
+    # can never abort a run mid-training: writes silently fall back to a log file.
     if parsed_args.log_file:
         _redirect_output(parsed_args.log_file)
+    _fallback_log = os.path.join(
+        (parsed_args.output_dir or OUTPUT_DIR).rstrip("\\/"), "console.log")
+    _install_safe_streams(_fallback_log)
 
     _title("REFORGE", subtitle="LoRA fine-tuning pipeline")
 

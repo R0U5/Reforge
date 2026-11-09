@@ -7,16 +7,43 @@ from peft import LoraConfig, get_peft_model, PeftModel
 from transformers import (
     AutoModelForCausalLM, AutoModelForImageTextToText,
     TrainingArguments, Trainer,
-    BitsAndBytesConfig
+    BitsAndBytesConfig,
+    TrainerCallback
 )
 
 from .config import BATCH_SIZE, LOG_STEPS, SAVE_STEPS, SAVE_LIMITS, OUTPUT_DIR, MERGED_DIR
-from .display import _info, _ok, _warn, _err, _banner, _table
+from .display import _info, _ok, _warn, _err, _banner, _table, _safe_print
 from .profiles import resolve_model_profile
 from .early_stopping import select_scheduler, EarlyStopByLoss, compute_min_steps, dynamic_early_stop_cap
 from .reporting import summarize_training
 from .tokenization import DynamicCausalCollator
 from .utils import roc
+
+
+class LossLineLogger(TrainerCallback):
+    """Emits each loss-log event as a single-line dict, safe on any stream.
+
+    The dashboard parses these lines to feed the live loss chart. They are
+    written through _safe_print, so a broken console/pipe handle can never
+    abort the training run. Emitted on stderr so it stays independent of
+    stdout-side progress-bar writes.
+    """
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if not logs or logs.get("loss") is None:
+            return
+        entry = {
+            "loss": round(float(logs["loss"]), 4),
+            "learning_rate": float(logs.get("learning_rate", 0.0) or 0.0),
+            "grad_norm": float(logs.get("grad_norm", 0.0) or 0.0),
+            "epoch": float(logs.get("epoch", 0.0) or 0.0),
+            "step": int(state.global_step),
+        }
+        try:
+            import sys as _sys
+            print(str(entry), file=_sys.stderr, flush=True)
+        except OSError:
+            pass
 
 
 def load_model(tokenizer, model_name, image_mode=False, output_dir=None, train_lm_head=False):
@@ -234,7 +261,7 @@ def run_training(train_dataset, tokenizer, training_mode, model_name, processor,
         logging_steps=LOG_STEPS,
         logging_strategy="steps",
         logging_first_step=True,
-        disable_tqdm=False,
+        disable_tqdm=bool(getattr(parsed_args, "no_tqdm", False)),
         report_to=[],
         save_strategy="steps",
         save_steps=SAVE_STEPS,
@@ -264,7 +291,7 @@ def run_training(train_dataset, tokenizer, training_mode, model_name, processor,
         processing_class=tokenizer,
         data_collator=data_collator,
         compute_metrics=None,
-        callbacks=[] if early_stop is None else [early_stop],
+        callbacks=[LossLineLogger()] + ([] if early_stop is None else [early_stop]),
     )
 
     _training_error = None
