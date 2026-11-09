@@ -53,6 +53,35 @@ def _enable_utf8_stdout() -> None:
 _enable_utf8_stdout()
 
 
+def _safe_print(*args, **kwargs) -> None:
+    """print() that never raises, even if the console handle dies mid-run.
+
+    On Windows, a failing terminal makes *every* subsequent write raise
+    `OSError: [Errno 22] Invalid argument`, which cascades through logging
+    and can abort training (and even the emergency-save path). Swallow
+    OSError and keep going.
+    """
+    try:
+        print(*args, **kwargs)
+    except OSError:
+        pass
+
+
+def _redirect_output(path: str) -> None:
+    """Send all console output to a file.
+
+    Keeps long training runs immune to failing Windows console handles
+    (OSError 22) and produces a reviewable log of the run.
+    """
+    global _USE_COLOR
+    directory = os.path.dirname(os.path.abspath(path))
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    sys.stdout = open(path, "a", encoding="utf-8", errors="replace", buffering=1)
+    sys.stderr = sys.stdout
+    _USE_COLOR = False
+
+
 def _detect_color() -> bool:
     if os.environ.get("NO_COLOR"):
         return False
@@ -83,46 +112,46 @@ def _bold(text: str) -> str:
 
 
 def _banner(title: str, color: str = _ANSI_BCYAN, width: int = 64) -> None:
-    print()
-    print(_c(color, "=" * width))
-    print(_c(_ANSI_BOLD + _ANSI_WHITE, f"  {title}"))
-    print(_c(_ANSI_GRAY, "-" * width))
+    _safe_print()
+    _safe_print(_c(color, "=" * width))
+    _safe_print(_c(_ANSI_BOLD + _ANSI_WHITE, f"  {title}"))
+    _safe_print(_c(_ANSI_GRAY, "-" * width))
 
 
-def _ok(msg: str)   -> None: print(f"  {_c(_ANSI_BGREEN, chr(0x2714))}  {msg}")
-def _info(msg: str) -> None: print(f"  {_c(_ANSI_BCYAN, chr(0xB7))}  {msg}")
-def _warn(msg: str) -> None: print(f"  {_c(_ANSI_BYELLOW, chr(0x26A0))}  {msg}")
-def _err(msg: str)  -> None: print(f"  {_c(_ANSI_BRED, chr(0x2716))}  {msg}")
+def _ok(msg: str)   -> None: _safe_print(f"  {_c(_ANSI_BGREEN, chr(0x2714))}  {msg}")
+def _info(msg: str) -> None: _safe_print(f"  {_c(_ANSI_BCYAN, chr(0xB7))}  {msg}")
+def _warn(msg: str) -> None: _safe_print(f"  {_c(_ANSI_BYELLOW, chr(0x26A0))}  {msg}")
+def _err(msg: str)  -> None: _safe_print(f"  {_c(_ANSI_BRED, chr(0x2716))}  {msg}")
 
 
 def _title(app: str, info: list = None, subtitle: str = None,
            color: str = _ANSI_BCYAN, width: int = 64) -> None:
-    print()
-    print(_c(color, "=" * width))
-    print()
+    _safe_print()
+    _safe_print(_c(color, "=" * width))
+    _safe_print()
     app_padded = f"  {app.center(width - 2)}"
-    print(_c(_ANSI_BOLD + _ANSI_BWHITE, app_padded))
+    _safe_print(_c(_ANSI_BOLD + _ANSI_BWHITE, app_padded))
     if subtitle:
         sub_padded = f"  {subtitle.center(width - 2)}"
-        print(_c(_ANSI_DIM, sub_padded))
-    print()
+        _safe_print(_c(_ANSI_DIM, sub_padded))
+    _safe_print()
     if info:
         key_w = max(_vlen(k) for k, _ in info)
         for key, value in info:
             key_styled = _c(_ANSI_GRAY, key.ljust(key_w + 2))
             value_styled = _c(_ANSI_WHITE, str(value)) if _USE_COLOR else str(value)
-            print(f"  {key_styled}{value_styled}")
-    print()
-    print(_c(_ANSI_GRAY, "-" * width))
+            _safe_print(f"  {key_styled}{value_styled}")
+    _safe_print()
+    _safe_print(_c(_ANSI_GRAY, "-" * width))
 
 
 def _table(title: str, rows: list, value_color: str = None,
            key_color: str = _ANSI_BCYAN, width: int = 64) -> None:
-    print()
-    print(_c(_ANSI_BOLD + _ANSI_WHITE, f"  {title}"))
-    print(_c(_ANSI_GRAY, "-" * width))
+    _safe_print()
+    _safe_print(_c(_ANSI_BOLD + _ANSI_WHITE, f"  {title}"))
+    _safe_print(_c(_ANSI_GRAY, "-" * width))
     if not rows:
-        print(_c(_ANSI_DIM, "  (no data)"))
+        _safe_print(_c(_ANSI_DIM, "  (no data)"))
     else:
         key_w = max(_vlen(k) for k, _ in rows)
         for key, value in rows:
@@ -130,8 +159,8 @@ def _table(title: str, rows: list, value_color: str = None,
             key_styled = _c(key_color, key.ljust(key_w))
             if value_color:
                 value_str = _c(value_color, value_str)
-            print(f"  {key_styled}    {value_str}")
-    print(_c(_ANSI_GRAY, "-" * width))
+            _safe_print(f"  {key_styled}    {value_str}")
+    _safe_print(_c(_ANSI_GRAY, "-" * width))
 
 
 def _fmt_duration(seconds: float) -> str:
