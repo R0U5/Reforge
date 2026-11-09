@@ -5,7 +5,7 @@ import shutil
 import torch
 from peft import LoraConfig, get_peft_model, PeftModel
 from transformers import (
-    AutoModelForCausalLM, AutoModelForVision2Seq,
+    AutoModelForCausalLM, AutoModelForImageTextToText,
     TrainingArguments, Trainer,
     BitsAndBytesConfig
 )
@@ -26,8 +26,8 @@ def load_model(tokenizer, model_name, image_mode=False, output_dir=None, train_l
 
     if image_mode:
         _banner("Model")
-        _info("Loading Phi-3-Vision (AutoModelForVision2Seq)...")
-        base_model = AutoModelForVision2Seq.from_pretrained(
+        _info("Loading Phi-3-Vision (AutoModelForImageTextToText)...")
+        base_model = AutoModelForImageTextToText.from_pretrained(
             model_name,
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
@@ -244,7 +244,6 @@ def run_training(train_dataset, tokenizer, training_mode, model_name, processor,
         dataloader_persistent_workers=False,
         lr_scheduler_type=selected_scheduler,
         bf16=True,
-        group_by_length=True,
         length_column_name="length",
         optim="paged_adamw_8bit",
         gradient_checkpointing=True,
@@ -262,7 +261,7 @@ def run_training(train_dataset, tokenizer, training_mode, model_name, processor,
         args=args,
         train_dataset=train_dataset,
         eval_dataset=None,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
         data_collator=data_collator,
         compute_metrics=None,
         callbacks=[] if early_stop is None else [early_stop],
