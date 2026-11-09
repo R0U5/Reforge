@@ -3,7 +3,7 @@ import os
 import sys
 
 from .config import OUTPUT_DIR
-from .display import _title, _info, _ok, _err, _warn, _banner, _enable_utf8_stdout
+from .display import _title, _info, _ok, _err, _warn, _banner, _enable_utf8_stdout, _redirect_output
 from .dataset import load_and_prepare_dataset, detect_training_mode
 from .profiles import resolve_model_profile
 from .training import run_training
@@ -52,8 +52,14 @@ def main():
     parser.add_argument('--hf_dataset', type=str, default=None, help="HuggingFace Hub dataset ID")
     parser.add_argument('--base_model', type=str, default=None, help="Override base model path")
     parser.add_argument('--output_dir', type=str, default=None, help="Override output directory")
+    parser.add_argument('--log_file', type=str, default=None,
+                        help="Redirect all console output to a text file (recommended for long runs; "
+                             "immune to failing Windows console handles)")
     parsed_args, _ = parser.parse_known_args()
     image_mode = parsed_args.image
+
+    if parsed_args.log_file:
+        _redirect_output(parsed_args.log_file)
 
     _title("REFORGE", subtitle="LoRA fine-tuning pipeline")
 
@@ -147,7 +153,7 @@ def main():
     _info(f"Saving to: {merge_dir}")
     os.makedirs(merge_dir, exist_ok=True)
     save_profile = resolve_model_profile(resolved_base)
-    from transformers import AutoModelForCausalLM, AutoModelForVision2Seq
+    from transformers import AutoModelForCausalLM, AutoModelForImageTextToText
     try:
         final_model_to_save.save_pretrained(
             merge_dir,
@@ -158,7 +164,7 @@ def main():
         _warn("Retrying with rebuilt base model...")
         import torch
         if image_mode:
-            base = AutoModelForVision2Seq.from_pretrained(
+            base = AutoModelForImageTextToText.from_pretrained(
                 resolved_base,
                 local_files_only=True,
                 trust_remote_code=True,
