@@ -16,6 +16,7 @@ src/reforge/
 ├── training.py          # LoRA setup, model loading, training loop
 ├── early_stopping.py    # EMA-based early stopping callback
 ├── reporting.py         # Training summary, loss curves, reports
+├── agent.py             # Agent mode: NDJSON events + run_state.json
 ├── utils.py             # Model scanner, file picker, GC
 └── dashboard.py         # Tkinter GUI — `reforge dashboard` (also: reforge-dashboard)
 ```
@@ -58,6 +59,9 @@ python -m reforge --steps 500
 
 # Disable early stopping and run full epochs
 python -m reforge --force --epoch 3
+
+# Agent mode: machine-readable NDJSON events on stdout + run_state.json
+python -m reforge dataset.parquet --base_model /path/to/model --agent
 ```
 
 ## CLI Arguments
@@ -74,6 +78,8 @@ python -m reforge --force --epoch 3
 | `--batch_size N` | Per-device batch size override (default: 1) |
 | `--grad_accum N` | Gradient accumulation steps override (default: model profile) |
 | `--force` | Disable early stopping |
+| `--agent` | Agent mode: NDJSON events on stdout + pollable `run_state.json` |
+| `--agent_log PATH` | Also tee the agent NDJSON stream to a file |
 
 ## Environment Variables
 
@@ -86,6 +92,7 @@ python -m reforge --force --epoch 3
 | `NO_COLOR` | unset | Disables all ANSI color output |
 | `FORCE_COLOR` | unset | Forces color output even when stdout is not a TTY |
 | `TERM=dumb` | unset | Disables color output (standard convention) |
+| `REFORGE_AGENT=1` | unset | Enables agent mode (same as `--agent`) |
 
 ## Features
 
@@ -102,6 +109,17 @@ python -m reforge --force --epoch 3
 - **Local model picker** — scans `~/HF_Models/` and the Hugging Face hub cache, then presents an interactive numbered list.
 - **Post-training summary** — formatted report with loss statistics, trend, and unicode sparkline. Writes a full `training_report.json`.
 - **Tkinter dashboard** (`reforge dashboard`, `python -m reforge dashboard`, or `-m reforge.dashboard`) — config editor, start/stop, and a live loss chart.
+
+### Agent mode
+- **NDJSON event stream on stdout** — one JSON object per line: `run_started`, `dataset_loaded`, `training_started`, `step` (loss, percent, ETA), `checkpoint_saved`, `early_stop_check`, `early_stop_triggered`, `training_complete`, `merge_started`, `merge_complete`, `run_complete`, `run_failed`, `run_interrupted`.
+- **Pollable state file** — `<output_dir>/run_state.json` holds the latest snapshot (status, step, loss, ETA, exit code), rewritten atomically after every event; safe to poll from a background process.
+- **Pure stdout in agent mode** — pretty/console output is diverted to stderr, so stdout parses line-by-line as JSON. Highly recommended to pass `--base_model` and a dataset argument, since interactive pickers are unavailable in agent mode (it fails fast with exit code 2 instead of blocking on stdin).
+- **Meaningful exit codes** — `0` success, `1` runtime/training failure, `2` invalid arguments or dataset, `130` interrupted.
+
+```jsonl
+{"ts": "2026-11-10T19:05:14Z", "event": "step", "step": 100, "total_steps": 1500, "loss": 2.4131, "pct": 6.7, "eta_sec": 612}
+{"ts": "2026-11-10T19:16:12Z", "event": "run_complete", "merged_dir": "C:/Users/you/Reforge_Output/merged", "exit_code": 0}
+```
 
 ## How It Works
 

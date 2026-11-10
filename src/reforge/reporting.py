@@ -1,7 +1,7 @@
 import json
 import os
 
-from .display import _ok, _warn, _banner, _table, _c, _ANSI_BCYAN, _ANSI_DIM, _fmt_duration
+from .display import _ok, _warn, _banner, _table, _safe_print, _c, _ANSI_BCYAN, _ANSI_DIM, _fmt_duration
 
 
 def _loss_sparkline(values: list, width: int = 48) -> str:
@@ -132,8 +132,8 @@ def summarize_training(
             ("Trend",           trend),
         ], value_color=_ANSI_BCYAN)
         dot = chr(0xB7)
-        print(f"  {_c(_ANSI_BCYAN, dot)}  Curve (n={len(loss_values)}): {_c(_ANSI_BCYAN, _loss_sparkline(loss_values))}")
-        print(f"  {_c(_ANSI_DIM, f'    range: min={best_loss:.4f}  max={worst_loss:.4f}  span={worst_loss - best_loss:.4f}')}")
+        _safe_print(f"  {_c(_ANSI_BCYAN, dot)}  Curve (n={len(loss_values)}): {_c(_ANSI_BCYAN, _loss_sparkline(loss_values))}")
+        _safe_print(f"  {_c(_ANSI_DIM, f'    range: min={best_loss:.4f}  max={worst_loss:.4f}  span={worst_loss - best_loss:.4f}')}")
     else:
         _warn("No loss entries found in log history \u2014 was logging_steps > 0?")
     if eval_entries:
@@ -144,7 +144,7 @@ def summarize_training(
                 ("Final eval loss", f"{float(ev_loss):.4f}"),
                 ("Eval points",     f"{len(eval_entries)}"),
             ])
-    print()
+    _safe_print()
 
     if report_path:
         try:

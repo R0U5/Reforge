@@ -3,7 +3,8 @@ import os
 import sys
 
 from .config import OUTPUT_DIR
-from .display import _title, _info, _ok, _err, _warn, _banner, _enable_utf8_stdout, _redirect_output
+from .display import _title, _info, _ok, _err, _warn, _banner, _safe_print, _enable_utf8_stdout, _redirect_output
+from .agent import BRIDGE
 from .dataset import load_and_prepare_dataset, detect_training_mode
 from .profiles import resolve_model_profile
 from .training import run_training
@@ -55,18 +56,70 @@ def main():
     parser.add_argument('--log_file', type=str, default=None,
                         help="Redirect all console output to a text file (recommended for long runs; "
                              "immune to failing Windows console handles)")
+    parser.add_argument('--agent', action='store_true',
+                        help="Agent mode: emit NDJSON events on stdout (pretty output moves to stderr) "
+                             "and keep run_state.json updated in the output directory")
+    parser.add_argument('--agent_log', type=str, default=None,
+                        help="Also tee the agent-mode NDJSON event stream to this file")
     parsed_args, _ = parser.parse_known_args()
     image_mode = parsed_args.image
 
     if parsed_args.log_file:
         _redirect_output(parsed_args.log_file)
 
-    _title("REFORGE", subtitle="LoRA fine-tuning pipeline")
-
     output_dir = parsed_args.output_dir or OUTPUT_DIR
     merge_dir = os.path.join(output_dir, "merged")
     merge_success_flag = os.path.join(merge_dir, "success.txt")
     os.makedirs(output_dir, exist_ok=True)
+
+    # Agent mode: stdout becomes a pure NDJSON event stream and
+    # <output_dir>/run_state.json tracks the latest snapshot.
+    _agent_env = os.environ.get("REFORGE_AGENT", "").strip().lower()
+    agent_mode = parsed_args.agent or _agent_env in ("1", "true", "yes")
+    if agent_mode:
+        BRIDGE.enable(output_dir, merge_dir, log_path=parsed_args.agent_log)
+
+    _title("REFORGE", subtitle="LoRA fine-tuning pipeline")
+
+    try:
+        _run_pipeline(parsed_args, image_mode, output_dir, merge_dir, merge_success_flag)
+    except SystemExit:
+        raise
+    except KeyboardInterrupt:
+        BRIDGE.emit("run_failed", error="Interrupted by user (KeyboardInterrupt)", exit_code=130)
+        raise
+    except Exception as e:
+        BRIDGE.emit("run_failed", error=str(e), exit_code=1)
+        raise
+
+
+def _run_pipeline(parsed_args, image_mode, output_dir, merge_dir, merge_success_flag):
+    merge_dir_actual = merge_dir
+
+    # Agent mode is non-interactive by contract: interactive model/dataset
+    # pickers would block forever waiting on stdin. Fail fast instead.
+    if BRIDGE.enabled:
+        _problems = []
+        if not parsed_args.base_model:
+            _problems.append("--base_model is required in agent mode (non-interactive run)")
+        if not (parsed_args.dataset or parsed_args.hf_dataset):
+            _problems.append("a dataset argument or --hf_dataset is required in agent mode")
+        if _problems:
+            BRIDGE.emit("run_failed", error="; ".join(_problems), exit_code=2)
+            _err(_problems[0])
+            raise SystemExit(2)
+
+    BRIDGE.emit(
+        "run_started",
+        output_dir=output_dir,
+        dataset=parsed_args.dataset,
+        hf_dataset=parsed_args.hf_dataset,
+        base_model=parsed_args.base_model,
+        image_mode=image_mode,
+        force=parsed_args.force,
+        epoch=parsed_args.epoch,
+        steps=parsed_args.steps,
+    )
 
     if parsed_args.base_model:
         resolved_base = parsed_args.base_model
@@ -94,12 +147,18 @@ def main():
         pass  # Hub IDs are not local .parquet files; validated at load time
     elif image_mode and dataset_path and not dataset_path.lower().endswith(".parquet"):
         if not ("/" in dataset_path and not os.path.exists(dataset_path)):
+            BRIDGE.emit("run_failed", error="No valid .parquet dataset provided (image mode)", exit_code=2)
             _err("Please select a valid .parquet file or pass --hf_dataset")
-            return
+            raise SystemExit(2)
     elif not image_mode:
         if (not dataset_path) or (not dataset_path.lower().endswith(".parquet")):
+            BRIDGE.emit("run_failed", error="No valid .parquet dataset provided", exit_code=2)
             _err("Please select a valid .parquet file")
-            return
+            raise SystemExit(2)
+        if not os.path.isfile(dataset_path):
+            BRIDGE.emit("run_failed", error=f"Dataset file not found: {dataset_path}", exit_code=2)
+            _err(f"Dataset file not found: {dataset_path}")
+            raise SystemExit(2)
 
     # Pre-flight schema check: fail fast on undetectable schemas before any
     # model/tokenizer loading. Reads only parquet metadata, not the data.
@@ -120,19 +179,29 @@ def main():
         image_mode=image_mode,
         base_model_override=resolved_base,
         output_dir=output_dir,
-        merge_dir=merge_dir,
+        merge_dir=merge_dir_actual,
         merge_success_flag=merge_success_flag,
+    )
+    BRIDGE.emit(
+        "dataset_loaded",
+        dataset=dataset_path,
+        training_mode=training_mode,
+        rows=train_dataset.num_rows,
+        eval_rows=(eval_dataset.num_rows if eval_dataset is not None else None),
+        base_model=resolved_base,
     )
 
     model, trainer, training_error = run_training(
         train_dataset, tokenizer, training_mode, model_name, processor,
         parsed_args, resolved_base,
         output_dir=output_dir,
-        merge_dir=merge_dir,
+        merge_dir=merge_dir_actual,
     )
 
     if training_error is not None:
         raise training_error
+
+    BRIDGE.emit("merge_started", merge_dir=merge_dir_actual)
 
     from peft import PeftModel
     if isinstance(model, PeftModel):
@@ -150,13 +219,13 @@ def main():
         _info("Model already merged")
         final_model_to_save = model
 
-    _info(f"Saving to: {merge_dir}")
-    os.makedirs(merge_dir, exist_ok=True)
+    _info(f"Saving to: {merge_dir_actual}")
+    os.makedirs(merge_dir_actual, exist_ok=True)
     save_profile = resolve_model_profile(resolved_base)
     from transformers import AutoModelForCausalLM, AutoModelForImageTextToText
     try:
         final_model_to_save.save_pretrained(
-            merge_dir,
+            merge_dir_actual,
             safe_serialization=save_profile["safe_serialization"],
         )
     except Exception as e:
@@ -187,20 +256,26 @@ def main():
         sd = {k: v.cpu() for k, v in final_model_to_save.state_dict().items()}
         missing_unexp = base.load_state_dict(sd, strict=False)
         _info(f"State-dict loaded \u2014 missing/unexpected: {missing_unexp}")
-        base.save_pretrained(merge_dir, safe_serialization=save_profile["safe_serialization"])
+        base.save_pretrained(merge_dir_actual, safe_serialization=save_profile["safe_serialization"])
 
     if image_mode and processor is not None:
-        processor.save_pretrained(merge_dir)
+        processor.save_pretrained(merge_dir_actual)
         _ok("Processor saved")
     else:
-        tokenizer.save_pretrained(merge_dir)
+        tokenizer.save_pretrained(merge_dir_actual)
 
     if training_error is None:
-        with open(os.path.join(merge_dir, "success.txt"), "w", encoding="utf-8") as f:
+        with open(os.path.join(merge_dir_actual, "success.txt"), "w", encoding="utf-8") as f:
             f.write("Merge complete")
+        BRIDGE.emit(
+            "merge_complete",
+            merged_dir=merge_dir_actual,
+            report=os.path.join(merge_dir_actual, "training_report.json"),
+        )
         _banner("Done")
-        _ok(f"Model saved to {merge_dir}")
-        print()
+        _ok(f"Model saved to {merge_dir_actual}")
+        _safe_print()
+        BRIDGE.emit("run_complete", merged_dir=merge_dir_actual, exit_code=0)
     else:
         raise training_error
 

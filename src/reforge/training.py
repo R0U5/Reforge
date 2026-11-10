@@ -12,6 +12,7 @@ from transformers import (
 
 from .config import BATCH_SIZE, LOG_STEPS, SAVE_STEPS, SAVE_LIMITS, OUTPUT_DIR, MERGED_DIR
 from .display import _info, _ok, _warn, _err, _banner, _table
+from .agent import BRIDGE, AgentProgressCallback
 from .profiles import resolve_model_profile
 from .early_stopping import select_scheduler, EarlyStopByLoss, compute_min_steps, dynamic_early_stop_cap
 from .reporting import summarize_training
@@ -220,6 +221,21 @@ def run_training(train_dataset, tokenizer, training_mode, model_name, processor,
         ("Warmup",        f"{dynamic_warmup} steps"),
     ])
 
+    BRIDGE.emit(
+        "training_started",
+        total_steps=total_steps,
+        epochs=num_train_epochs,
+        training_mode=training_mode,
+        lr=profile["learning_rate"],
+        batch_size=batch_size,
+        grad_accum=grad_accum,
+        early_stop=bool(use_early_stop),
+        scheduler=selected_scheduler,
+        warmup_steps=dynamic_warmup,
+    )
+
+    progress_callback = AgentProgressCallback(BRIDGE, early_stop)
+
     args = TrainingArguments(
         output_dir=output_dir,
         per_device_train_batch_size=batch_size,
@@ -264,7 +280,7 @@ def run_training(train_dataset, tokenizer, training_mode, model_name, processor,
         processing_class=tokenizer,
         data_collator=data_collator,
         compute_metrics=None,
-        callbacks=[] if early_stop is None else [early_stop],
+        callbacks=[c for c in (early_stop, progress_callback) if c is not None],
     )
 
     _training_error = None
@@ -310,7 +326,7 @@ def run_training(train_dataset, tokenizer, training_mode, model_name, processor,
             trainer.train(resume_from_checkpoint=last_ckpt)
         else:
             trainer.train()
-        summarize_training(
+        summary = summarize_training(
             trainer,
             dataset_size=len(train_dataset),
             num_train_epochs=num_train_epochs,
@@ -318,8 +334,18 @@ def run_training(train_dataset, tokenizer, training_mode, model_name, processor,
             grad_accum=grad_accum,
             report_path=os.path.join(merge_dir, "training_report.json"),
         )
+        loss_summary = summary.get("loss", {}) if isinstance(summary, dict) else {}
+        BRIDGE.emit(
+            "training_complete",
+            steps=summary.get("total_steps"),
+            final_loss=loss_summary.get("final"),
+            best_loss=loss_summary.get("best"),
+            time_sec=summary.get("training_time_sec"),
+            report=os.path.join(merge_dir, "training_report.json"),
+        )
         roc()
     except KeyboardInterrupt:
+        BRIDGE.emit("run_interrupted")
         _warn("Keyboard interrupt \u2014 saving current state...")
         if isinstance(model, PeftModel):
             model.save_pretrained(merge_dir)
@@ -327,6 +353,7 @@ def run_training(train_dataset, tokenizer, training_mode, model_name, processor,
             trainer.save_model(merge_dir)
     except Exception as e:
         _training_error = e
+        BRIDGE.emit("training_failed", error=str(e), emergency_save=True)
         _err(f"Training error: {e}")
         _warn("Attempting emergency save before merge...")
         try:

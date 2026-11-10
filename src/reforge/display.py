@@ -53,6 +53,17 @@ def _enable_utf8_stdout() -> None:
 _enable_utf8_stdout()
 
 
+# When agent mode is active, pretty/human console output is diverted here
+# (stderr) so stdout carries pure NDJSON events for machine parsing.
+_DIVERT_STREAM = None
+
+
+def _set_stream(stream) -> None:
+    """Redirect all display output to `stream` (used by agent mode)."""
+    global _DIVERT_STREAM
+    _DIVERT_STREAM = stream
+
+
 def _safe_print(*args, **kwargs) -> None:
     """print() that never raises, even if the console handle dies mid-run.
 
@@ -61,6 +72,8 @@ def _safe_print(*args, **kwargs) -> None:
     and can abort training (and even the emergency-save path). Swallow
     OSError and keep going.
     """
+    if _DIVERT_STREAM is not None:
+        kwargs.setdefault("file", _DIVERT_STREAM)
     try:
         print(*args, **kwargs)
     except OSError:
