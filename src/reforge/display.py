@@ -1,6 +1,8 @@
+import io
 import os
 import re
 import sys
+import threading
 
 _ANSI_RESET   = "\033[0m"
 _ANSI_BOLD    = "\033[1m"
@@ -93,6 +95,69 @@ def _redirect_output(path: str) -> None:
     sys.stdout = open(path, "a", encoding="utf-8", errors="replace", buffering=1)
     sys.stderr = sys.stdout
     _USE_COLOR = False
+
+
+class _SafeStream(io.TextIOBase):
+    """A text stream wrapper that survives OSError mid-run.
+
+    `tqdm` and the Trainer capture `sys.stdout` / `sys.stderr` when they are
+    created. On Windows the underlying console/pipe handle can start failing
+    with `OSError: [Errno 22] Invalid argument` mid-run and *every* further
+    write fails, which aborts training (and even the exception handlers).
+    This wrapper: on the first OSError it silently switches to a fallback
+    log file and keeps writing from there, so a dead terminal can never
+    kill a training run.
+    """
+
+    def __init__(self, delegate, fallback_factory):
+        self._delegate = delegate
+        self._fallback_factory = fallback_factory
+        self._fallback = None
+        self._lock = threading.Lock()
+
+    @property
+    def encoding(self):
+        return getattr(self._delegate, "encoding", "utf-8")
+
+    def isatty(self):
+        return False
+
+    def write(self, s):
+        try:
+            return self._delegate.write(s)
+        except OSError:
+            pass
+        except Exception:
+            pass
+        try:
+            with self._lock:
+                if self._fallback is None:
+                    self._fallback = self._fallback_factory()
+                self._delegate = self._fallback
+            return self._delegate.write(s)
+        except Exception:
+            return len(s)
+
+    def flush(self):
+        try:
+            self._delegate.flush()
+        except Exception:
+            pass
+
+
+def _install_safe_streams(fallback_log: str) -> None:
+    """Wrap sys.stdout / sys.stderr so OSError can never escape a write."""
+    directory = os.path.dirname(os.path.abspath(fallback_log))
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+
+    def factory():
+        return open(fallback_log, "a", encoding="utf-8", errors="replace", buffering=1)
+
+    if not isinstance(sys.stdout, _SafeStream):
+        sys.stdout = _SafeStream(sys.stdout, factory)
+    if not isinstance(sys.stderr, _SafeStream):
+        sys.stderr = _SafeStream(sys.stderr, factory)
 
 
 def _detect_color() -> bool:

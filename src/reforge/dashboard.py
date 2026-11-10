@@ -581,6 +581,12 @@ class ReforgeDashboard:
         if self._var_latex.get():  cmd.append("--latex")
         if self._var_code.get():   cmd.append("--code")
         if self._var_image.get():  cmd.append("--image")
+        # The child's tqdm bar writes progress to stdout; on some Windows
+        # setups that write starts failing EINVAL mid-run and crashes
+        # training. --no_tqdm removes the bar; loss rows arrive on stderr
+        # via the trainers LossLineLogger instead (crash-proof).
+        if "--no_tqdm" not in cmd:
+            cmd.append("--no_tqdm")
         return cmd
 
     def _update_cmd_preview(self):
@@ -722,40 +728,12 @@ class ReforgeDashboard:
                 line = raw.decode("utf-8", errors="replace")
                 if any(p in line for p in self._SUPPRESS_PATTERNS):
                     continue
-                entry = try_parse_loss_line(line)
-                if entry:
-                    self._step_count += 1
-                    self._line_queue.put(entry)
-                    if not self._loss_header_printed:
-                        self._loss_header_printed = True
-                        hdr = (
-                            f"\n  {'step':<8}  "
-                            f"{'loss':<10}  "
-                            f"{'lr':<12}  "
-                            f"{'grad_norm':<10}  "
-                            f"{'epoch'}\n"
-                            f"  {'-'*58}\n"
-                        )
-                        self._write_line(sys.stdout, hdr)
-                    loss = entry.get("loss", 0)
-                    lr   = entry.get("learning_rate", 0)
-                    ep   = entry.get("epoch", 0)
-                    gnorm = entry.get("grad_norm", 0)
-                    step  = entry.get("step", self._step_count)
-                    if lr > 0:
-                        lr_str = f"{lr:.2e}"
-                    else:
-                        lr_str = "0"
-                    formatted = (
-                        f"  step {step:<6}  "
-                        f"loss {loss:<8.4f}  "
-                        f"lr {lr_str:<10}  "
-                        f"gnorm {gnorm:<8.3f}  "
-                        f"ep {ep:.2f}\n"
-                    )
-                    self._write_line(sys.stdout, formatted)
-                else:
-                    self._write_line(sys.stdout, line)
+                # Loss dicts are consumed from stderr (LossLineLogger) with
+                # line integrity; echoing the stdout copies here would
+                # double-count chart points, so filter them on this side.
+                if "'loss'" in line or '"loss"' in line:
+                    continue
+                self._write_line(sys.stdout, line)
         except Exception:
             pass
         finally:
@@ -763,6 +741,78 @@ class ReforgeDashboard:
                 pipe.close()
             except Exception:
                 pass
+
+    def _reader_stderr(self, pipe):
+        """Consume stderr line-by-line; dict lines feed the live chart.
+
+        Reads raw chunks and re-assembles lines locally so a chunk boundary
+        can never split a loss row. Loss rows are child-proof: trainers
+        LossLineLogger writes them via _safe_print, so even if this pipe
+        dies the training run keeps going.
+        """
+        buf = b""
+        try:
+            while True:
+                chunk = pipe.read(256)
+                if not chunk:
+                    break
+                buf += chunk
+                while b"\n" in buf:
+                    raw, buf = buf.split(b"\n", 1)
+                    self._handle_stderr_line(raw)
+            if buf:
+                self._handle_stderr_line(buf)
+        except Exception:
+            pass
+        finally:
+            try:
+                pipe.close()
+            except Exception:
+                pass
+
+    def _handle_stderr_line(self, raw: bytes):
+        text = raw.decode("utf-8", errors="replace").replace("\r", "")
+        if not text.strip():
+            return
+        if any(p in text for p in self._SUPPRESS_PATTERNS):
+            return
+        entry = try_parse_loss_line(text)
+        if entry:
+            self._emit_loss_row(entry)
+        else:
+            self._write_line(sys.stderr, text)
+
+    def _emit_loss_row(self, entry: dict):
+        self._step_count += 1
+        self._line_queue.put(entry)
+        if not self._loss_header_printed:
+            self._loss_header_printed = True
+            hdr = (
+                f"\n  {'step':<8}  "
+                f"{'loss':<10}  "
+                f"{'lr':<12}  "
+                f"{'grad_norm':<10}  "
+                f"{'epoch'}\n"
+                f"  {'-'*58}\n"
+            )
+            self._write_line(sys.stdout, hdr)
+        loss = entry.get("loss", 0)
+        lr   = entry.get("learning_rate", 0)
+        ep   = entry.get("epoch", 0)
+        gnorm = entry.get("grad_norm", 0)
+        step  = entry.get("step", self._step_count)
+        if lr > 0:
+            lr_str = f"{lr:.2e}"
+        else:
+            lr_str = "0"
+        formatted = (
+            f"  step {step:<6}  "
+            f"loss {loss:<8.4f}  "
+            f"lr {lr_str:<10}  "
+            f"gnorm {gnorm:<8.3f}  "
+            f"ep {ep:.2f}\n"
+        )
+        self._write_line(sys.stdout, formatted)
 
     def _reader_stderr(self, pipe):
         try:
