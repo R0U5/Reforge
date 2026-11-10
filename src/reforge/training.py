@@ -36,21 +36,35 @@ def load_model(tokenizer, model_name, image_mode=False, output_dir=None, train_l
             _attn_implementation="eager",
         ).to("cuda")
     else:
+        # Check if this is a merged model (full precision, no adapter_config.json)
+        adapter_config_path = os.path.join(model_name, "adapter_config.json")
+        is_merged_model = os.path.isdir(model_name) and os.path.isfile(os.path.join(model_name, "config.json")) and not os.path.isfile(adapter_config_path)
+        
         _banner("Model")
-        _info(f"Loading {os.path.basename(model_name)} (AutoModelForCausalLM)...")
-        bnb_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_use_double_quant=True,
-        )
-        base_model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            quantization_config=bnb_config,
-            trust_remote_code=profile["trust_remote_code"],
-            local_files_only=True,
-            _attn_implementation=profile["attn_implementation"],
-        )
+        if is_merged_model:
+            _info(f"Loading merged model {os.path.basename(model_name)} in bf16 (no 4-bit quantization)...")
+            base_model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                torch_dtype=torch.bfloat16,
+                trust_remote_code=profile["trust_remote_code"],
+                local_files_only=True,
+                _attn_implementation=profile["attn_implementation"],
+            ).to("cuda")
+        else:
+            _info(f"Loading {os.path.basename(model_name)} (AutoModelForCausalLM) with 4-bit quantization...")
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_use_double_quant=True,
+            )
+            base_model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                quantization_config=bnb_config,
+                trust_remote_code=profile["trust_remote_code"],
+                local_files_only=True,
+                _attn_implementation=profile["attn_implementation"],
+            )
 
     if hasattr(base_model.config, "use_cache"):
         base_model.config.use_cache = False
@@ -159,10 +173,10 @@ def run_training(train_dataset, tokenizer, training_mode, model_name, processor,
     batch_size = getattr(parsed_args, "batch_size", None) or BATCH_SIZE
     grad_accum = getattr(parsed_args, "grad_accum", None) or profile["grad_accum"]
     if grad_accum < 1:
-        _warn(f"grad_accum < 1 is invalid — falling back to profile value ({profile['grad_accum']})")
+        _warn(f"grad_accum < 1 is invalid \u2014 falling back to profile value ({profile['grad_accum']})")
         grad_accum = profile["grad_accum"]
     if batch_size < 1:
-        _warn(f"batch_size < 1 is invalid — falling back to config value ({BATCH_SIZE})")
+        _warn(f"batch_size < 1 is invalid \u2014 falling back to config value ({BATCH_SIZE})")
         batch_size = BATCH_SIZE
     _info(f"Model profile: {os.path.basename(model_name)}  |  grad_accum: {grad_accum}"
           + ("" if grad_accum == profile["grad_accum"] else f"  (profile default: {profile['grad_accum']})")
@@ -208,7 +222,7 @@ def run_training(train_dataset, tokenizer, training_mode, model_name, processor,
         _info("Early stop: disabled")
 
     selected_scheduler = select_scheduler(train_dataset.num_rows, num_train_epochs, min_stop_steps)
-    # 1% of the run, but never below 75 steps nor above 10% of the run —
+    # 1% of the run, but never below 75 steps nor above 10% of the run \u2014
     # otherwise short runs would spend their whole schedule in warmup.
     dynamic_warmup = min(max(75, int(0.01 * total_steps)), max(1, total_steps // 10))
     _table("Training Config", [
@@ -220,21 +234,6 @@ def run_training(train_dataset, tokenizer, training_mode, model_name, processor,
         ("Batch size",    f"{batch_size}  (effective {batch_size * grad_accum} with grad accum {grad_accum})"),
         ("Warmup",        f"{dynamic_warmup} steps"),
     ])
-
-    BRIDGE.emit(
-        "training_started",
-        total_steps=total_steps,
-        epochs=num_train_epochs,
-        training_mode=training_mode,
-        lr=profile["learning_rate"],
-        batch_size=batch_size,
-        grad_accum=grad_accum,
-        early_stop=bool(use_early_stop),
-        scheduler=selected_scheduler,
-        warmup_steps=dynamic_warmup,
-    )
-
-    progress_callback = AgentProgressCallback(BRIDGE, early_stop)
 
     args = TrainingArguments(
         output_dir=output_dir,
@@ -280,7 +279,7 @@ def run_training(train_dataset, tokenizer, training_mode, model_name, processor,
         processing_class=tokenizer,
         data_collator=data_collator,
         compute_metrics=None,
-        callbacks=[c for c in (early_stop, progress_callback) if c is not None],
+        callbacks=[] if early_stop is None else [early_stop, AgentProgressCallback(BRIDGE, early_stop)],
     )
 
     _training_error = None
@@ -326,7 +325,7 @@ def run_training(train_dataset, tokenizer, training_mode, model_name, processor,
             trainer.train(resume_from_checkpoint=last_ckpt)
         else:
             trainer.train()
-        summary = summarize_training(
+        summarize_training(
             trainer,
             dataset_size=len(train_dataset),
             num_train_epochs=num_train_epochs,
@@ -334,18 +333,8 @@ def run_training(train_dataset, tokenizer, training_mode, model_name, processor,
             grad_accum=grad_accum,
             report_path=os.path.join(merge_dir, "training_report.json"),
         )
-        loss_summary = summary.get("loss", {}) if isinstance(summary, dict) else {}
-        BRIDGE.emit(
-            "training_complete",
-            steps=summary.get("total_steps"),
-            final_loss=loss_summary.get("final"),
-            best_loss=loss_summary.get("best"),
-            time_sec=summary.get("training_time_sec"),
-            report=os.path.join(merge_dir, "training_report.json"),
-        )
         roc()
     except KeyboardInterrupt:
-        BRIDGE.emit("run_interrupted")
         _warn("Keyboard interrupt \u2014 saving current state...")
         if isinstance(model, PeftModel):
             model.save_pretrained(merge_dir)
@@ -353,7 +342,6 @@ def run_training(train_dataset, tokenizer, training_mode, model_name, processor,
             trainer.save_model(merge_dir)
     except Exception as e:
         _training_error = e
-        BRIDGE.emit("training_failed", error=str(e), emergency_save=True)
         _err(f"Training error: {e}")
         _warn("Attempting emergency save before merge...")
         try:
