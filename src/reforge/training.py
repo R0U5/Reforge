@@ -36,8 +36,21 @@ def load_model(tokenizer, model_name, image_mode=False, output_dir=None, train_l
             _attn_implementation="eager",
         ).to("cuda")
     else:
+        # Detect a previously merged model: a full model directory carrying
+        # config.json but no adapter_config.json. These are the base models
+        # restored by the training chain (merged/ + success.txt).
+        adapter_config_path = os.path.join(model_name, "adapter_config.json")
+        is_merged_model = (
+            os.path.isdir(model_name)
+            and os.path.isfile(os.path.join(model_name, "config.json"))
+            and not os.path.isfile(adapter_config_path)
+        )
+
         _banner("Model")
-        _info(f"Loading {os.path.basename(model_name)} (AutoModelForCausalLM)...")
+        if is_merged_model:
+            _info(f"Loading merged model {os.path.basename(model_name)} (AutoModelForCausalLM, 4-bit)...")
+        else:
+            _info(f"Loading {os.path.basename(model_name)} (AutoModelForCausalLM)...")
         bnb_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
