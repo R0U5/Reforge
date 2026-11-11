@@ -33,7 +33,8 @@ Structured failures
     remediation `hint` (see classify_error). Unknown failures emit the
     message only. Codes: missing_base_model, missing_dataset,
     invalid_dataset, dataset_not_found, undetectable_schema,
-    model_not_found, cuda_oom, dataset_too_small, checkpoint_base_mismatch.
+    model_not_found, cuda_oom, dataset_too_small, checkpoint_base_mismatch,
+    invalid_base_model.
 
 Self-description
     `reforge --agent-schema` prints the complete agent contract as one
@@ -113,6 +114,11 @@ _ERROR_PATTERNS = [
      "checkpoint-last was trained on a different base model; the run restarted "
      "with a fresh LoRA adapter. Point --base_model at the original base, or "
      "remove the output_dir checkpoint to accept the restart."),
+    ("points at a training checkpoint",
+     "invalid_base_model",
+     "--base_model was set to a Trainer checkpoint (contains adapter_config.json), "
+     "not a base model. Pass the original base model directory instead; resuming "
+     "from checkpoint-last happens automatically."),
     ("dataset file not found",
      "dataset_not_found",
      "Pass an existing .parquet path as the positional dataset argument, or "

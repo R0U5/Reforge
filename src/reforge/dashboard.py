@@ -745,23 +745,19 @@ class ReforgeDashboard:
     def _reader_stderr(self, pipe):
         """Consume stderr line-by-line; dict lines feed the live chart.
 
-        Reads raw chunks and re-assembles lines locally so a chunk boundary
-        can never split a loss row. Loss rows are child-proof: trainers
-        LossLineLogger writes them via _safe_print, so even if this pipe
-        dies the training run keeps going.
+        Uses readline() rather than a fixed-size read(). BufferedReader.read(n)
+        blocks until *n* bytes have accumulated, so the old read(256) sat on the
+        first ~4 loss rows (each row is ~84 bytes) before surfacing anything —
+        the chart showed "Starting..." for the first several steps of every run.
+        readline() returns the moment a newline arrives, so step 1 plots
+        immediately. A trailing partial line is flushed at EOF by the iterator.
+
+        Loss rows are child-proof: trainers LossLineLogger writes them via
+        _safe_print, so even if this pipe dies the training run keeps going.
         """
-        buf = b""
         try:
-            while True:
-                chunk = pipe.read(256)
-                if not chunk:
-                    break
-                buf += chunk
-                while b"\n" in buf:
-                    raw, buf = buf.split(b"\n", 1)
-                    self._handle_stderr_line(raw)
-            if buf:
-                self._handle_stderr_line(buf)
+            for raw in iter(pipe.readline, b""):
+                self._handle_stderr_line(raw)
         except Exception:
             pass
         finally:
@@ -813,24 +809,6 @@ class ReforgeDashboard:
             f"ep {ep:.2f}\n"
         )
         self._write_line(sys.stdout, formatted)
-
-    def _reader_stderr(self, pipe):
-        try:
-            while True:
-                chunk = pipe.read(256)
-                if not chunk:
-                    break
-                text = chunk.decode("utf-8", errors="replace")
-                if any(p in text for p in self._SUPPRESS_PATTERNS):
-                    continue
-                self._write_line(sys.stderr, text)
-        except Exception:
-            pass
-        finally:
-            try:
-                pipe.close()
-            except Exception:
-                pass
 
     def _stop_training(self):
         if not self._proc:

@@ -336,6 +336,54 @@ def _dry_run(parsed_args) -> int:
     return 0 if result["ok"] else 2
 
 
+def _sanitize_merged_for_save(merged_model):
+    """Clear stale PEFT bookkeeping left on a model after merge_and_unload().
+
+    merge_and_unload() removes every LoRA tuner layer but leaves
+    ``_hf_peft_config_loaded = True`` on the underlying transformers model.
+    transformers 5.x save_pretrained then wrongly takes the adapter-only
+    branch and crashes inside active_adapters() (UnboundLocalError: with no
+    tuner layers left to inspect, its loop never assigns the variable).
+    Clearing the flag makes save_pretrained do a normal full save.
+    """
+    try:
+        if getattr(merged_model, "_hf_peft_config_loaded", False):
+            merged_model._hf_peft_config_loaded = False
+    except Exception:
+        pass
+    return merged_model
+
+
+def _rebuild_and_merge(adapter_dir, base_dir, tokenizer, save_profile,
+                       image_mode=False):
+    """Rebuild the base in bf16 on CPU, apply + merge the adapter, return it.
+
+    Merging into the bf16 base (instead of the 4-bit quantized training
+    model) is numerically exact and produces a standalone, loadable model.
+    Loading on CPU keeps this safe on small-VRAM GPUs.
+    """
+    import torch
+    from peft import PeftModel
+    from transformers import AutoModelForCausalLM, AutoModelForImageTextToText
+    _info(f"Rebuilding base model in bf16 (CPU): {base_dir}")
+    auto_cls = AutoModelForImageTextToText if image_mode else AutoModelForCausalLM
+    base = auto_cls.from_pretrained(
+        base_dir,
+        local_files_only=True,
+        trust_remote_code=save_profile["trust_remote_code"],
+        torch_dtype=torch.bfloat16,
+        low_cpu_mem_usage=True,
+        _attn_implementation="eager",
+    )
+    if save_profile["resize_embeddings"] and tokenizer is not None:
+        try:
+            base.resize_token_embeddings(len(tokenizer))
+        except Exception:
+            pass
+    merged = PeftModel.from_pretrained(base, adapter_dir).merge_and_unload()
+    return _sanitize_merged_for_save(merged)
+
+
 def _run_pipeline(parsed_args, image_mode, output_dir, merge_dir, merge_success_flag):
     merge_dir_actual = merge_dir
 
@@ -372,6 +420,20 @@ def _run_pipeline(parsed_args, image_mode, output_dir, merge_dir, merge_success_
         _info(f"Base model override: {resolved_base}")
     else:
         resolved_base = select_base_model(image_mode=image_mode)
+
+    # A Trainer checkpoint (adapter_config.json, no config.json) is not a
+    # base model: loading it half-works, the LoRA merge then rebuilds from a
+    # directory that checkpoint rotation has since deleted (cryptic
+    # HFValidationError). Fail early with an actionable message instead.
+    if resolved_base and os.path.isfile(os.path.join(resolved_base, "adapter_config.json")) \
+            and not os.path.isfile(os.path.join(resolved_base, "config.json")):
+        _msg = (f"--base_model points at a training checkpoint ({resolved_base}), "
+                "not a base model. Pass the original base model directory; "
+                "runs resume from <output_dir>/checkpoint-last automatically.")
+        _err(_msg)
+        BRIDGE.emit("run_failed", error=_msg, error_code="invalid_base_model",
+                    exit_code=2)
+        raise SystemExit(2)
 
     modes = []
     if parsed_args.latex:
@@ -466,60 +528,84 @@ def _run_pipeline(parsed_args, image_mode, output_dir, merge_dir, merge_success_
 
     BRIDGE.emit("merge_started", stage="exporting", merge_dir=merge_dir_actual)
 
+    import gc
+    import shutil
+    import torch
     from peft import PeftModel
+    from transformers import AutoModelForCausalLM, AutoModelForImageTextToText
+
+    save_profile = None
     if isinstance(model, PeftModel):
         _banner("Saving")
         _info("Merging LoRA weights into base model...")
+
+        # 1. Export the adapter first: small, reliable, and the rebuild path
+        # below needs it on disk independent of the training model.
+        adapter_export_dir = os.path.join(output_dir, "adapter_export")
         try:
-            merged_model = model.merge_and_unload()
-            final_model_to_save = merged_model
-            _ok("LoRA merge complete")
+            model.save_pretrained(adapter_export_dir)
+            _ok(f"Adapter exported: {adapter_export_dir}")
         except Exception as e:
-            _warn(f"Merge failed: {e} \u2014 saving adapter as-is")
-            final_model_to_save = model
+            raise RuntimeError(f"Adapter export failed before merge: {e}") from e
+
+        # 2. Pick the true base dir: the adapter's recorded base beats the
+        # CLI argument (which may point at a checkpoint, or a moved/renamed
+        # directory that no longer exists).
+        recorded_base = None
+        try:
+            recorded_base = model.peft_config["default"].base_model_name_or_path
+        except Exception:
+            pass
+        merge_base = resolved_base
+        if recorded_base and os.path.isfile(os.path.join(recorded_base, "config.json")):
+            if os.path.abspath(recorded_base) != os.path.abspath(resolved_base):
+                _info(f"Using adapter-recorded base: {recorded_base}")
+            merge_base = recorded_base
+        if not os.path.isfile(os.path.join(merge_base, "config.json")):
+            raise RuntimeError(
+                f"Cannot merge: base model directory not found or has no "
+                f"config.json (adapter recorded: {recorded_base!r}, "
+                f"--base_model: {resolved_base!r})")
+        save_profile = resolve_model_profile(merge_base)
+
+        is_4bit = bool(
+            getattr(model, "is_loaded_in_4bit", False)
+            or getattr(model.get_base_model(), "is_loaded_in_4bit", False))
+        merged_model = None
+        if not is_4bit:
+            try:
+                merged_model = _sanitize_merged_for_save(model.merge_and_unload())
+                _ok("LoRA merge complete")
+            except Exception as e:
+                _warn(f"Direct merge failed: {e} — rebuilding base model instead")
+        if merged_model is None:
+            # 3. 4-bit runs must NOT merge in GPU memory: the LoRA weights
+            # would be baked into the 4-bit containers with rounding errors,
+            # and saving a 4-bit model cannot produce a usable merged model.
+            # Free the training model + VRAM, rebuild the base in bf16 on
+            # CPU, then merge there.
+            del model
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            merged_model = _rebuild_and_merge(
+                adapter_export_dir, merge_base, tokenizer, save_profile,
+                image_mode=image_mode)
+            _ok("LoRA merge complete (rebuilt bf16 base)")
+        final_model_to_save = merged_model
+        shutil.rmtree(adapter_export_dir, ignore_errors=True)
     else:
         _banner("Saving")
         _info("Model already merged")
         final_model_to_save = model
+        save_profile = resolve_model_profile(resolved_base)
 
     _info(f"Saving to: {merge_dir_actual}")
     os.makedirs(merge_dir_actual, exist_ok=True)
-    save_profile = resolve_model_profile(resolved_base)
-    from transformers import AutoModelForCausalLM, AutoModelForImageTextToText
-    try:
-        final_model_to_save.save_pretrained(
-            merge_dir_actual,
-            safe_serialization=save_profile["safe_serialization"],
-        )
-    except Exception as e:
-        _err(f"save_pretrained failed: {e}")
-        _warn("Retrying with rebuilt base model...")
-        import torch
-        if image_mode:
-            base = AutoModelForImageTextToText.from_pretrained(
-                resolved_base,
-                local_files_only=True,
-                trust_remote_code=True,
-                torch_dtype=torch.bfloat16,
-                _attn_implementation="eager",
-            ).to("cuda")
-        else:
-            base = AutoModelForCausalLM.from_pretrained(
-                resolved_base,
-                local_files_only=True,
-                trust_remote_code=save_profile["trust_remote_code"],
-                torch_dtype=torch.bfloat16,
-                _attn_implementation="eager",
-            ).to("cuda")
-        if save_profile["resize_embeddings"]:
-            try:
-                base.resize_token_embeddings(len(tokenizer))
-            except Exception:
-                pass
-        sd = {k: v.cpu() for k, v in final_model_to_save.state_dict().items()}
-        missing_unexp = base.load_state_dict(sd, strict=False)
-        _info(f"State-dict loaded \u2014 missing/unexpected: {missing_unexp}")
-        base.save_pretrained(merge_dir_actual, safe_serialization=save_profile["safe_serialization"])
+    final_model_to_save.save_pretrained(
+        merge_dir_actual,
+        safe_serialization=save_profile["safe_serialization"],
+    )
 
     if image_mode and processor is not None:
         processor.save_pretrained(merge_dir_actual)
