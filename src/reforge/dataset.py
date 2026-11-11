@@ -473,7 +473,16 @@ def load_and_prepare_dataset(dataset_path, cleaning_mode, image_mode=False, base
         just_logged = log_dataset(dataset_path, TRAINING_CHAIN_PATH)
         if just_logged:
             purge_checkpoints(output_dir if output_dir else OUTPUT_DIR)
-    return train_dataset, eval_dataset, tokenizer, training_mode, model_name, processor
+    schema_info = {
+        "columns": list(columns),
+        "mapped_roles": {
+            "question": col_question, "chosen": col_chosen,
+            "rejected": col_rejected, "image": col_image,
+        },
+        "cleaning_mode": effective_mode,
+        "shuffle_seed": shuffle_seed,
+    }
+    return train_dataset, eval_dataset, tokenizer, training_mode, model_name, processor, schema_info
 
 
 def _resolve_model_name(merged_dir: str, merge_success_flag: str, base_model: str) -> str:

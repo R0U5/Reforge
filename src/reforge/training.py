@@ -13,7 +13,7 @@ from transformers import (
 
 from .config import BATCH_SIZE, LOG_STEPS, SAVE_STEPS, SAVE_LIMITS, OUTPUT_DIR, MERGED_DIR
 from .display import _info, _ok, _warn, _err, _banner, _table, _safe_print
-from .agent import BRIDGE, AgentProgressCallback
+from .agent import BRIDGE, AgentProgressCallback, classify_error
 from .profiles import resolve_model_profile
 from .early_stopping import select_scheduler, EarlyStopByLoss, compute_min_steps, dynamic_early_stop_cap
 from .reporting import summarize_training
@@ -263,6 +263,7 @@ def run_training(train_dataset, tokenizer, training_mode, model_name, processor,
 
     BRIDGE.emit(
         "training_started",
+        stage="training",
         total_steps=total_steps,
         epochs=num_train_epochs,
         training_mode=training_mode,
@@ -393,7 +394,9 @@ def run_training(train_dataset, tokenizer, training_mode, model_name, processor,
             trainer.save_model(merge_dir)
     except Exception as e:
         _training_error = e
-        BRIDGE.emit("training_failed", error=str(e), emergency_save=True)
+        _error_code, _hint = classify_error(str(e))
+        BRIDGE.emit("training_failed", error=str(e), error_code=_error_code,
+                    hint=_hint, emergency_save=True)
         _err(f"Training error: {e}")
         _warn("Attempting emergency save before merge...")
         try:

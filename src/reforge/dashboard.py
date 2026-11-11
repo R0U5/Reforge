@@ -1123,4 +1123,6 @@ class ReforgeDashboard:
 
 
 if __name__ == "__main__":
-    ReforgeDashboard().run()
+    raise SystemExit(
+        "Launch the dashboard with:  reforge dashboard"
+    )

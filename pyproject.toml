@@ -30,7 +30,6 @@ Homepage = "https://github.com/R0U5/Reforge"
 
 [project.scripts]
 reforge = "reforge.__main__:main"
-reforge-dashboard = "reforge.dashboard:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

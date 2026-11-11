@@ -18,8 +18,10 @@ src/reforge/
 ├── reporting.py         # Training summary, loss curves, reports
 ├── agent.py             # Agent mode: NDJSON events + run_state.json
 ├── utils.py             # Model scanner, file picker, GC
-└── dashboard.py         # Tkinter GUI — `reforge dashboard` (also: reforge-dashboard)
+└── dashboard.py           # Tkinter GUI — `reforge dashboard` (the only launch path)
 ```
+
+`AGENTS.md` (repo root) is the orientation guide for AI agents working on or driving Reforge.
 
 ## Quick Start
 
@@ -36,8 +38,6 @@ pip install -e ".[dashboard]"
 
 # Launch the GUI dashboard
 reforge dashboard
-python -m reforge dashboard
-python -m reforge.dashboard
 
 # Specify a Hugging Face Hub dataset
 python -m reforge --hf_dataset username/dataset-name
@@ -79,6 +79,8 @@ python -m reforge dataset.parquet --base_model /path/to/model --agent
 | `--grad_accum N` | Gradient accumulation steps override (default: model profile) |
 | `--force` | Disable early stopping |
 | `--agent` | Agent mode: NDJSON events on stdout + pollable `run_state.json` |
+| `--agent_schema` | Print the machine-readable agent contract as JSON and exit 0 (also: `reforge agent-schema`) |
+| `--dry_run` | Preflight: validate args/dataset/model and print the resolved training plan as JSON (no weights loaded) |
 | `--agent_log PATH` | Also tee the agent NDJSON stream to a file |
 
 ## Environment Variables
@@ -111,15 +113,21 @@ python -m reforge dataset.parquet --base_model /path/to/model --agent
 - **Tkinter dashboard** (`reforge dashboard`, `python -m reforge dashboard`, or `-m reforge.dashboard`) — config editor, start/stop, and a live loss chart.
 
 ### Agent mode
-- **NDJSON event stream on stdout** — one JSON object per line: `run_started`, `dataset_loaded`, `training_started`, `step` (loss, percent, ETA), `checkpoint_saved`, `early_stop_check`, `early_stop_triggered`, `training_complete`, `merge_started`, `merge_complete`, `run_complete`, `run_failed`, `run_interrupted`.
-- **Pollable state file** — `<output_dir>/run_state.json` holds the latest snapshot (status, step, loss, ETA, exit code), rewritten atomically after every event; safe to poll from a background process.
+- **Self-describing contract** — `reforge --agent-schema` (or `reforge agent-schema`) prints the complete machine-readable contract as one JSON object: CLI arguments, event vocabulary and fields, `run_state.json` keys, exit codes, error codes, dataset schemas, model profiles, artifact map, and an example session. Generated from the live argparse parser and pipeline constants, so it cannot drift. **Agents should call this first.**
+- **Preflight** — `reforge --dry_run --base_model PATH dataset.parquet` validates everything and prints the resolved training plan (steps, epochs, scheduler, warmup, early-stop caps, LoRA config) as JSON without loading weights. Exit 0 = safe to launch, 2 = errors listed with codes.
+- **NDJSON event stream on stdout** — one JSON object per line: `run_started`, `dataset_loaded`, `training_started`, `step` (loss, percent, ETA), `checkpoint_saved`, `early_stop_check`, `early_stop_triggered`, `training_complete`, `merge_started`, `merge_complete`, `run_complete`, `run_failed`, `run_interrupted`. Each event carries a `stage` field (`loading`/`preparing`/`training`/`exporting`).
+- **Pollable state file** — `<output_dir>/run_state.json` holds the latest snapshot (schema `version`, status, step, loss, ETA, stage, error, exit code), rewritten atomically after every event; safe to poll from a background process.
+- **Structured failures** — `run_failed`/`training_failed` events carry a machine-branchable `error_code` and a remediation `hint` (`missing_base_model`, `undetectable_schema`, `cuda_oom`, `model_not_found`, `dataset_not_found`, `invalid_dataset`, `missing_dataset`, `dataset_too_small`, `checkpoint_base_mismatch`).
+- **Rich `dataset_loaded`** — includes detected `training_mode`, raw `columns`, `mapped_roles` (question/chosen/rejected/image → column), `cleaning_mode`, and `shuffle_seed`.
 - **Pure stdout in agent mode** — pretty/console output is diverted to stderr, so stdout parses line-by-line as JSON. Highly recommended to pass `--base_model` and a dataset argument, since interactive pickers are unavailable in agent mode (it fails fast with exit code 2 instead of blocking on stdin).
 - **Meaningful exit codes** — `0` success, `1` runtime/training failure, `2` invalid arguments or dataset, `130` interrupted.
 
 ```jsonl
-{"ts": "2026-11-10T19:05:14Z", "event": "step", "step": 100, "total_steps": 1500, "loss": 2.4131, "pct": 6.7, "eta_sec": 612}
-{"ts": "2026-11-10T19:16:12Z", "event": "run_complete", "merged_dir": "C:/Users/you/Reforge_Output/merged", "exit_code": 0}
+{"ts": "2026-11-10T19:05:14Z", "event": "step", "stage": "training", "step": 100, "total_steps": 1500, "loss": 2.4131, "pct": 6.7, "eta_sec": 612}
+{"ts": "2026-11-10T19:16:12Z", "event": "run_complete", "stage": "complete", "merged_dir": "C:/Users/you/Reforge_Output/merged", "exit_code": 0}
 ```
+
+See [`AGENTS.md`](AGENTS.md) for the full agent-facing guide (structure, monitoring, failure handling). A portable skill for skill-compatible agent harnesses is bundled at [`skills/reforge/SKILL.md`](skills/reforge/SKILL.md).
 
 ## How It Works
 
