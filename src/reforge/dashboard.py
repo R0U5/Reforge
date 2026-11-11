@@ -814,24 +814,6 @@ class ReforgeDashboard:
         )
         self._write_line(sys.stdout, formatted)
 
-    def _reader_stderr(self, pipe):
-        try:
-            while True:
-                chunk = pipe.read(256)
-                if not chunk:
-                    break
-                text = chunk.decode("utf-8", errors="replace")
-                if any(p in text for p in self._SUPPRESS_PATTERNS):
-                    continue
-                self._write_line(sys.stderr, text)
-        except Exception:
-            pass
-        finally:
-            try:
-                pipe.close()
-            except Exception:
-                pass
-
     def _stop_training(self):
         if not self._proc:
             return

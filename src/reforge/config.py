@@ -36,7 +36,6 @@ DEFAULT_HF_MODELS_DIR = os.environ.get(
     os.path.join(os.path.expanduser("~"), "HF_Models")
 )
 
-MAX_LENGTH = 750
 SAVE_STEPS = 25
 SAVE_LIMITS = 2
 LOG_STEPS = 1

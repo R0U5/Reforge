@@ -219,6 +219,12 @@ def run_training(train_dataset, tokenizer, training_mode, model_name, processor,
         total_steps = estimated_steps * num_train_epochs
         _info(f"Estimated steps: {total_steps}")
 
+    # Fail before loading any weights: a dataset too small for one optimizer
+    # step otherwise costs a full 4-bit model load (VRAM + minutes) first.
+    if total_steps < 1:
+        _err("Not enough data to train!")
+        raise RuntimeError("Not enough data to train!")
+
     use_early_stop = not parsed_args.force and not use_steps
     min_stop_steps = compute_min_steps(train_dataset, batch_size, grad_accum)
     early_stop = None
@@ -326,10 +332,6 @@ def run_training(train_dataset, tokenizer, training_mode, model_name, processor,
 
     _training_error = None
     try:
-        if total_steps < 1:
-            _err("Not enough data to train!")
-            raise RuntimeError("Not enough data to train!")
-
         _banner("Training")
         _info(f"Train rows: {len(train_dataset):,}  |  Steps: {total_steps}  |  Warmup: {dynamic_warmup}")
         last_ckpt = os.path.join(output_dir, "checkpoint-last")
@@ -388,10 +390,19 @@ def run_training(train_dataset, tokenizer, training_mode, model_name, processor,
     except KeyboardInterrupt:
         BRIDGE.emit("run_interrupted")
         _warn("Keyboard interrupt \u2014 saving current state...")
-        if isinstance(model, PeftModel):
-            model.save_pretrained(merge_dir)
-        else:
-            trainer.save_model(merge_dir)
+        # Save OUTSIDE merge_dir: the export below writes the merged model
+        # there, and leftover adapter files (adapter_config.json) would make
+        # the next chained run misclassify merged/ as a non-merged base.
+        _interrupted_dir = os.path.join(output_dir, "interrupted_adapter")
+        try:
+            os.makedirs(_interrupted_dir, exist_ok=True)
+            if isinstance(model, PeftModel):
+                model.save_pretrained(_interrupted_dir)
+            else:
+                trainer.save_model(_interrupted_dir)
+            _ok(f"Interrupted state saved to {_interrupted_dir}")
+        except Exception as save_err:
+            _err(f"Interrupted save failed: {save_err}")
     except Exception as e:
         _training_error = e
         _error_code, _hint = classify_error(str(e))

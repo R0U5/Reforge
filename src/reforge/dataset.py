@@ -124,7 +124,10 @@ def detect_training_mode(columns):
     if has_image_col:
         check_order = ["multimodal"] + [m for m in TRAINING_SCHEMAS if m != "multimodal"]
     else:
-        check_order = list(TRAINING_SCHEMAS.keys())
+        # Chat must be checked before SFT: "messages" is an alias of both
+        # (chat.question and sft.chosen), and SFT would otherwise swallow
+        # every conversation dataset, making chat mode unreachable.
+        check_order = ["chat"] + [m for m in TRAINING_SCHEMAS if m != "chat"]
 
     for mode in check_order:
         schema = TRAINING_SCHEMAS[mode]
@@ -158,20 +161,6 @@ def resolve_column(role, available_columns, training_mode):
         if alias in lowered:
             return lowered[alias]
     return None
-
-
-def mapped_summary(col_question, col_chosen, col_rejected, col_image=None):
-    used = []
-    if col_image:    used.append(f" image    \u2192 {col_image}")
-    if col_question: used.append(f" question \u2192 {col_question}")
-    if col_chosen:   used.append(f" chosen   \u2192 {col_chosen}")
-    if col_rejected: used.append(f" rejected \u2192 {col_rejected}")
-    if used:
-        print("\nMapped Roles:")
-        for line in used:
-            print(" ", line)
-    else:
-        print("No usable column roles mapped!")
 
 
 def unbox_field(text: str) -> str:
@@ -251,23 +240,42 @@ def synthesize_prompt_dataset(raw_dataset, col_question, col_chosen, col_rejecte
                 a = row.get(col_chosen, "") or ""
                 if str(a).strip():
                     parts.append(clean(str(a)))
-            text = "\n\n".join(parts)
-            result = {"text": text}
-            if col_image and col_image != "image":
-                result["image"] = row[col_image]
-            return result
+            return {"text": "\n\n".join(parts)}
 
         processed = raw_dataset.map(
             build_multimodal_row,
             num_proc=1,
             writer_batch_size=50,
         )
+        # The original image column is renamed here (not copied in the map,
+        # which would collide with the rename) and everything else dropped.
         if col_image and col_image != "image" and col_image in processed.column_names:
             processed = processed.rename_column(col_image, "image")
         cols_to_drop = [c for c in processed.column_names if c not in ("text", "image")]
         if cols_to_drop:
             processed = processed.remove_columns(cols_to_drop)
-        processed = processed.filter(lambda e: bool(str(e["text"]).strip()), num_proc=1)
+        processed = processed.filter(lambda e: bool(str(e["text"] or "").strip()), num_proc=1)
+        _info(f"Retained {len(processed):,} / {original_count:,} rows")
+    elif training_mode == "chat":
+        def build_chat_row(row):
+            msgs = row.get(col_question) if col_question else None
+            if isinstance(msgs, str):
+                try:
+                    import json as _json
+                    msgs = _json.loads(msgs)
+                except Exception:
+                    msgs = None
+            if not (isinstance(msgs, list) and msgs
+                    and all(isinstance(m, dict) and "role" in m and "content" in m
+                            for m in msgs)):
+                return {"messages": None}
+            return {"messages": msgs}
+
+        processed = raw_dataset.map(build_chat_row, num_proc=1, writer_batch_size=50)
+        cols_to_drop = [c for c in processed.column_names if c != "messages"]
+        if cols_to_drop:
+            processed = processed.remove_columns(cols_to_drop)
+        processed = processed.filter(lambda e: bool(e.get("messages")), num_proc=1)
         _info(f"Retained {len(processed):,} / {original_count:,} rows")
     else:
         df = raw_dataset.to_pandas()
@@ -298,8 +306,15 @@ def synthesize_prompt_dataset(raw_dataset, col_question, col_chosen, col_rejecte
 
     if len(processed) > 0:
         first_raw = raw_dataset[0]
-        q = clean(str(first_raw.get(col_question, ""))) if col_question else ""
-        a = clean(str(first_raw.get(col_chosen, ""))) if col_chosen else ""
+        if training_mode == "chat":
+            _msgs = first_raw.get(col_question) or []
+            q = f"{len(_msgs)} messages | " + " | ".join(
+                f"{m.get('role')}: {str(m.get('content', ''))[:40]}"
+                for m in _msgs[:3] if isinstance(m, dict))
+            a = ""
+        else:
+            q = clean(str(first_raw.get(col_question, ""))) if col_question else ""
+            a = clean(str(first_raw.get(col_chosen, ""))) if col_chosen else ""
         _width = 58
         if q or a:
             print(f"\n  {'-' * _width}")
@@ -322,7 +337,13 @@ def load_and_prepare_dataset(dataset_path, cleaning_mode, image_mode=False, base
 
     _num_proc = min(12, os.cpu_count() or 4)
 
-    is_hf_hub = not os.path.exists(dataset_path) and "/" in dataset_path
+    is_hf_hub = (
+        not os.path.exists(dataset_path)
+        and "/" in dataset_path
+        # A typo'd local path (e.g. C:/wrong/data.parquet) contains "/" too;
+        # only treat extension-less IDs as Hub datasets.
+        and not dataset_path.lower().endswith(".parquet")
+    )
     if is_hf_hub:
         _info(f"Source: HF Hub \u2014 {dataset_path}")
         _prev_offline = os.environ.pop("HF_DATASETS_OFFLINE", None)
@@ -419,7 +440,7 @@ def load_and_prepare_dataset(dataset_path, cleaning_mode, image_mode=False, base
 
     _banner("Tokenization")
     _info("Measuring sequence lengths...")
-    processed, auto_len = measure_lengths(processed, tokenizer)
+    processed, auto_len = measure_lengths(processed, tokenizer, training_mode=training_mode)
 
     _info("Tokenizing dataset...")
     protected = {"length"}
