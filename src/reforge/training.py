@@ -2,6 +2,7 @@ import json
 import os
 import shutil
 
+import numpy as np
 import torch
 from peft import LoraConfig, get_peft_model, PeftModel
 from transformers import (
@@ -40,6 +41,10 @@ class LossLineLogger(TrainerCallback):
             "epoch": float(logs.get("epoch", 0.0) or 0.0),
             "step": int(state.global_step),
         }
+        # DPO runs also log preference alignment metrics; surface the
+        # chosen-over-rejected accuracy so the dashboard can display it.
+        if logs.get("rewards/accuracies") is not None:
+            entry["acc"] = round(float(logs["rewards/accuracies"]), 4)
         try:
             import sys as _sys
             print(str(entry), file=_sys.stderr, flush=True)
@@ -188,6 +193,15 @@ def print_trainable_parameters(model):
 
 def run_training(train_dataset, tokenizer, training_mode, model_name, processor, parsed_args, resolved_base, output_dir=None, merge_dir=None):
     image_mode = (training_mode == "multimodal")
+    is_dpo = (training_mode == "dpo")
+    if is_dpo:
+        try:
+            from trl import DPOConfig, DPOTrainer
+        except ImportError as import_err:
+            raise RuntimeError(
+                "DPO training requires the 'trl' package - install it with: pip install trl"
+            ) from import_err
+        dpo_beta = float(getattr(parsed_args, "dpo_beta", None) or 0.1)
     if output_dir is None:
         output_dir = OUTPUT_DIR
     if merge_dir is None:
@@ -279,11 +293,12 @@ def run_training(train_dataset, tokenizer, training_mode, model_name, processor,
         early_stop=bool(use_early_stop),
         scheduler=selected_scheduler,
         warmup_steps=dynamic_warmup,
+        beta=(dpo_beta if is_dpo else None),
     )
 
     progress_callback = AgentProgressCallback(BRIDGE, early_stop)
 
-    args = TrainingArguments(
+    _common_args = dict(
         output_dir=output_dir,
         per_device_train_batch_size=batch_size,
         gradient_accumulation_steps=grad_accum,
@@ -313,22 +328,54 @@ def run_training(train_dataset, tokenizer, training_mode, model_name, processor,
         gradient_checkpointing_kwargs={"use_reentrant": False},
     )
 
+    if is_dpo:
+        # DPOConfig extends TrainingArguments, so every scheduling/batching
+        # knob above applies unchanged. max_length comes from the P95 of the
+        # templated prompt+completion lengths measured during dataset prep.
+        dpo_max_length = 1024
+        try:
+            if "length" in train_dataset.column_names:
+                _lengths = [int(v) for v in train_dataset["length"]]
+                if _lengths:
+                    dpo_max_length = max(128, min(1024, int(np.percentile(_lengths, 95))))
+        except Exception:
+            pass
+        _info(f"DPO config: beta {dpo_beta}  |  max_length {dpo_max_length} (P95)"
+              "  |  reference model: adapter-disabled base (no extra copy)")
+        args = DPOConfig(beta=dpo_beta, max_length=dpo_max_length, **_common_args)
+    else:
+        args = TrainingArguments(**_common_args)
+
     model = load_model(
         tokenizer, model_name, image_mode=image_mode, output_dir=output_dir,
         train_lm_head=getattr(parsed_args, "train_lm_head", False),
     )
-    data_collator = DynamicCausalCollator(tokenizer, pad_to_multiple_of=8, image_mode=image_mode)
 
-    trainer = Trainer(
-        model=model,
-        args=args,
-        train_dataset=train_dataset,
-        eval_dataset=None,
-        processing_class=tokenizer,
-        data_collator=data_collator,
-        compute_metrics=None,
-        callbacks=[LossLineLogger()] + [c for c in (early_stop, progress_callback) if c is not None],
-    )
+    if is_dpo:
+        # TRL requires left padding and a pad token for the preference
+        # collator (pad token is set during dataset prep).
+        tokenizer.padding_side = "left"
+        data_collator = None  # TRL default: DataCollatorForPreference
+        trainer = DPOTrainer(
+            model=model,
+            ref_model=None,  # adapter-disabled base weights act as reference
+            args=args,
+            train_dataset=train_dataset,
+            processing_class=tokenizer,
+            callbacks=[LossLineLogger()] + [c for c in (early_stop, progress_callback) if c is not None],
+        )
+    else:
+        data_collator = DynamicCausalCollator(tokenizer, pad_to_multiple_of=8, image_mode=image_mode)
+        trainer = Trainer(
+            model=model,
+            args=args,
+            train_dataset=train_dataset,
+            eval_dataset=None,
+            processing_class=tokenizer,
+            data_collator=data_collator,
+            compute_metrics=None,
+            callbacks=[LossLineLogger()] + [c for c in (early_stop, progress_callback) if c is not None],
+        )
 
     _training_error = None
     try:
@@ -336,7 +383,7 @@ def run_training(train_dataset, tokenizer, training_mode, model_name, processor,
         _info(f"Train rows: {len(train_dataset):,}  |  Steps: {total_steps}  |  Warmup: {dynamic_warmup}")
         last_ckpt = os.path.join(output_dir, "checkpoint-last")
 
-        if not image_mode and torch.cuda.is_available():
+        if not image_mode and not is_dpo and torch.cuda.is_available():
             try:
                 _info("Warming up CUDA kernels (one dry-run forward pass)...")
                 from torch.utils.data import DataLoader

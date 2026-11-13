@@ -120,6 +120,7 @@ kill (see `pid` in run_state.json), or diagnose failures.
 | `checkpoint_base_mismatch` | checkpoint-last belongs to a different base; run restarted fresh |
 | `invalid_base_model` | `--base_model` points at a Trainer checkpoint, not a model dir — pass the original base |
 | `tokenizer_load_failed` | install `sentencepiece`/`tiktoken`, or check the model's tokenizer files |
+| `missing_dependency` | install the required extra (e.g. `pip install trl` for DPO) |
 | `unknown_args` | unrecognized CLI flag (typo); see `--agent-schema` for valid flags |
 
 Unknown failures emit the message only. `hint` contains the remediation.
@@ -127,9 +128,16 @@ Unknown failures emit the message only. `hint` contains the remediation.
 ## 6. Dataset schemas (how your data will be interpreted)
 
 Modes are detected from column names via alias matching, checked in order:
-`multimodal` (if an image column exists) → `sft` → `causal` → `chat`.
-Full alias tables: `reforge --agent-schema` → `dataset_schemas`.
+`multimodal` (if an image column exists) → `chat` → `dpo` → `sft` →
+`causal`. Full alias tables: `reforge --agent-schema` → `dataset_schemas`.
 
+- **dpo** — needs BOTH `chosen` and `rejected` (preference pairs), optional
+  `question` (prompt). Trains with TRL's `DPOTrainer` (LoRA on the 4-bit
+  base; the adapter-disabled base weights act as the reference model).
+  `--dpo_beta` sets beta (default 0.1); `--dpo` forces DPO interpretation.
+  Workflow: SFT first, then DPO on a pair dataset — the training chain
+  (merged/success.txt) makes the SFT-merged model the DPO base
+  automatically.
 - **sft** — needs `chosen` (response/answer/completion/…), optional
   `question` (instruction/prompt/…)
 - **causal** — needs a raw-text column (`text`/`prompt`)

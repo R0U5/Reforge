@@ -1,6 +1,6 @@
 # Reforge
 
-A modular LoRA fine-tuning pipeline for Hugging Face causal language models and vision-language models. Reforge handles dataset loading, automatic schema detection, text cleaning, tokenization, training with smart early stopping, LoRA merge, and final model export. Includes a Tkinter dashboard for interactive control.
+A modular LoRA fine-tuning pipeline for Hugging Face causal language models and vision-language models. Reforge handles dataset loading, automatic schema detection, text cleaning, tokenization, training with smart early stopping (SFT or DPO preference tuning), LoRA merge, and final model export. Includes a Tkinter dashboard for interactive control.
 
 ## Project Structure
 
@@ -54,6 +54,15 @@ python -m reforge --latex
 # Multimodal image+text training
 python -m reforge --image
 
+# DPO preference tuning (dataset with chosen + rejected columns; auto-detected)
+python -m reforge preference_pairs.parquet --base_model /path/to/sft_model
+
+# DPO with a custom beta (KL strength vs the reference model)
+python -m reforge preference_pairs.parquet --base_model /path/to/sft_model --dpo_beta 0.05
+
+# Force DPO interpretation on a dataset with unusual column names
+python -m reforge pairs.parquet --base_model /path/to/sft_model --dpo
+
 # Train for exactly 500 steps
 python -m reforge --steps 500
 
@@ -71,6 +80,8 @@ python -m reforge dataset.parquet --base_model /path/to/model --agent
 | `--base_model PATH` | Path to a local Hugging Face model directory (skips picker) |
 | `--hf_dataset ID` | Load a dataset from the Hugging Face Hub |
 | `--image` | Enable multimodal (vision+text) training |
+| `--dpo` | Force DPO training (normally auto-detected from `chosen`+`rejected` columns) |
+| `--dpo_beta X` | DPO beta, KL strength vs the reference model (default: 0.1; DPO runs only) |
 | `--latex` | Preserve LaTeX/scientific notation during cleaning |
 | `--code` | Preserve code formatting and indentation |
 | `--epoch N` | Number of training epochs (default: 1) |
@@ -82,6 +93,34 @@ python -m reforge dataset.parquet --base_model /path/to/model --agent
 | `--agent_schema` | Print the machine-readable agent contract as JSON and exit 0 (also: `reforge agent-schema`) |
 | `--dry_run` | Preflight: validate args/dataset/model and print the resolved training plan as JSON (no weights loaded) |
 | `--agent_log PATH` | Also tee the agent NDJSON stream to a file |
+
+## Dataset Schemas
+
+Training mode is auto-detected from column names (aliases in parentheses):
+
+| Mode | Required columns | Optional columns | Trains with |
+|------|------------------|------------------|-------------|
+| `dpo` | `chosen` (response, answer, completion, accepted, output, solution) **and** `rejected` (unpreferred, worse, answer_2, response_2, output_2) | `question` (prompt, instruction, input, query, context, problem) | TRL `DPOTrainer` |
+| `sft` | `chosen` | `question` | HF `Trainer` |
+| `causal` | `text` (prompt) | — | HF `Trainer` |
+| `chat` | `messages` | — | HF `Trainer` |
+| `multimodal` | image + text (`--image`) | — | HF `Trainer` |
+
+Detection checks `dpo` before `sft`, so a dataset with both completions is
+always read as preference pairs. DPO rows become `{prompt, chosen, rejected}`
+(or chat-message lists when the tokenizer has a chat template); TRL tokenizes
+them internally. Use `--dpo` to force DPO on non-standard column names —
+the run fails preflight with `invalid_dataset` if both completions are missing.
+
+### The SFT → DPO workflow
+
+1. Train SFT on your instruction dataset as usual → `merged/` + `success.txt`.
+2. Run DPO on a preference-pair dataset **without passing `--base_model`** —
+   the training chain picks up the SFT-merged model as the base automatically
+   (or pass `--base_model /path/to/merged` explicitly).
+3. Watch `rewards/accuracies` climb in the dashboard log while loss decreases.
+   `beta` (default 0.1) controls KL pressure vs the reference model: higher =
+   stay closer to the SFT model, lower = more aggressive alignment.
 
 ## Environment Variables
 
@@ -99,7 +138,8 @@ python -m reforge dataset.parquet --base_model /path/to/model --agent
 ## Features
 
 ### Core
-- **Automatic training mode detection** — inspects dataset columns and selects the right pipeline: SFT (instruction/response), causal (raw text), chat (messages), or multimodal (image+text).
+- **Automatic training mode detection** — inspects dataset columns and selects the right pipeline: SFT (instruction/response), DPO (preference pairs: chosen+rejected), causal (raw text), chat (messages), or multimodal (image+text).
+- **DPO (preference tuning)** — preference-pair datasets train with TRL's `DPOTrainer`: LoRA adapters on the 4-bit base with the adapter-disabled base weights acting as the reference model (no second copy in VRAM), `beta` configurable via `--dpo_beta`. Intended workflow: **SFT first, then DPO** — the SFT run's merged model automatically becomes the DPO run's base via the training chain. Preference alignment is visible live (`rewards/accuracies` in the dashboard log).
 - **Built-in data cleaning** — strips LaTeX, HTML, markdown artifacts, unicode garbage, emoji, junk tokens, and e-commerce noise. Configurable modes for math, LaTeX-preserving, and code-preserving workflows.
 - **Model profiles** — ships with tuned configs for Phi-2, Phi-3, Phi-3-Vision, and more. Falls back to sensible defaults for unlisted models.
 - **Smart early stopping** — EMA-based loss plateau/worsening detection with exposure floors, LR gates, and dynamic hard caps.
@@ -110,7 +150,7 @@ python -m reforge dataset.parquet --base_model /path/to/model --agent
 ### Interactive
 - **Local model picker** — scans `~/HF_Models/` and the Hugging Face hub cache, then presents an interactive numbered list.
 - **Post-training summary** — formatted report with loss statistics, trend, and unicode sparkline. Writes a full `training_report.json`.
-- **Tkinter dashboard** (`reforge dashboard`, `python -m reforge dashboard`, or `-m reforge.dashboard`) — config editor, start/stop, and a live loss chart.
+- **Tkinter dashboard** (`reforge dashboard`, `python -m reforge dashboard`, or `-m reforge.dashboard`) — config editor, start/stop, and a live loss chart. Includes a DPO card (force checkbox, beta field, and the SFT→DPO chain hint) and shows `rewards/accuracies` as an `acc` column in the training log during DPO runs.
 
 ### Agent mode
 - **Self-describing contract** — `reforge --agent-schema` (or `reforge agent-schema`) prints the complete machine-readable contract as one JSON object: CLI arguments, event vocabulary and fields, `run_state.json` keys, exit codes, error codes, dataset schemas, model profiles, artifact map, and an example session. Generated from the live argparse parser and pipeline constants, so it cannot drift. **Agents should call this first.**
@@ -134,7 +174,7 @@ See [`AGENTS.md`](AGENTS.md) for the full agent-facing guide (structure, monitor
 1. **Load** — reads a `.parquet` file or HF Hub dataset, auto-detects training schema.
 2. **Clean** — mode-appropriate text normalization.
 3. **Tokenize** — P95-based length detection, tokenizes with dynamic padding.
-4. **Train** — LoRA adapters, CUDA warmup, Hugging Face `Trainer`.
+4. **Train** — LoRA adapters, CUDA warmup, Hugging Face `Trainer` (or TRL `DPOTrainer` for preference-pair datasets).
 5. **Stop** — early stopping via EMA plateau/worsening detection.
 6. **Report** — summary banner, training_report.json.
 7. **Merge** — LoRA adapter merged back into the base model.

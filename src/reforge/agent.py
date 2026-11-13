@@ -64,7 +64,9 @@ def _now() -> str:
 # Bumped whenever the event vocabulary, run_state keys, or error codes
 # change in a way an agent could observe. Agents should read this from
 # run_state.json ("version") or `reforge --agent-schema`.
-SCHEMA_VERSION = 2
+# v3: DPO training mode (trl.DPOTrainer), beta in training_started,
+#     missing_dependency error code.
+SCHEMA_VERSION = 3
 
 
 # Status shown in run_state.json after each event type.
@@ -87,10 +89,10 @@ _STATUS_BY_EVENT = {
 # Event fields that mirror into run_state.json.
 _MIRRORED_FIELDS = {
     "dataset", "base_model", "training_mode", "rows", "eval_rows",
-    "total_steps", "step", "pct", "eta_sec", "lr", "early_stop",
+    "total_steps", "step", "pct", "eta_sec", "lr", "early_stop", "beta",
     "merged_dir", "report", "error", "exit_code", "interrupted",
     "error_code", "hint", "cleaning_mode", "mapped_roles",
-    "columns", "shuffle_seed",
+    "columns", "shuffle_seed", "dpo_beta",
 }
 
 # Substring match (case-insensitive) -> (error_code, hint). First match
@@ -144,6 +146,15 @@ _ERROR_PATTERNS = [
      "Tokenizer could not be loaded. Install the converter backend "
      "(pip install sentencepiece, or tiktoken for some models), or verify "
      "the model directory contains tokenizer files."),
+    ("dpo training requires the 'trl' package",
+     "missing_dependency",
+     "DPO training needs the TRL library. Install it with: pip install trl "
+     "(or pip install -e . which now includes it)."),
+    ("dpo mode requires 'chosen' and 'rejected'",
+     "invalid_dataset",
+     "DPO training needs a preference-pair dataset: both a chosen and a "
+     "rejected column (aliases in `reforge --agent-schema` -> "
+     "dataset_schemas)."),
 ]
 
 
@@ -331,6 +342,8 @@ _EVENT_FIELDS = {
             "hf_dataset": "str|null — Hub dataset ID, when used",
             "base_model": "str|null — base model directory",
             "image_mode": "bool — multimodal (vision+text) training requested",
+            "dpo": "bool — DPO training forced via --dpo",
+            "dpo_beta": "float|null — DPO beta override (--dpo_beta)",
             "force": "bool — early stopping disabled",
             "epoch": "int — requested epochs",
             "steps": "int|null — fixed step budget (overrides epochs)",
@@ -342,7 +355,7 @@ _EVENT_FIELDS = {
         "stage": "preparing",
         "fields": {
             "dataset": "str — resolved dataset source",
-            "training_mode": '"sft"|"causal"|"chat"|"multimodal" — detected schema',
+            "training_mode": '"sft"|"causal"|"chat"|"multimodal"|"dpo" — detected schema',
             "rows": "int — training rows after cleaning/filtering",
             "eval_rows": "int|null — eval split size (usually null: no split)",
             "base_model": "str — resolved base model (may be a prior merged model)",
@@ -365,6 +378,7 @@ _EVENT_FIELDS = {
             "early_stop": "bool — EMA early stopping enabled",
             "scheduler": "str — LR scheduler type",
             "warmup_steps": "int — LR warmup steps",
+            "beta": "float — DPO beta (KL strength vs reference); present on DPO runs only",
         },
     },
     "step": {

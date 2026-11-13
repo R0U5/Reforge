@@ -104,6 +104,19 @@ def _join_chat_text(messages) -> str:
     )
 
 
+def _completion_text_of(*completions) -> str:
+    """Longest completion text among string or chat-message-list values."""
+    best = ""
+    for c in completions:
+        if isinstance(c, list):
+            text = "".join(str(m.get("content", "")) for m in c if isinstance(m, dict))
+        else:
+            text = str(c or "")
+        if len(text) > len(best):
+            best = text
+    return best
+
+
 def _decode_image(raw):
     if isinstance(raw, PILImage.Image):
         return raw.convert("RGB")
@@ -307,6 +320,35 @@ def measure_lengths(ds, tokenizer, training_mode=None):
             if n is not None:
                 return {"length": n}
             return {"length": len(_join_chat_text(e["messages"]))}
+        # DPO rows: measure prompt + preferred completion (the longer of the
+        # pair drives sequence length in practice). Conversational rows go
+        # through the chat template, matching what DPOTrainer will tokenize.
+        if training_mode == "dpo":
+            prompt = e.get("prompt")
+            chosen = e.get("chosen")
+            rejected = e.get("rejected")
+            if isinstance(prompt, list) or isinstance(chosen, list):
+                base_msgs = list(prompt) if isinstance(prompt, list) else []
+                n_best = None
+                for completion in (chosen, rejected):
+                    comp_msgs = (list(completion) if isinstance(completion, list)
+                                 else [{"role": "assistant", "content": str(completion or "")}])
+                    n = _template_len(tokenizer, base_msgs + comp_msgs)
+                    if n is not None:
+                        n_best = n if n_best is None else max(n_best, n)
+                if n_best is not None:
+                    return {"length": n_best}
+                text = "".join(str(m.get("content", "")) for m in base_msgs if isinstance(m, dict))
+                text += _completion_text_of(chosen, rejected)
+            else:
+                text = (str(prompt or "") + _completion_text_of(chosen, rejected))
+            ids = tokenizer(
+                text,
+                add_special_tokens=True,
+                truncation=False,
+                return_attention_mask=False
+            )["input_ids"]
+            return {"length": len(ids)}
         # SFT rows: measure the templated user/assistant pair, not raw text,
         # so the P95 matches what training actually feeds the model.
         if training_mode == "sft" and e.get("question"):
