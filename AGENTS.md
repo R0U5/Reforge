@@ -118,6 +118,7 @@ kill (see `pid` in run_state.json), or diagnose failures.
 | `cuda_oom` | lower `--batch_size`, or use a smaller base model |
 | `dataset_too_small` | too few rows for one optimizer step |
 | `checkpoint_base_mismatch` | checkpoint-last belongs to a different base; run restarted fresh |
+| `invalid_base_model` | `--base_model` points at a Trainer checkpoint, not a model dir — pass the original base |
 | `tokenizer_load_failed` | install `sentencepiece`/`tiktoken`, or check the model's tokenizer files |
 | `unknown_args` | unrecognized CLI flag (typo); see `--agent-schema` for valid flags |
 
