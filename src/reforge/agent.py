@@ -34,7 +34,7 @@ Structured failures
     message only. Codes: missing_base_model, missing_dataset,
     invalid_dataset, dataset_not_found, undetectable_schema,
     model_not_found, cuda_oom, dataset_too_small, checkpoint_base_mismatch,
-    invalid_base_model.
+    invalid_base_model, tokenizer_load_failed, unknown_args.
 
 Self-description
     `reforge --agent-schema` prints the complete agent contract as one
@@ -89,7 +89,7 @@ _MIRRORED_FIELDS = {
     "dataset", "base_model", "training_mode", "rows", "eval_rows",
     "total_steps", "step", "pct", "eta_sec", "lr", "early_stop",
     "merged_dir", "report", "error", "exit_code", "interrupted",
-    "error_code", "hint", "stage", "cleaning_mode", "mapped_roles",
+    "error_code", "hint", "cleaning_mode", "mapped_roles",
     "columns", "shuffle_seed",
 }
 
@@ -139,6 +139,11 @@ _ERROR_PATTERNS = [
      "Base model was not found on disk. Runs are offline by default "
      "(HF_HUB_OFFLINE=1): pass a local model directory (e.g. under "
      "REFORGE_MODELS_DIR or the HF hub cache), or pre-download the model."),
+    ("couldn't instantiate the backend tokenizer",
+     "tokenizer_load_failed",
+     "Tokenizer could not be loaded. Install the converter backend "
+     "(pip install sentencepiece, or tiktoken for some models), or verify "
+     "the model directory contains tokenizer files."),
 ]
 
 
@@ -456,9 +461,11 @@ _EVENT_FIELDS = {
     },
 }
 
-_ERROR_CODES_DOC = {
-    code: hint for _, code, hint in _ERROR_PATTERNS
-}
+_ERROR_CODES_DOC = {code: hint for _, code, hint in _ERROR_PATTERNS}
+# Raised directly in __main__ for unrecognized CLI flags (not message-derived).
+_ERROR_CODES_DOC["unknown_args"] = (
+    "Unrecognized CLI flags were passed. Check flag spelling; "
+    "`reforge --agent-schema` lists every valid flag.")
 
 _EXIT_CODES_DOC = {
     "0": "success",
@@ -546,6 +553,8 @@ def build_agent_schema(parser=None) -> dict:
                 "version": "schema version of this contract",
                 "pid": "process id (kill this to stop a run)",
                 "status": "starting|preparing|training|exporting|saving|complete|failed",
+                "stage": "pipeline position (loading/preparing/training/exporting), "
+                         "set by the latest stage-tagged event",
                 "started_at": "run start (UTC)",
                 "updated_at": "last event time (UTC)",
                 "step": "current optimizer step",

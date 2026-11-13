@@ -90,6 +90,8 @@ fix the listed errors. Requires `--base_model` + dataset, same as agent mode.
 | `dataset_too_small` | more rows, or lower batch/accum |
 | `checkpoint_base_mismatch` | checkpoint belongs to another base; run restarted fresh |
 | `invalid_base_model` | `--base_model` points at a Trainer checkpoint, not a model dir |
+| `tokenizer_load_failed` | install `sentencepiece`/`tiktoken`, or check tokenizer files |
+| `unknown_args` | unrecognized CLI flag (typo); see `--agent-schema` |
 
 ## Dataset schemas
 

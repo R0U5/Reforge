@@ -95,8 +95,21 @@ def main():
     parser.add_argument('--no_tqdm', action='store_true',
                         help="Disable the tqdm progress bar and emit clean loss lines instead "
                              "(the dashboard sets this automatically)")
-    parsed_args, _ = parser.parse_known_args()
+    parsed_args, _unknown_args = parser.parse_known_args()
     image_mode = parsed_args.image
+
+    # Agent mode flips early so the incompatibility guard below can run
+    # before any output redirection happens.
+    _agent_env = os.environ.get("REFORGE_AGENT", "").strip().lower()
+    agent_mode = parsed_args.agent or _agent_env in ("1", "true", "yes")
+
+    # --log_file replaces sys.stdout with a file, which would redirect the
+    # agent-mode NDJSON event stream away from the agent's stdout pipe.
+    if agent_mode and parsed_args.log_file:
+        _err("--log_file cannot be combined with agent mode: it redirects stdout "
+             "(the NDJSON event stream) into a file, leaving the agent with no "
+             "events. Use --agent_log to tee the stream instead.")
+        raise SystemExit(2)
 
     # `--agent_schema`: pure self-description. Handle before anything that
     # has side effects (no dirs created, no streams wrapped). Human output
@@ -128,10 +141,19 @@ def main():
 
     # Agent mode: stdout becomes a pure NDJSON event stream and
     # <output_dir>/run_state.json tracks the latest snapshot.
-    _agent_env = os.environ.get("REFORGE_AGENT", "").strip().lower()
-    agent_mode = parsed_args.agent or _agent_env in ("1", "true", "yes")
     if agent_mode:
         BRIDGE.enable(output_dir, merge_dir, log_path=parsed_args.agent_log)
+
+    # A typo'd flag would otherwise be silently swallowed and the run would
+    # proceed with unexpected defaults. Warn always; fail hard in agent mode.
+    if _unknown_args:
+        _message = ("Unrecognized arguments: " + " ".join(_unknown_args)
+                    + " (check flag spelling; see `reforge --help`)")
+        if agent_mode:
+            BRIDGE.emit("run_failed", error=_message, exit_code=2)
+            _err(_message)
+            raise SystemExit(2)
+        _warn(_message)
 
     _title("REFORGE", subtitle="LoRA fine-tuning pipeline")
 
@@ -616,17 +638,18 @@ def _run_pipeline(parsed_args, image_mode, output_dir, merge_dir, merge_success_
     if training_error is None:
         with open(os.path.join(merge_dir_actual, "success.txt"), "w", encoding="utf-8") as f:
             f.write("Merge complete")
+        _report_path = os.path.join(merge_dir_actual, "training_report.json")
+        # Interrupted runs skip summarize_training, so the report may not
+        # exist; only claim the path when it is really there.
         BRIDGE.emit(
             "merge_complete",
             merged_dir=merge_dir_actual,
-            report=os.path.join(merge_dir_actual, "training_report.json"),
+            report=(_report_path if os.path.isfile(_report_path) else None),
         )
         _banner("Done")
         _ok(f"Model saved to {merge_dir_actual}")
         _safe_print()
         BRIDGE.emit("run_complete", merged_dir=merge_dir_actual, exit_code=0)
-    else:
-        raise training_error
 
 
 if __name__ == '__main__':

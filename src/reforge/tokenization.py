@@ -1,5 +1,4 @@
 import io
-import math
 import os
 
 import numpy as np
@@ -57,17 +56,52 @@ class DynamicCausalCollator:
         return batch
 
 
-def compute_metrics(eval_pred):
-    logits, labels = eval_pred
-    shift_logits = torch.from_numpy(logits[..., :-1, :].copy())
-    shift_labels = torch.from_numpy(labels[..., 1:].copy()).long()
-    loss_fct = torch.nn.CrossEntropyLoss(ignore_index=-100)
-    loss = loss_fct(shift_logits.reshape(-1, shift_logits.size(-1)), shift_labels.reshape(-1))
-    try:
-        perplexity = math.exp(loss.item())
-    except OverflowError:
-        perplexity = float("inf")
-    return {"perplexity": perplexity, "eval_loss": loss.item()}
+def split_sft_pair(text: str, question: str) -> tuple:
+    """Split an SFT row into (question, answer).
+
+    Preferred: the dataset carries the cleaned question separately, so the
+    boundary between prompt and answer is unambiguous. Legacy fallback:
+    merged text only, split on the first "\n\n". Unseparable rows return
+    ("", text) and are trained causally.
+    """
+    question = str(question or "").strip()
+    text = str(text or "")
+    if question and text.startswith(question) and len(text) > len(question):
+        return question, text[len(question):].lstrip("\r\n").strip()
+    sep = "\n\n"
+    sep_idx = text.find(sep)
+    if sep_idx >= 0:
+        return (question or text[:sep_idx].strip()), text[sep_idx + len(sep):].strip()
+    return "", text
+
+
+def build_sft_messages(text: str, question: str) -> "list | None":
+    """Build the user/assistant message pair for an SFT row, or None."""
+    q, a = split_sft_pair(text, question)
+    if q and a:
+        return [{"role": "user", "content": q}, {"role": "assistant", "content": a}]
+    return None
+
+
+def _causal_tokenize(text, tokenizer, max_length) -> tuple:
+    """Plain causal tokenization shared by every fallback path."""
+    tokens = tokenizer(
+        text,
+        padding=False,
+        truncation=True,
+        max_length=max_length
+    )
+    input_ids = tokens["input_ids"]
+    attention_mask = tokens.get("attention_mask", [1] * len(input_ids))
+    return input_ids, attention_mask
+
+
+def _join_chat_text(messages) -> str:
+    """Flatten a messages list to plain text for causal fallbacks."""
+    return "\n".join(
+        str(m.get("content", "")) for m in (messages or [])
+        if isinstance(m, dict)
+    )
 
 
 def _decode_image(raw):
@@ -122,37 +156,21 @@ def tokenize(example, tokenizer, training_mode="sft", max_length=750, processor=
             "attention_mask": [int(x) for x in attention_mask],
             "labels":         [int(x) for x in labels],
             "pixel_values":   pixel_values,
-            **({"length": len(input_ids)} if "length" not in example else {"length": int(example["length"])}),
+            "length":         len(input_ids),
         }
 
-    # SFT mode: use chat template to format conversation, mask prompt tokens via exact token indexing
-    if training_mode == "sft":
-        text = example.get("text", "")
-        question = str(example.get("question") or "").strip()
-        if question and text.startswith(question) and len(text) > len(question):
-            # Preferred: the dataset carries the cleaned question separately,
-            # so the boundary between prompt and answer is unambiguous.
-            answer = text[len(question):].lstrip("\r\n").strip()
-        else:
-            # Legacy fallback: merged text only — split on the first "\n\n".
-            sep = "\n\n"
-            sep_idx = text.find(sep)
-            if sep_idx >= 0:
-                question = question or text[:sep_idx].strip()
-                answer = text[sep_idx + len(sep):].strip()
-            else:
-                # No separator - treat as causal
-                question = ""
-                answer = text
-
-        if question and answer:
-            # Build full conversation messages
-            messages = [
-                {"role": "user", "content": question},
-                {"role": "assistant", "content": answer}
-            ]
-
-            # Tokenize the FULL conversation with chat template
+    # Chat mode: train on the last assistant response only.
+    if training_mode == "chat":
+        messages = example.get("messages")
+        if not isinstance(messages, list) or not all(isinstance(m, dict) for m in messages):
+            messages = None
+        last_assistant = None
+        if messages:
+            for i in range(len(messages) - 1, -1, -1):
+                if messages[i].get("role") == "assistant":
+                    last_assistant = i
+                    break
+        if messages and last_assistant is not None:
             full_tokens = tokenizer.apply_chat_template(
                 messages,
                 tokenize=True,
@@ -164,11 +182,60 @@ def tokenize(example, tokenizer, training_mode="sft", max_length=750, processor=
             input_ids = full_tokens["input_ids"]
             attention_mask = full_tokens.get("attention_mask", [1] * len(input_ids))
 
+            # Everything before the final assistant message is the prompt.
+            prompt_tokens = tokenizer.apply_chat_template(
+                messages[:last_assistant],
+                tokenize=True,
+                add_generation_prompt=True,
+                truncation=True,
+                max_length=max_length,
+                return_dict=True,
+            )
+            boundary = len(prompt_tokens["input_ids"])
+
+            # Sanity: boundary must leave some response tokens to train on.
+            if boundary <= 0 or boundary >= len(input_ids):
+                input_ids, attention_mask = _causal_tokenize(
+                    _join_chat_text(messages), tokenizer, max_length)
+                boundary = 0
+        else:
+            # No assistant turn - train causally on the flattened conversation.
+            input_ids, attention_mask = _causal_tokenize(
+                _join_chat_text(messages), tokenizer, max_length)
+            boundary = 0
+
+        labels = [-100] * boundary + list(input_ids[boundary:])
+        labels = labels[:len(input_ids)]
+
+        return {
+            "input_ids": [int(x) for x in input_ids],
+            "attention_mask": [int(x) for x in attention_mask],
+            "labels": [int(x) for x in labels],
+        }
+
+    # SFT mode: use chat template to format conversation, mask prompt tokens via exact token indexing
+    if training_mode == "sft":
+        text = example.get("text", "") or ""
+        question, answer = split_sft_pair(text, str(example.get("question") or ""))
+
+        if question and answer:
+            # Tokenize the FULL conversation with chat template
+            full_tokens = tokenizer.apply_chat_template(
+                [{"role": "user", "content": question},
+                 {"role": "assistant", "content": answer}],
+                tokenize=True,
+                add_generation_prompt=False,
+                truncation=True,
+                max_length=max_length,
+                return_dict=True,
+            )
+            input_ids = full_tokens["input_ids"]
+            attention_mask = full_tokens.get("attention_mask", [1] * len(input_ids))
+
             # Tokenize ONLY the user message (question) with same chat template to find boundary
             # This gives us the EXACT token count of the prompt portion
-            user_messages = [{"role": "user", "content": question}]
             user_tokens = tokenizer.apply_chat_template(
-                user_messages,
+                [{"role": "user", "content": question}],
                 tokenize=True,
                 add_generation_prompt=True,  # Include assistant prompt marker
                 truncation=True,
@@ -177,22 +244,18 @@ def tokenize(example, tokenizer, training_mode="sft", max_length=750, processor=
             )
             boundary = len(user_tokens["input_ids"])
 
-            # Sanity: boundary must be valid
-            if boundary <= 0 or boundary > len(input_ids):
+            # Sanity: boundary must leave some response tokens to train on
+            if boundary <= 0 or boundary >= len(input_ids):
                 # Fallback: causal on full text
-                tokens = tokenizer(text, padding=False, truncation=True, max_length=max_length)
-                input_ids = tokens["input_ids"]
-                attention_mask = tokens.get("attention_mask", [1] * len(input_ids))
+                input_ids, attention_mask = _causal_tokenize(text, tokenizer, max_length)
                 boundary = 0
         else:
             # No separator or no question - treat as causal
-            tokens = tokenizer(text, padding=False, truncation=True, max_length=max_length)
-            input_ids = tokens["input_ids"]
-            attention_mask = tokens.get("attention_mask", [1] * len(input_ids))
+            input_ids, attention_mask = _causal_tokenize(text, tokenizer, max_length)
             boundary = 0
 
         # Mask prompt tokens, train on assistant response only
-        labels = [-100] * boundary + input_ids[boundary:]
+        labels = [-100] * boundary + list(input_ids[boundary:])
         labels = labels[:len(input_ids)]
 
         return {
@@ -221,12 +284,39 @@ def tokenize(example, tokenizer, training_mode="sft", max_length=750, processor=
     return out
 
 
-def measure_lengths(ds, tokenizer):
+def measure_lengths(ds, tokenizer, training_mode=None):
     _num_proc = min(12, os.cpu_count() or 4)
 
+    def _template_len(tokenizer, messages) -> int | None:
+        """Token length of a conversation under its chat template, or None."""
+        try:
+            ids = tokenizer.apply_chat_template(
+                messages, tokenize=True, add_generation_prompt=False)
+            # Newer transformers wrap the ids in a BatchEncoding; plain lists
+            # are returned by older versions.
+            if hasattr(ids, "get"):
+                ids = ids["input_ids"]
+            return len(ids)
+        except Exception:
+            return None
+
     def _len_map(e):
+        # Chat rows: measure the actual templated conversation.
+        if training_mode == "chat" and e.get("messages"):
+            n = _template_len(tokenizer, e["messages"])
+            if n is not None:
+                return {"length": n}
+            return {"length": len(_join_chat_text(e["messages"]))}
+        # SFT rows: measure the templated user/assistant pair, not raw text,
+        # so the P95 matches what training actually feeds the model.
+        if training_mode == "sft" and e.get("question"):
+            messages = build_sft_messages(e.get("text") or "", e["question"])
+            if messages is not None:
+                n = _template_len(tokenizer, messages)
+                if n is not None:
+                    return {"length": n}
         ids = tokenizer(
-            e["text"],
+            e.get("text") or "",
             add_special_tokens=True,
             truncation=False,
             return_attention_mask=False

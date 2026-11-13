@@ -11,6 +11,6 @@ accelerate>=0.25.0
 # Optional — enables emoji stripping during data cleaning
 # emoji>=2.0.0
 
-# Optional — required for the Tkinter dashboard (reforge-dashboard)
+# Optional — required for the Tkinter dashboard (`reforge dashboard`)
 # matplotlib>=3.7.0
 # scipy>=1.10.0  # faster loss-curve smoothing (falls back to numpy)
