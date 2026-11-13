@@ -89,6 +89,8 @@ fix the listed errors. Requires `--base_model` + dataset, same as agent mode.
 | `cuda_oom` | lower `--batch_size`, or use a smaller base model |
 | `dataset_too_small` | more rows, or lower batch/accum |
 | `checkpoint_base_mismatch` | checkpoint belongs to another base; run restarted fresh |
+| `tokenizer_load_failed` | install `sentencepiece`/`tiktoken`, or check tokenizer files |
+| `unknown_args` | unrecognized CLI flag (typo); see `--agent-schema` |
 
 ## Dataset schemas
 
