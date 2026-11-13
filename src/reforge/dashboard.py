@@ -169,6 +169,7 @@ class ReforgeDashboard:
         steps      = "",
         batch_size = "",
         grad_accum = "",
+        dpo_beta  = "",
     )
 
     def __init__(self):
@@ -467,6 +468,22 @@ class ReforgeDashboard:
                         style="Flag.TCheckbutton").grid(
             row=3, column=0, columnspan=4, sticky="w", pady=2)
 
+        # – DPO –
+        c = self._card(cfg, "DPO", row, 0); row += 1
+        self._var_dpo = tk.BooleanVar()
+        ttk.Checkbutton(c, text="--dpo     (force DPO training)",
+                        variable=self._var_dpo,
+                        style="Flag.TCheckbutton").grid(
+            row=0, column=0, columnspan=4, sticky="w", pady=2)
+        self._var_dpo_beta = tk.StringVar(value=self._DEFAULTS["dpo_beta"])
+        self._field_row(c, 1, "DPO Beta", self._var_dpo_beta,
+                        hint="(blank = 0.1)", width=10)
+        tk.Label(c, text="SFT first, then DPO: after SFT finishes, merged/ "
+                         "becomes the DPO base model automatically.",
+                 bg=SURFACE, fg=FAINT, font=(FONT, 8), wraplength=340,
+                 justify="left").grid(row=2, column=0, columnspan=4,
+                                      sticky="w", pady=(4, 0))
+
         # – Command preview –
         c = self._card(cfg, "Command Preview", row, 0); row += 1
         self._cmd_preview = tk.Text(
@@ -484,7 +501,8 @@ class ReforgeDashboard:
         for v in (self._var_base_model, self._var_dataset, self._var_hf_dataset,
                   self._var_epoch, self._var_steps, self._var_batch, self._var_grad):
             v.trace_add("write", lambda *_: self._update_cmd_preview())
-        for v in (self._var_force, self._var_latex, self._var_code, self._var_image):
+        for v in (self._var_force, self._var_latex, self._var_code, self._var_image,
+                  self._var_dpo, self._var_dpo_beta):
             v.trace_add("write", lambda *_: self._update_cmd_preview())
 
         # – Right: live chart –
@@ -581,6 +599,10 @@ class ReforgeDashboard:
         if self._var_latex.get():  cmd.append("--latex")
         if self._var_code.get():   cmd.append("--code")
         if self._var_image.get():  cmd.append("--image")
+        if self._var_dpo.get():    cmd.append("--dpo")
+        dpo_beta = self._var_dpo_beta.get().strip()
+        if dpo_beta:
+            cmd += ["--dpo_beta", dpo_beta]
         # The child's tqdm bar writes progress to stdout; on some Windows
         # setups that write starts failing EINVAL mid-run and crashes
         # training. --no_tqdm removes the bar; loss rows arrive on stderr
@@ -661,6 +683,19 @@ class ReforgeDashboard:
             grad  = self._parse_int_field(self._var_grad, "Grad. accumulation")
         except ValueError:
             return
+
+        dpo_beta_raw = self._var_dpo_beta.get().strip()
+        if dpo_beta_raw:
+            try:
+                dpo_beta = float(dpo_beta_raw)
+            except ValueError:
+                messagebox.showwarning(
+                    "Invalid value", f"DPO Beta must be a number (got {dpo_beta_raw!r}).")
+                return
+            if dpo_beta <= 0:
+                messagebox.showwarning(
+                    "Invalid value", f"DPO Beta must be > 0 (got {dpo_beta}).")
+                return
 
         cmd = self._build_cmd()
 
@@ -792,8 +827,9 @@ class ReforgeDashboard:
                 f"{'loss':<10}  "
                 f"{'lr':<12}  "
                 f"{'grad_norm':<10}  "
-                f"{'epoch'}\n"
-                f"  {'-'*58}\n"
+                f"{'epoch':<8}  "
+                f"{'acc'}\n"
+                f"  {'-'*66}\n"
             )
             self._write_line(sys.stdout, hdr)
         loss = entry.get("loss", 0)
@@ -801,6 +837,7 @@ class ReforgeDashboard:
         ep   = entry.get("epoch", 0)
         gnorm = entry.get("grad_norm", 0)
         step  = entry.get("step", self._step_count)
+        acc   = entry.get("acc")
         if lr > 0:
             lr_str = f"{lr:.2e}"
         else:
@@ -810,8 +847,11 @@ class ReforgeDashboard:
             f"loss {loss:<8.4f}  "
             f"lr {lr_str:<10}  "
             f"gnorm {gnorm:<8.3f}  "
-            f"ep {ep:.2f}\n"
+            f"ep {ep:.2f}"
         )
+        # DPO runs log rewards/accuracies (chosen preferred over rejected);
+        # SFT rows have no acc and print a dash.
+        formatted += f"  acc {acc:.3f}\n" if acc is not None else "  acc \u2014\n"
         self._write_line(sys.stdout, formatted)
 
     def _stop_training(self):

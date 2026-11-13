@@ -71,6 +71,8 @@ python -m reforge dataset.parquet --base_model /path/to/model --agent
 | `--base_model PATH` | Path to a local Hugging Face model directory (skips picker) |
 | `--hf_dataset ID` | Load a dataset from the Hugging Face Hub |
 | `--image` | Enable multimodal (vision+text) training |
+| `--dpo` | Force DPO training (normally auto-detected from `chosen`+`rejected` columns) |
+| `--dpo_beta X` | DPO beta, KL strength vs the reference model (default: 0.1; DPO runs only) |
 | `--latex` | Preserve LaTeX/scientific notation during cleaning |
 | `--code` | Preserve code formatting and indentation |
 | `--epoch N` | Number of training epochs (default: 1) |
@@ -99,7 +101,8 @@ python -m reforge dataset.parquet --base_model /path/to/model --agent
 ## Features
 
 ### Core
-- **Automatic training mode detection** — inspects dataset columns and selects the right pipeline: SFT (instruction/response), causal (raw text), chat (messages), or multimodal (image+text).
+- **Automatic training mode detection** — inspects dataset columns and selects the right pipeline: SFT (instruction/response), DPO (preference pairs: chosen+rejected), causal (raw text), chat (messages), or multimodal (image+text).
+- **DPO (preference tuning)** — preference-pair datasets train with TRL's `DPOTrainer`: LoRA adapters on the 4-bit base with the adapter-disabled base weights acting as the reference model (no second copy in VRAM), `beta` configurable via `--dpo_beta`. Intended workflow: **SFT first, then DPO** — the SFT run's merged model automatically becomes the DPO run's base via the training chain. Preference alignment is visible live (`rewards/accuracies` in the dashboard log).
 - **Built-in data cleaning** — strips LaTeX, HTML, markdown artifacts, unicode garbage, emoji, junk tokens, and e-commerce noise. Configurable modes for math, LaTeX-preserving, and code-preserving workflows.
 - **Model profiles** — ships with tuned configs for Phi-2, Phi-3, Phi-3-Vision, and more. Falls back to sensible defaults for unlisted models.
 - **Smart early stopping** — EMA-based loss plateau/worsening detection with exposure floors, LR gates, and dynamic hard caps.
@@ -134,7 +137,7 @@ See [`AGENTS.md`](AGENTS.md) for the full agent-facing guide (structure, monitor
 1. **Load** — reads a `.parquet` file or HF Hub dataset, auto-detects training schema.
 2. **Clean** — mode-appropriate text normalization.
 3. **Tokenize** — P95-based length detection, tokenizes with dynamic padding.
-4. **Train** — LoRA adapters, CUDA warmup, Hugging Face `Trainer`.
+4. **Train** — LoRA adapters, CUDA warmup, Hugging Face `Trainer` (or TRL `DPOTrainer` for preference-pair datasets).
 5. **Stop** — early stopping via EMA plateau/worsening detection.
 6. **Report** — summary banner, training_report.json.
 7. **Merge** — LoRA adapter merged back into the base model.

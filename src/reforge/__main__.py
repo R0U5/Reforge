@@ -68,6 +68,11 @@ def main():
     parser.add_argument('--grad_accum', type=int, default=None,
                         help="Gradient accumulation steps override (default: model profile)")
     parser.add_argument('--image',      action='store_true', help="Enable multimodal (image+text) training")
+    parser.add_argument('--dpo',        action='store_true',
+                         help="Force DPO training (normally auto-detected from chosen+rejected columns). "
+                              "Requires both a chosen and a rejected column in the dataset.")
+    parser.add_argument('--dpo_beta',   type=float, default=None,
+                         help="DPO beta, the KL-strength vs the reference model (default: 0.1; DPO runs only)")
     parser.add_argument('--train_lm_head', action='store_true',
                         help="Opt-in: fully train the lm_head (~5 GB VRAM on large-vocab models like Qwen3). "
                              "Use for new-token vocab runs or head-capacity ablations. Ignored when resuming from checkpoint-last.")
@@ -245,10 +250,21 @@ def _dry_run(parsed_args) -> int:
                            "verify the file is a valid .parquet file")
             if columns is not None and not parsed_args.image:
                 try:
-                    training_mode = detect_training_mode(columns)
+                    training_mode = ("dpo" if parsed_args.dpo
+                                     else detect_training_mode(columns))
                     mapped_roles = dict(zip(
                         ("question", "chosen", "rejected", "image"),
                         auto_map_roles(columns, training_mode)))
+                    if (training_mode == "dpo"
+                            and not (mapped_roles.get("chosen")
+                                     and mapped_roles.get("rejected"))):
+                        _add_error(
+                            "invalid_dataset",
+                            "DPO mode requires 'chosen' and 'rejected' columns",
+                            "preference-pair datasets need both completions "
+                            "(aliases in `reforge --agent-schema` -> "
+                            "dataset_schemas)",
+                            columns=columns)
                 except ValueError as e:
                     _add_error("undetectable_schema", str(e),
                                "rename columns to match a supported schema (see "
@@ -330,6 +346,14 @@ def _dry_run(parsed_args) -> int:
                                     else "4-bit NF4 (bitsandbytes)",
                 },
             }
+            if training_mode == "dpo":
+                plan["dpo"] = {
+                    "trainer": "trl.DPOTrainer",
+                    "beta": (parsed_args.dpo_beta
+                             if parsed_args.dpo_beta is not None else 0.1),
+                    "reference": "adapter-disabled base weights (LoRA; no extra model copy)",
+                    "max_length": "P95 of prompt+completion lengths (capped at 1024)",
+                }
         else:
             plan = {"training_mode": "multimodal",
                     "warning": "row counts unavailable for Hub datasets; step plan skipped"}
@@ -384,6 +408,8 @@ def _run_pipeline(parsed_args, image_mode, output_dir, merge_dir, merge_success_
         hf_dataset=parsed_args.hf_dataset,
         base_model=parsed_args.base_model,
         image_mode=image_mode,
+        dpo=bool(parsed_args.dpo),
+        dpo_beta=parsed_args.dpo_beta,
         force=parsed_args.force,
         epoch=parsed_args.epoch,
         steps=parsed_args.steps,
@@ -461,6 +487,7 @@ def _run_pipeline(parsed_args, image_mode, output_dir, merge_dir, merge_success_
         output_dir=output_dir,
         merge_dir=merge_dir_actual,
         merge_success_flag=merge_success_flag,
+        force_dpo=bool(parsed_args.dpo),
     )
     BRIDGE.emit(
         "dataset_loaded",

@@ -19,6 +19,22 @@ except ImportError:
     _EMOJI_AVAILABLE = False
 
 TRAINING_SCHEMAS = {
+    # DPO must be checked before SFT: both schemas match on a "chosen"-style
+    # column, so SFT would otherwise swallow every preference-pair dataset.
+    # DPO additionally requires a "rejected" column, which makes it
+    # unambiguous against plain SFT data.
+    "dpo": {
+        "required": ["chosen", "rejected"],
+        "optional": ["question"],
+        "aliases": {
+            "chosen":   ["chosen", "response", "answer", "completion",
+                         "accepted", "output", "solution"],
+            "rejected": ["rejected", "unpreferred", "worse",
+                         "answer_2", "response_2", "output_2"],
+            "question": ["prompt", "instruction", "question", "input",
+                         "query", "context", "problem"]
+        }
+    },
     "sft": {
         "required": ["chosen"],
         "optional": ["question"],
@@ -124,10 +140,13 @@ def detect_training_mode(columns):
     if has_image_col:
         check_order = ["multimodal"] + [m for m in TRAINING_SCHEMAS if m != "multimodal"]
     else:
-        # Chat must be checked before SFT: "messages" is an alias of both
-        # (chat.question and sft.chosen), and SFT would otherwise swallow
-        # every conversation dataset, making chat mode unreachable.
-        check_order = ["chat"] + [m for m in TRAINING_SCHEMAS if m != "chat"]
+        # Chat and DPO must both be checked before SFT: "messages" is an
+        # alias of both chat.question and sft.chosen, and "chosen"-style
+        # columns match sft — SFT would otherwise swallow every
+        # conversation or preference-pair dataset, making those modes
+        # unreachable.
+        check_order = ["chat", "dpo"] + [m for m in TRAINING_SCHEMAS
+                                         if m not in ("chat", "dpo")]
 
     for mode in check_order:
         schema = TRAINING_SCHEMAS[mode]
@@ -226,10 +245,47 @@ def clean_string(s, mode: str = "math"):
     return s.strip()
 
 
-def synthesize_prompt_dataset(raw_dataset, col_question, col_chosen, col_rejected, training_mode, clean, col_image=None):
+def _completion_text(completion) -> str:
+    """Completion text whether it is a plain string or a chat-message list."""
+    if isinstance(completion, list):
+        return "".join(str(m.get("content", "")) for m in completion
+                       if isinstance(m, dict))
+    return str(completion or "")
+
+
+def synthesize_prompt_dataset(raw_dataset, col_question, col_chosen, col_rejected,
+                              training_mode, clean, col_image=None,
+                              conversational=False):
     original_count = len(raw_dataset)
 
-    if training_mode == "multimodal":
+    if training_mode == "dpo":
+        # Preference pairs: keep prompt/chosen/rejected as text (or chat
+        # messages) and let TRL's DPOTrainer handle tokenization.
+        def build_dpo_row(row):
+            q = clean(str(row.get(col_question, "") or "")) if col_question else ""
+            a = clean(str(row.get(col_chosen, "") or "")) if col_chosen else ""
+            r = clean(str(row.get(col_rejected, "") or "")) if col_rejected else ""
+            if conversational and q:
+                return {
+                    "prompt":   [{"role": "user", "content": q}],
+                    "chosen":   [{"role": "assistant", "content": a}],
+                    "rejected": [{"role": "assistant", "content": r}],
+                }
+            return {"prompt": q, "chosen": a, "rejected": r}
+
+        processed = raw_dataset.map(build_dpo_row, num_proc=1, writer_batch_size=50)
+        keep_cols = ("prompt", "chosen", "rejected") if col_question else ("chosen", "rejected")
+        cols_to_drop = [c for c in processed.column_names if c not in keep_cols]
+        if cols_to_drop:
+            processed = processed.remove_columns(cols_to_drop)
+        before = len(processed)
+        processed = processed.filter(
+            lambda e: bool(_completion_text(e["chosen"]).strip())
+            and bool(_completion_text(e["rejected"]).strip()),
+            num_proc=1,
+        )
+        _info(f"Retained {len(processed):,} / {before:,} rows (rows need both a chosen and a rejected completion)")
+    elif training_mode == "multimodal":
         def build_multimodal_row(row):
             parts = []
             if col_question:
@@ -315,6 +371,7 @@ def synthesize_prompt_dataset(raw_dataset, col_question, col_chosen, col_rejecte
         else:
             q = clean(str(first_raw.get(col_question, ""))) if col_question else ""
             a = clean(str(first_raw.get(col_chosen, ""))) if col_chosen else ""
+        r = clean(str(first_raw.get(col_rejected, ""))) if (training_mode == "dpo" and col_rejected) else ""
         _width = 58
         if q or a:
             print(f"\n  {'-' * _width}")
@@ -324,6 +381,8 @@ def synthesize_prompt_dataset(raw_dataset, col_question, col_chosen, col_rejecte
             print(f"  Prompt   : {q[:120]}{chr(0x2026) if len(q) > 120 else ''}")
         if a:
             print(f"  Response : {a[:120]}{chr(0x2026) if len(a) > 120 else ''}")
+        if r:
+            print(f"  Rejected : {r[:120]}{chr(0x2026) if len(r) > 120 else ''}")
         if q or a:
             print()
     else:
@@ -332,7 +391,7 @@ def synthesize_prompt_dataset(raw_dataset, col_question, col_chosen, col_rejecte
     return processed
 
 
-def load_and_prepare_dataset(dataset_path, cleaning_mode, image_mode=False, base_model_override=None, output_dir=None, merge_dir=None, merge_success_flag=None):
+def load_and_prepare_dataset(dataset_path, cleaning_mode, image_mode=False, base_model_override=None, output_dir=None, merge_dir=None, merge_success_flag=None, force_dpo=False):
     from transformers import AutoTokenizer, AutoProcessor
 
     _num_proc = min(12, os.cpu_count() or 4)
@@ -366,8 +425,15 @@ def load_and_prepare_dataset(dataset_path, cleaning_mode, image_mode=False, base
         training_mode = "multimodal"
     else:
         training_mode = detect_training_mode(columns)
+        if force_dpo and training_mode != "dpo":
+            training_mode = "dpo"
 
     col_question, col_chosen, col_rejected, col_image = auto_map_roles(columns, training_mode)
+    if training_mode == "dpo" and (not col_chosen or not col_rejected):
+        raise ValueError(
+            "DPO mode requires 'chosen' and 'rejected' columns "
+            f"(detected columns: {list(columns)})"
+        )
     _banner("Dataset")
     _info(f"Mode: {training_mode.upper()}  |  Cleaning: {cleaning_mode or 'math'}  |  Seed: {shuffle_seed}")
     img_label = "\u2014" if not col_image else col_image
@@ -433,62 +499,77 @@ def load_and_prepare_dataset(dataset_path, cleaning_mode, image_mode=False, base
         processed = processed.filter(lambda e: bool(e["text"].strip()), num_proc=_num_proc)
         _info(f"Retained {len(processed):,} / {before:,} rows")
     else:
+        # Conversational DPO: TRL applies the tokenizer's chat template to
+        # prompt/chosen/rejected message lists, matching how the SFT path
+        # formats conversations.
+        conversational = bool(getattr(tokenizer, "chat_template", None))
+        if conversational:
+            _info("DPO: using the tokenizer's chat template (conversational format)")
         processed = synthesize_prompt_dataset(
             raw_dataset, col_question, col_chosen, col_rejected,
-            training_mode, clean, col_image=col_image
+            training_mode, clean, col_image=col_image,
+            conversational=conversational,
         )
 
     _banner("Tokenization")
     _info("Measuring sequence lengths...")
     processed, auto_len = measure_lengths(processed, tokenizer, training_mode=training_mode)
 
-    _info("Tokenizing dataset...")
-    protected = {"length"}
-    if image_mode:
-        protected.add("image")
-    cols_to_remove = [c for c in processed.column_names if c not in protected]
+    if training_mode == "dpo":
+        # TRL's DPOTrainer tokenizes prompt/chosen/rejected internally
+        # (applying the chat template for conversational rows). The P95
+        # length measured above is passed to DPOConfig.max_length instead.
+        _info("DPO mode — keeping the text dataset; TRL tokenizes internally")
+        roc()
+        train_dataset = processed
+    else:
+        _info("Tokenizing dataset...")
+        protected = {"length"}
+        if image_mode:
+            protected.add("image")
+        cols_to_remove = [c for c in processed.column_names if c not in protected]
 
-    tokenized = processed.map(
-        lambda e: tokenize(
-            example=e,
-            tokenizer=tokenizer,
-            training_mode=training_mode,
-            max_length=auto_len,
-            processor=processor
-        ),
-        remove_columns=cols_to_remove,
-        batched=False,
-        num_proc=1 if image_mode else _num_proc,
-        writer_batch_size=50 if image_mode else 1000,
-        keep_in_memory=False,
-    )
-
-    if image_mode:
-        before = len(tokenized)
-        tokenized = tokenized.filter(
-            lambda e: len(e["input_ids"]) > 0 and e.get("pixel_values") is not None
+        tokenized = processed.map(
+            lambda e: tokenize(
+                example=e,
+                tokenizer=tokenizer,
+                training_mode=training_mode,
+                max_length=auto_len,
+                processor=processor
+            ),
+            remove_columns=cols_to_remove,
+            batched=False,
+            num_proc=1 if image_mode else _num_proc,
+            writer_batch_size=50 if image_mode else 1000,
+            keep_in_memory=False,
         )
-        dropped = before - len(tokenized)
-        if dropped:
-            _warn(f"Dropped {dropped} rows with unreadable images")
 
-    _info("Casting columns to tensor format...")
-    tokenized = tokenized.cast_column("input_ids", Sequence(Value("int64")))
-    tokenized = tokenized.cast_column("attention_mask", Sequence(Value("int64")))
-    tokenized = tokenized.cast_column("labels", Sequence(Value("int64")))
-    if "length" in tokenized.column_names:
-        tokenized = tokenized.cast_column("length", Value("int32"))
+        if image_mode:
+            before = len(tokenized)
+            tokenized = tokenized.filter(
+                lambda e: len(e["input_ids"]) > 0 and e.get("pixel_values") is not None
+            )
+            dropped = before - len(tokenized)
+            if dropped:
+                _warn(f"Dropped {dropped} rows with unreadable images")
 
-    fmt_cols = ["input_ids", "attention_mask", "labels"]
-    if "length" in tokenized.column_names:
-        fmt_cols.append("length")
-    if image_mode and "pixel_values" in tokenized.column_names:
-        fmt_cols.append("pixel_values")
+        _info("Casting columns to tensor format...")
+        tokenized = tokenized.cast_column("input_ids", Sequence(Value("int64")))
+        tokenized = tokenized.cast_column("attention_mask", Sequence(Value("int64")))
+        tokenized = tokenized.cast_column("labels", Sequence(Value("int64")))
+        if "length" in tokenized.column_names:
+            tokenized = tokenized.cast_column("length", Value("int32"))
 
-    tokenized.set_format(type="torch", columns=fmt_cols)
-    roc()
+        fmt_cols = ["input_ids", "attention_mask", "labels"]
+        if "length" in tokenized.column_names:
+            fmt_cols.append("length")
+        if image_mode and "pixel_values" in tokenized.column_names:
+            fmt_cols.append("pixel_values")
 
-    train_dataset = tokenized
+        tokenized.set_format(type="torch", columns=fmt_cols)
+        roc()
+
+        train_dataset = tokenized
     eval_dataset = None
     if TRAINING_CHAIN_PATH:
         just_logged = log_dataset(dataset_path, TRAINING_CHAIN_PATH)

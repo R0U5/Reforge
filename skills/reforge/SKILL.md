@@ -50,7 +50,8 @@ reforge --agent \
 
 Useful flags: `--steps N` (fixed step budget), `--epoch N`, `--force`
 (disable early stopping), `--batch_size N`, `--grad_accum N`, `--image`
-(multimodal), `--latex` / `--code` (preserve LaTeX / code during cleaning),
+(multimodal), `--dpo` / `--dpo_beta X` (DPO preference training),
+`--latex` / `--code` (preserve LaTeX / code during cleaning),
 `--output_dir PATH`.
 
 ## Monitor
@@ -94,13 +95,15 @@ fix the listed errors. Requires `--base_model` + dataset, same as agent mode.
 
 ## Dataset schemas
 
-Detected from column names (alias matching): **sft** (`chosen` required,
-`question` optional), **causal** (raw `text`/`prompt`), **chat**
-(`messages`), **multimodal** (image + text, with `--image`). The
-`dataset_loaded` event reports exactly how columns were mapped
-(`mapped_roles`) and the `cleaning_mode` used — default cleaning strips
-LaTeX/HTML/markdown/emoji, so pass `--latex` or `--code` when that content
-is the point.
+Detected from column names (alias matching): **dpo** (BOTH `chosen` and
+`rejected` — preference pairs, trained with TRL's DPOTrainer; run SFT
+first and the training chain makes the merged model the DPO base),
+**sft** (`chosen` required, `question` optional), **causal**
+(raw `text`/`prompt`), **chat** (`messages`), **multimodal** (image +
+text, with `--image`). The `dataset_loaded` event reports exactly how
+columns were mapped (`mapped_roles`) and the `cleaning_mode` used —
+default cleaning strips LaTeX/HTML/markdown/emoji, so pass `--latex` or
+`--code` when that content is the point.
 
 ## Side effects to check before launching
 
