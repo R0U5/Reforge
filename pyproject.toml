@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "reforge"
-version = "1.1.0"
+version = "1.2.0"
 description = "A modular LoRA fine-tuning pipeline for Hugging Face models"
 readme = "README.md"
 license = {text = "MIT"}

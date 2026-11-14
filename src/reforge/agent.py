@@ -66,7 +66,10 @@ def _now() -> str:
 # run_state.json ("version") or `reforge --agent-schema`.
 # v3: DPO training mode (trl.DPOTrainer), beta in training_started,
 #     missing_dependency error code.
-SCHEMA_VERSION = 3
+# v4: Batch mode (--batch): batch_started/stage_started/stage_completed/
+#     stage_failed/batch_interrupted/batch_complete/batch_failed events,
+#     batch_state.json, batch_manifest_invalid/batch_stage_failed error codes.
+SCHEMA_VERSION = 4
 
 
 # Status shown in run_state.json after each event type.
@@ -84,6 +87,13 @@ _STATUS_BY_EVENT = {
     "merge_complete":       "exporting",
     "run_complete":         "complete",
     "run_failed":           "failed",
+    "batch_started":        "starting",
+    "stage_started":        "training",
+    "stage_completed":      "complete",
+    "stage_failed":         "failed",
+    "batch_interrupted":    "interrupted",
+    "batch_complete":       "complete",
+    "batch_failed":         "failed",
 }
 
 # Event fields that mirror into run_state.json.
@@ -93,6 +103,8 @@ _MIRRORED_FIELDS = {
     "merged_dir", "report", "error", "exit_code", "interrupted",
     "error_code", "hint", "cleaning_mode", "mapped_roles",
     "columns", "shuffle_seed", "dpo_beta",
+    "batch_dir", "total_stages", "index", "name", "final_merged",
+    "resuming", "returncode",
 }
 
 # Substring match (case-insensitive) -> (error_code, hint). First match
@@ -155,6 +167,15 @@ _ERROR_PATTERNS = [
      "DPO training needs a preference-pair dataset: both a chosen and a "
      "rejected column (aliases in `reforge --agent-schema` -> "
      "dataset_schemas)."),
+    ("batch manifest",
+     "batch_manifest_invalid",
+     "The --batch argument must be either a single .json manifest file or a "
+     "list of .parquet paths. Manifest format is in `reforge --agent-schema` "
+     "-> batch_manifest."),
+    ("batch requires an explicit base model",
+     "missing_base_model",
+     "Batch mode never chains from a stale merged/ silently: pass "
+     "--base_model (or set 'base_model' in the manifest) for stage 1."),
 ]
 
 
@@ -473,6 +494,73 @@ _EVENT_FIELDS = {
             "exit_code": "int — 1 runtime, 2 invalid arguments/dataset, 130 interrupted",
         },
     },
+    "batch_started": {
+        "description": "Batch mode beginning: the stage list and its resolved "
+                       "status. First event of every batch run.",
+        "stage": "loading",
+        "fields": {
+            "batch_dir": "str — batch_x/ directory holding batch_state.json + stage dirs",
+            "base_model": "str — stage 1's base model (explicit; batch never chains silently)",
+            "total_stages": "int",
+            "datasets": "list[str] — dataset (or hf_dataset) per stage, in order",
+            "resuming": "bool — true when --batch_dir resumed an existing batch",
+        },
+    },
+    "stage_started": {
+        "description": "A batch stage's child reforge process is launching.",
+        "stage": "loading",
+        "fields": {
+            "index": "int — 0-based stage index",
+            "name": "str — stage name (stage_01, ...)",
+            "dataset": "str — this stage's dataset",
+            "stage_dir": "str — the stage's own output dir (run_state.json, agent.ndjson)",
+            "base_model": "str — previous stage's merged dir (or the explicit base for index 0)",
+        },
+    },
+    "stage_completed": {
+        "description": "A batch stage trained, merged, and wrote success.txt.",
+        "stage": "complete",
+        "fields": {
+            "index": "int", "name": "str", "dataset": "str",
+            "merged_dir": "str — this stage's merged model (the next stage's base)",
+            "training_mode": "str|null — detected mode from the stage's run_state.json",
+        },
+    },
+    "stage_failed": {
+        "description": "A batch stage failed; the batch aborts (later stages stay pending). "
+                       "error/error_code/hint come from the stage's own run_failed event.",
+        "stage": "failed",
+        "fields": {
+            "index": "int", "name": "str", "dataset": "str",
+            "error": "str", "error_code": "str|null", "hint": "str|null",
+            "returncode": "int — the child process exit code",
+        },
+    },
+    "batch_interrupted": {
+        "description": "Ctrl+C during a batch: the interrupted child got "
+                       "CTRL_BREAK, saved its state, and exited; remaining "
+                       "stages stay pending. Resume with --batch_dir.",
+        "stage": "interrupted",
+        "fields": {
+            "index": "int — the stage that was interrupted",
+            "name": "str",
+            "returncode": "int — usually 130",
+            "hint": "str — the exact resume command",
+        },
+    },
+    "batch_complete": {
+        "description": "All batch stages completed. Terminal event.",
+        "stage": "complete",
+        "fields": {
+            "final_merged": "str — the last stage's merged model directory",
+            "completed_stages": "int",
+        },
+    },
+    "batch_failed": {
+        "description": "Batch aborted (manifest invalid or a stage failed). Terminal event.",
+        "stage": "failed",
+        "fields": {"error": "str", "error_code": "str|null", "hint": "str|null"},
+    },
 }
 
 _ERROR_CODES_DOC = {code: hint for _, code, hint in _ERROR_PATTERNS}
@@ -625,6 +713,39 @@ def build_agent_schema(parser=None) -> dict:
                                                "NEXT run uses merged/ as its base model (training chain)",
             "<output_dir>/merged/training_report.json": "loss statistics, trend, timing",
         },
+        "batch_mode": {
+            "invocation": "reforge --batch stage1.parquet stage2.parquet pairs.parquet "
+                          "--base_model PATH  |  --batch manifest.json --base_model PATH",
+            "manifest": {
+                "path": "pass a single .json path to --batch for per-stage control",
+                "keys": {
+                    "base_model": "required (or pass --base_model): stage 1's base. "
+                                  "Batch never chains from a stale merged/ silently",
+                    "output_dir": "optional: batch root (batch_<timestamp> is created inside)",
+                    "keep_stage_merges": "optional bool: keep every stage's merged model "
+                                         "(disk-heavy); default false = only the newest "
+                                         "completed stage's merged is kept",
+                    "stages": "list of stage objects, trained in order; the LAST stage's "
+                              "merged model is the final output",
+                },
+                "stage_keys": "dataset | hf_dataset (required), plus: name, epochs, steps, "
+                              "force, dpo, dpo_beta, latex, code, batch_size, grad_accum",
+                "note": "a stage whose dataset has chosen+rejected columns trains as DPO "
+                        "automatically - no special batch keys needed",
+            },
+            "layout": {
+                "batch_dir": "output_dir/batch_<timestamp>/ (or --batch_dir to resume)",
+                "state": "<batch_dir>/batch_state.json - per-stage status; the resume anchor",
+                "stages": "<batch_dir>/stage_01/..stage_0N/ - each a complete reforge "
+                          "output dir; stage N trains on stage N-1's merged model",
+            },
+            "resume": "rerun the same --batch command with --batch_dir <batch_dir>; "
+                      "completed stages are skipped, the interrupted stage resumes "
+                      "from its own checkpoint-last",
+            "run_state": "in batch mode, <batch_dir>/run_state.json tracks batch events; "
+                         "each stage also writes its own <stage_dir>/run_state.json and "
+                         "<stage_dir>/agent.ndjson (teeable via --agent_log)",
+        },
         "example_session": [
             '$ reforge --agent --base_model ~/HF_Models/phi-2 data.parquet --agent_log run.ndjson',
             '{"ts":"2026-11-10T19:05:01Z","event":"run_started","output_dir":"...","base_model":"..."}',
@@ -637,6 +758,17 @@ def build_agent_schema(parser=None) -> dict:
             '"pct":0.38,"loss":2.4131,"eta_sec":600}',
             '{"ts":"2026-11-10T19:16:12Z","event":"run_complete",'
             '"merged_dir":"~/Reforge_Output/merged","exit_code":0}',
+        ],
+        "batch_example_session": [
+            '$ reforge --agent --batch sft1.parquet sft2.parquet pairs.parquet --base_model ~/HF_Models/phi-2',
+            '{"event":"batch_started","batch_dir":".../batch_20261113_143000","total_stages":3,"resuming":false}',
+            '{"event":"stage_started","index":0,"dataset":"sft1.parquet","base_model":"~/HF_Models/phi-2"}',
+            '{"event":"stage_completed","index":0,"merged_dir":".../stage_01/merged","training_mode":"sft"}',
+            '{"event":"stage_started","index":1,"dataset":"sft2.parquet",'
+            '"base_model":".../stage_01/merged"}',
+            '{"event":"stage_completed","index":1,"merged_dir":".../stage_02/merged"}',
+            '{"event":"stage_started","index":2,"dataset":"pairs.parquet","base_model":".../stage_02/merged"}',
+            '{"event":"batch_complete","final_merged":".../stage_03/merged","exit_code":0}',
         ],
     }
     return contract

@@ -97,6 +97,13 @@ def main():
                              "training). Non-interactive: --base_model and a dataset are required.")
     parser.add_argument('--agent_log', type=str, default=None,
                         help="Also tee the agent-mode NDJSON event stream to this file")
+    parser.add_argument('--batch', nargs='+', default=None,
+                        help="Batch mode: train multiple datasets in order, chaining merges "
+                             "(SFT stage 1 -> ... -> DPO stage). Either a .json manifest "
+                             "(per-stage overrides) or a list of .parquet paths.")
+    parser.add_argument('--batch_dir', type=str, default=None,
+                        help="Resume an interrupted batch: point at its batch_<timestamp> "
+                             "directory (printed when the batch started)")
     parser.add_argument('--no_tqdm', action='store_true',
                         help="Disable the tqdm progress bar and emit clean loss lines instead "
                              "(the dashboard sets this automatically)")
@@ -129,6 +136,8 @@ def main():
     # `--dry_run`: non-interactive preflight, also keeps stdout pure JSON.
     if parsed_args.dry_run:
         _set_stream(sys.stderr)
+        if parsed_args.batch:
+            raise SystemExit(_dry_run_batch(parsed_args))
         raise SystemExit(_dry_run(parsed_args))
 
     # Wrap stdout/stderr so a failing Windows console or pipe handle (OSError 22)
@@ -145,8 +154,9 @@ def main():
     os.makedirs(output_dir, exist_ok=True)
 
     # Agent mode: stdout becomes a pure NDJSON event stream and
-    # <output_dir>/run_state.json tracks the latest snapshot.
-    if agent_mode:
+    # <output_dir>/run_state.json tracks the latest snapshot. In batch mode
+    # this happens inside _raise_batch (run_state.json lives in the batch dir).
+    if agent_mode and not parsed_args.batch:
         BRIDGE.enable(output_dir, merge_dir, log_path=parsed_args.agent_log)
 
     # A typo'd flag would otherwise be silently swallowed and the run would
@@ -159,6 +169,16 @@ def main():
             _err(_message)
             raise SystemExit(2)
         _warn(_message)
+
+    # Batch mode: sequential stages with chained merges. Handled as its own
+    # top-level flow - the single-run pipeline below never sees --batch.
+    if parsed_args.batch:
+        if _unknown_args:
+            _message = ("Unrecognized arguments: " + " ".join(_unknown_args)
+                        + " (check flag spelling; see `reforge --help`)")
+            _err(_message)
+            raise SystemExit(2)
+        _raise_batch(parsed_args, agent_mode)
 
     _title("REFORGE", subtitle="LoRA fine-tuning pipeline")
 
@@ -677,6 +697,93 @@ def _run_pipeline(parsed_args, image_mode, output_dir, merge_dir, merge_success_
         _ok(f"Model saved to {merge_dir_actual}")
         _safe_print()
         BRIDGE.emit("run_complete", merged_dir=merge_dir_actual, exit_code=0)
+
+
+def _raise_batch(parsed_args, agent_mode) -> None:
+    """Top-level batch flow: sequential stages with chained merges."""
+    from .batch import BatchRunner, load_manifest
+
+    _fallback_log = os.path.join(
+        (parsed_args.output_dir or OUTPUT_DIR).rstrip("\\/"), "console.log")
+    _install_safe_streams(_fallback_log)
+
+    try:
+        manifest = load_manifest(parsed_args.batch)
+        runner = BatchRunner(
+            manifest,
+            base_model=parsed_args.base_model or manifest.get("base_model"),
+            batch_dir=parsed_args.batch_dir,
+            output_dir=parsed_args.output_dir,
+            extra_flags=("--no_tqdm",) if parsed_args.no_tqdm else (),
+        )
+    except Exception as e:
+        from .batch import _BatchError
+        error_code = "batch_manifest_invalid" if isinstance(e, _BatchError) else None
+        _err(str(e) if isinstance(e, _BatchError) else f"Batch setup failed: {e}")
+        if agent_mode:
+            BRIDGE.emit("batch_failed", error=str(e), error_code=error_code
+                        or "batch_setup_failed", exit_code=2)
+        raise SystemExit(2)
+
+    if agent_mode:
+        BRIDGE.enable(runner.batch_dir, os.path.join(runner.batch_dir, "merged"),
+                      log_path=parsed_args.agent_log)
+
+    _title("REFORGE", subtitle="Batch training - chained stages")
+
+    try:
+        code = runner.run()
+    except KeyboardInterrupt:
+        BRIDGE.emit("batch_interrupted", error="Interrupted by user",
+                    batch_dir=runner.batch_dir, exit_code=130)
+        _warn("Batch interrupted. Resume with: "
+              f"--batch {parsed_args.batch[0] if len(parsed_args.batch) == 1 else ' '.join(parsed_args.batch)} "
+              f"--batch_dir {runner.batch_dir}")
+        raise
+    except Exception as e:
+        _err(f"Batch error: {e}")
+        raise SystemExit(1)
+    raise SystemExit(code)
+
+
+def _dry_run_batch(parsed_args) -> int:
+    """Preflight for --batch: validate every stage, print one JSON plan."""
+    import json as _json
+    from .batch import dry_run_batch, load_manifest
+
+    result = {"dry_run": True, "ok": True, "errors": [], "warnings": []}
+
+    def _add_error(code, message, hint=None, **extra):
+        entry = {"error_code": code, "message": message}
+        if hint:
+            entry["hint"] = hint
+        entry.update(extra)
+        result["errors"].append(entry)
+        result["ok"] = False
+
+    try:
+        manifest = load_manifest(parsed_args.batch)
+    except Exception as e:
+        _add_error("batch_manifest_invalid", str(e),
+                   "check --batch (a .json manifest or a list of .parquet paths)")
+        sys.stdout.write(_json.dumps(result, indent=2, default=str) + "\n")
+        return 2
+
+    base_model = parsed_args.base_model or manifest.get("base_model")
+    errors, plan = dry_run_batch(manifest, base_model)
+    for e in errors:
+        _add_error(e.get("error_code") or "batch_manifest_invalid", e.get("message", str(e)),
+                   e.get("hint"))
+    for w in (plan or {}).get("warnings", []):
+        result["warnings"].append(w)
+
+    result["output"] = {
+        "batch_root": parsed_args.output_dir or OUTPUT_DIR,
+    }
+    if plan:
+        result["batch"] = plan.get("batch")
+    sys.stdout.write(_json.dumps(result, indent=2, default=str) + "\n")
+    return 0 if result["ok"] else 2
 
 
 if __name__ == '__main__':

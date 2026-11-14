@@ -15,6 +15,7 @@ src/reforge/
 ├── tokenization.py      # Tokenization, collation, length measurement
 ├── training.py          # LoRA setup, model loading, training loop
 ├── early_stopping.py    # EMA-based early stopping callback
+├── batch.py               # Batch mode: sequential chained stages
 ├── reporting.py         # Training summary, loss curves, reports
 ├── agent.py             # Agent mode: NDJSON events + run_state.json
 ├── utils.py             # Model scanner, file picker, GC
@@ -82,6 +83,8 @@ python -m reforge dataset.parquet --base_model /path/to/model --agent
 | `--image` | Enable multimodal (vision+text) training |
 | `--dpo` | Force DPO training (normally auto-detected from `chosen`+`rejected` columns) |
 | `--dpo_beta X` | DPO beta, KL strength vs the reference model (default: 0.1; DPO runs only) |
+| `--batch D1 D2 ...` | Batch mode: train datasets in order, chaining merges (`--batch manifest.json` for per-stage control) |
+| `--batch_dir PATH` | Resume an interrupted batch from its `batch_<timestamp>` directory |
 | `--latex` | Preserve LaTeX/scientific notation during cleaning |
 | `--code` | Preserve code formatting and indentation |
 | `--epoch N` | Number of training epochs (default: 1) |
@@ -122,6 +125,41 @@ the run fails preflight with `invalid_dataset` if both completions are missing.
    `beta` (default 0.1) controls KL pressure vs the reference model: higher =
    stay closer to the SFT model, lower = more aggressive alignment.
 
+## Batch Mode
+
+Train several datasets in order, each stage training on the previous stage's merged model — the canonical workflow is **SFT → SFT → DPO → final merge**:
+
+```bash
+# Inline list: global flags apply to every stage
+python -m reforge --batch sft_math.parquet sft_code.parquet dpo_pairs.parquet --base_model /path/to/base
+
+# Manifest: per-stage control
+python -m reforge --batch manifest.json --base_model /path/to/base
+```
+
+Manifest format:
+
+```json
+{
+  "base_model": "C:/path/to/base-model",
+  "stages": [
+    {"dataset": "sft_math.parquet", "epochs": 2},
+    {"dataset": "sft_code.parquet", "code": true, "force": true, "steps": 300},
+    {"dataset": "dpo_pairs.parquet", "dpo_beta": 0.1}
+  ]
+}
+```
+
+Per-stage keys map to the CLI flags: `dataset`/`hf_dataset`, `name`, `epochs`, `steps`, `force`, `dpo`, `dpo_beta`, `latex`, `code`, `batch_size`, `grad_accum`. A stage whose dataset has `chosen`+`rejected` columns trains as DPO automatically.
+
+Behavior:
+
+- Each stage is a complete Reforge run in its own dir (`batch_<timestamp>/stage_01/` …), so early stopping, checkpointing, and merging behave exactly as in single runs — early stopping resets per stage.
+- The final model is the last stage's `stage_0N/merged`. Completed stages' merged models are deleted once the next stage completes (only the running stage's predecessor is ever needed). Set `"keep_stage_merges": true` to keep all.
+- **Stage 1 requires an explicit `--base_model`** (CLI or manifest) — batch never chains from a stale `Reforge_Output/merged` silently.
+- **Resume:** interrupt with Ctrl+C (the current stage saves its adapter), then rerun with `--batch_dir <batch_dir>`. Completed stages are skipped; the interrupted stage resumes from its checkpoints. A stage whose merge was interrupted is detected (no `success.txt`) and restarted cleanly.
+- `--dry_run --batch manifest.json` validates every stage and prints per-stage plans without touching the GPU.
+
 ## Environment Variables
 
 | Variable | Default | Description |
@@ -140,6 +178,7 @@ the run fails preflight with `invalid_dataset` if both completions are missing.
 ### Core
 - **Automatic training mode detection** — inspects dataset columns and selects the right pipeline: SFT (instruction/response), DPO (preference pairs: chosen+rejected), causal (raw text), chat (messages), or multimodal (image+text).
 - **DPO (preference tuning)** — preference-pair datasets train with TRL's `DPOTrainer`: LoRA adapters on the 4-bit base with the adapter-disabled base weights acting as the reference model (no second copy in VRAM), `beta` configurable via `--dpo_beta`. Intended workflow: **SFT first, then DPO** — the SFT run's merged model automatically becomes the DPO run's base via the training chain. Preference alignment is visible live (`rewards/accuracies` in the dashboard log).
+- **Batch mode (`--batch`)** — train a list of datasets in order with chained merges (SFT → SFT → DPO). Per-stage control via a JSON manifest; automatic resume from `batch_state.json`; per-stage early stopping; disk-friendly (intermediate merges auto-reclaimed).
 - **Built-in data cleaning** — strips LaTeX, HTML, markdown artifacts, unicode garbage, emoji, junk tokens, and e-commerce noise. Configurable modes for math, LaTeX-preserving, and code-preserving workflows.
 - **Model profiles** — ships with tuned configs for Phi-2, Phi-3, Phi-3-Vision, and more. Falls back to sensible defaults for unlisted models.
 - **Smart early stopping** — EMA-based loss plateau/worsening detection with exposure floors, LR gates, and dynamic hard caps.

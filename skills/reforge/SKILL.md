@@ -54,6 +54,26 @@ Useful flags: `--steps N` (fixed step budget), `--epoch N`, `--force`
 `--latex` / `--code` (preserve LaTeX / code during cleaning),
 `--output_dir PATH`.
 
+## Batch mode: several datasets in order (SFT → ... → DPO)
+
+```bash
+reforge --agent --base_model /path/to/model --batch sft1.parquet sft2.parquet pairs.parquet
+reforge --agent --base_model /path/to/model --batch manifest.json
+```
+
+Stages train in order, each on the previous stage's merged model; the last
+stage's merged dir is the final output. Per-stage control goes in a
+`.json` manifest (`--agent-schema` → `batch_mode` for the exact schema);
+a `chosen`+`rejected` stage trains as DPO automatically. `--base_model`
+is required (batch never chains from a stale `merged/` silently).
+
+Batch events: `batch_started → (stage_started → stage_completed)* →
+batch_complete` (or `stage_failed` / `batch_interrupted`). Poll
+`<batch_dir>/batch_state.json` for stage status; each stage also writes
+`<batch_dir>/stage_0N/agent.ndjson` with its full event stream. **Resume**
+an interrupted batch: rerun the same command plus
+`--batch_dir <batch_dir>`.
+
 ## Monitor
 
 - **Stream stdout NDJSON** (preferred): events `run_started → dataset_loaded
@@ -83,6 +103,7 @@ fix the listed errors. Requires `--base_model` + dataset, same as agent mode.
 | error_code | Fix |
 |---|---|
 | `missing_base_model` | pass `--base_model /path/to/model` |
+| `batch_manifest_invalid` | `--batch` needs a `.json` manifest or `.parquet` list; validate with `--dry_run --batch ... --base_model ...` |
 | `missing_dataset` | pass a `.parquet` path or `--hf_dataset ID` |
 | `invalid_dataset` / `dataset_not_found` | fix the dataset path (`.parquet`) |
 | `undetectable_schema` | rename columns to match a supported schema (see `--agent-schema` → `dataset_schemas`) |
