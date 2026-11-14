@@ -265,7 +265,12 @@ def synthesize_prompt_dataset(raw_dataset, col_question, col_chosen, col_rejecte
             q = clean(str(row.get(col_question, "") or "")) if col_question else ""
             a = clean(str(row.get(col_chosen, "") or "")) if col_chosen else ""
             r = clean(str(row.get(col_rejected, "") or "")) if col_rejected else ""
-            if conversational and q:
+            if conversational:
+                # Always emit chat-message lists when conversational, even for
+                # empty prompts: pyarrow rejects columns mixing list and
+                # non-list values, so the fallback string format below would
+                # poison the whole column. Empty-prompt rows are filtered out
+                # right after the map.
                 return {
                     "prompt":   [{"role": "user", "content": q}],
                     "chosen":   [{"role": "assistant", "content": a}],
@@ -274,17 +279,26 @@ def synthesize_prompt_dataset(raw_dataset, col_question, col_chosen, col_rejecte
             return {"prompt": q, "chosen": a, "rejected": r}
 
         processed = raw_dataset.map(build_dpo_row, num_proc=1, writer_batch_size=50)
-        keep_cols = ("prompt", "chosen", "rejected") if col_question else ("chosen", "rejected")
+        keep_cols = ("prompt", "chosen", "rejected")
         cols_to_drop = [c for c in processed.column_names if c not in keep_cols]
         if cols_to_drop:
             processed = processed.remove_columns(cols_to_drop)
         before = len(processed)
-        processed = processed.filter(
-            lambda e: bool(_completion_text(e["chosen"]).strip())
-            and bool(_completion_text(e["rejected"]).strip()),
-            num_proc=1,
-        )
-        _info(f"Retained {len(processed):,} / {before:,} rows (rows need both a chosen and a rejected completion)")
+        if conversational:
+            processed = processed.filter(
+                lambda e: bool(_completion_text(e["prompt"]).strip())
+                and bool(_completion_text(e["chosen"]).strip())
+                and bool(_completion_text(e["rejected"]).strip()),
+                num_proc=1,
+            )
+            _info(f"Retained {len(processed):,} / {before:,} rows (rows need a prompt, a chosen and a rejected completion)")
+        else:
+            processed = processed.filter(
+                lambda e: bool(_completion_text(e["chosen"]).strip())
+                and bool(_completion_text(e["rejected"]).strip()),
+                num_proc=1,
+            )
+            _info(f"Retained {len(processed):,} / {before:,} rows (rows need both a chosen and a rejected completion)")
     elif training_mode == "multimodal":
         def build_multimodal_row(row):
             parts = []
@@ -501,10 +515,13 @@ def load_and_prepare_dataset(dataset_path, cleaning_mode, image_mode=False, base
     else:
         # Conversational DPO: TRL applies the tokenizer's chat template to
         # prompt/chosen/rejected message lists, matching how the SFT path
-        # formats conversations.
-        conversational = bool(getattr(tokenizer, "chat_template", None))
+        # formats conversations. Only possible when the dataset actually has
+        # a prompt column (TRL requires one for the chat-template path).
+        conversational = bool(getattr(tokenizer, "chat_template", None)) and bool(col_question)
         if conversational:
             _info("DPO: using the tokenizer's chat template (conversational format)")
+        elif not col_question:
+            _warn("DPO: no prompt/question column detected - training on completions with an empty prompt")
         processed = synthesize_prompt_dataset(
             raw_dataset, col_question, col_chosen, col_rejected,
             training_mode, clean, col_image=col_image,
