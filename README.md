@@ -190,6 +190,7 @@ Behavior:
 - **Local model picker** — scans `~/HF_Models/` and the Hugging Face hub cache, then presents an interactive numbered list.
 - **Post-training summary** — formatted report with loss statistics, trend, and unicode sparkline. Writes a full `training_report.json`.
 - **Tkinter dashboard** (`reforge dashboard`, `python -m reforge dashboard`, or `-m reforge.dashboard`) — config editor, start/stop, and a live loss chart. Includes a DPO card (force checkbox, beta field, and the SFT→DPO chain hint) and shows `rewards/accuracies` as an `acc` column in the training log during DPO runs.
+- **Dashboard progress panel** (tqdm/Docker-inspired) — the dashboard launches training in agent mode and renders the NDJSON event stream live: a `DATASET → MODEL → TRAIN → MERGE` phase tracker (Docker-pull-style segments with spinner/✓/✗ states), a progress bar with the percent caption, and a tqdm-style info line `step 450/1000 · 45% · [03:12<03:54 · 1.9 it/s]` plus an ETA chip. Indeterminate sweep animation while loading/merging; batch runs get a `STAGE k/N` chip that resets the bar per stage.
 
 ### Agent mode
 - **Self-describing contract** — `reforge --agent-schema` (or `reforge agent-schema`) prints the complete machine-readable contract as one JSON object: CLI arguments, event vocabulary and fields, `run_state.json` keys, exit codes, error codes, dataset schemas, model profiles, artifact map, and an example session. Generated from the live argparse parser and pipeline constants, so it cannot drift. **Agents should call this first.**

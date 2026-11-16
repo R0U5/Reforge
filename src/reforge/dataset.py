@@ -499,6 +499,10 @@ def load_and_prepare_dataset(dataset_path, cleaning_mode, image_mode=False, base
         tokenizer.add_special_tokens(special_tokens)
     tokenizer.pad_token = tokenizer.pad_token or tokenizer.eos_token or tokenizer.unk_token
 
+    if training_mode in ("sft", "chat") and not getattr(tokenizer, "chat_template", None):
+        _warn(f"{os.path.basename(model_name)} has no chat template — "
+              "SFT/chat rows will train causally on raw text instead")
+
     if training_mode == "causal":
         _info(f"Causal mode \u2014 training on raw text column '{col_chosen}'")
         text_col = col_chosen
@@ -569,6 +573,14 @@ def load_and_prepare_dataset(dataset_path, cleaning_mode, image_mode=False, base
             dropped = before - len(tokenized)
             if dropped:
                 _warn(f"Dropped {dropped} rows with unreadable images")
+        else:
+            before = len(tokenized)
+            tokenized = tokenized.filter(
+                lambda e: len(e["input_ids"]) > 0
+            )
+            dropped = before - len(tokenized)
+            if dropped:
+                _warn(f"Dropped {dropped} rows longer than max_length (kept out to preserve <|im_end|> supervision)")
 
         _info("Casting columns to tensor format...")
         tokenized = tokenized.cast_column("input_ids", Sequence(Value("int64")))

@@ -75,8 +75,24 @@ def resolve_model_profile(model_path: str) -> dict:
     name = os.path.basename(model_path).lower()
     for key, profile in MODEL_PROFILES.items():
         if key in name:
-            return profile
-    return MODEL_PROFILE_DEFAULT
+            p = dict(profile)
+            break
+    else:
+        p = dict(MODEL_PROFILE_DEFAULT)
+    # Optional env overrides: REFORGE_LR (float), REFORGE_GRAD_ACCUM (int)
+    lr_env = os.environ.get("REFORGE_LR")
+    if lr_env:
+        try:
+            p["learning_rate"] = float(lr_env)
+        except ValueError:
+            pass
+    ga_env = os.environ.get("REFORGE_GRAD_ACCUM")
+    if ga_env:
+        try:
+            p["grad_accum"] = int(ga_env)
+        except ValueError:
+            pass
+    return p
 
 
 def resolve_profile_key(model_path: str) -> str:

@@ -31,6 +31,28 @@ def _launch_dashboard() -> int:
     return 0
 
 
+def _launch_webui(argv_tail: list[str]) -> int:
+    """Run the local web dashboard in this process (`reforge webui|ui`)."""
+    import argparse as _argparse
+    p = _argparse.ArgumentParser(prog="reforge webui",
+                                 description="Launch the browser dashboard")
+    p.add_argument("--host", default=None, help="bind address (default 127.0.0.1)")
+    p.add_argument("--port", type=int, default=None,
+                   help="bind port (default 7861)")
+    p.add_argument("--no-browser", action="store_true",
+                   help="don't open a browser window automatically")
+    args, _unknown = p.parse_known_args(argv_tail)
+
+    from .webui import DEFAULT_HOST, DEFAULT_PORT, launch
+    host = args.host or DEFAULT_HOST
+    port = args.port if args.port is not None else DEFAULT_PORT
+    if port == 7860:
+        _warn("port 7860 is Lethe's default — passing an explicit --port is "
+              "fine, but 7861 is the reforge default to avoid collisions")
+    launch(host=host, port=port, open_browser=not args.no_browser)
+    return 0
+
+
 def _resolve_cleaning_mode(parsed_args) -> str:
     """Shared by the real pipeline and --dry_run so they cannot disagree."""
     modes = []
@@ -50,6 +72,10 @@ def main():
     # a dataset file is expected to keep its .parquet extension.)
     if len(sys.argv) > 1 and sys.argv[1] == "dashboard":
         raise SystemExit(_launch_dashboard())
+
+    # `reforge webui` / `reforge ui` — browser dashboard (Lethe-style).
+    if len(sys.argv) > 1 and sys.argv[1] in ("webui", "ui"):
+        raise SystemExit(_launch_webui(sys.argv[2:]))
 
     # `reforge agent-schema` == `reforge --agent_schema`: print the agent
     # contract as JSON and exit 0.
@@ -671,6 +697,23 @@ def _run_pipeline(parsed_args, image_mode, output_dir, merge_dir, merge_success_
 
     _info(f"Saving to: {merge_dir_actual}")
     os.makedirs(merge_dir_actual, exist_ok=True)
+
+    # Serve-time stopping: training teaches the template's end-of-turn token
+    # (<|im_end|> etc.), but the merged model's generation_config is whatever
+    # the base shipped — and base checkpoints often have none at all (no
+    # generation_config.json, config.eos_token_id absent), so HF generate()
+    # would never stop. Pin the tokenizer's eos into the saved generation
+    # config — but only when the model carries no eos of its own (never
+    # clobber an intentional multi-eos list like Llama-3's [128001, 128009]).
+    _tok_eos = getattr(tokenizer, "eos_token_id", None)
+    _gc = getattr(final_model_to_save, "generation_config", None)
+    if _tok_eos is not None and _gc is not None and _gc.eos_token_id is None:
+        try:
+            _gc.eos_token_id = _tok_eos
+            _ok(f"generation_config.eos_token_id pinned to tokenizer eos ({_tok_eos})")
+        except Exception as _gc_err:
+            _warn(f"Could not pin generation_config eos: {_gc_err}")
+
     final_model_to_save.save_pretrained(
         merge_dir_actual,
         safe_serialization=save_profile["safe_serialization"],
