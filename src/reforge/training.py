@@ -83,19 +83,45 @@ def load_model(tokenizer, model_name, image_mode=False, output_dir=None, train_l
             _info(f"Loading merged model {os.path.basename(model_name)} (AutoModelForCausalLM, 4-bit)...")
         else:
             _info(f"Loading {os.path.basename(model_name)} (AutoModelForCausalLM)...")
+
+        # Detect multimodal ConditionalGeneration checkpoints (e.g. Qwen3.5-9B):
+        # AutoModelForCausalLM rejects their nested config; load the text-capable
+        # ConditionalGeneration class instead, with 4-bit quantization + vision frozen.
+        arch = None
+        try:
+            with open(os.path.join(model_name, "config.json"), "r", encoding="utf-8") as f:
+                import json as _json_cfg
+                arch = (_json_cfg.load(f).get("architectures") or [None])[0]
+        except Exception:
+            arch = None
+        is_multimodal_lm = bool(arch and "ForConditionalGeneration" in str(arch))
+
         bnb_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
             bnb_4bit_compute_dtype=torch.bfloat16,
             bnb_4bit_use_double_quant=True,
         )
-        base_model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            quantization_config=bnb_config,
-            trust_remote_code=profile["trust_remote_code"],
-            local_files_only=True,
-            _attn_implementation=profile["attn_implementation"],
-        )
+        if is_multimodal_lm:
+            from transformers import AutoModelForImageTextToText
+            base_model = AutoModelForImageTextToText.from_pretrained(
+                model_name,
+                quantization_config=bnb_config,
+                trust_remote_code=profile["trust_remote_code"],
+                local_files_only=True,
+                _attn_implementation=profile["attn_implementation"],
+            )
+            for name, param in base_model.named_parameters():
+                if any(tag in name.lower() for tag in ("vision", "visual", "img_projection", "image_newline")):
+                    param.requires_grad_(False)
+        else:
+            base_model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                quantization_config=bnb_config,
+                trust_remote_code=profile["trust_remote_code"],
+                local_files_only=True,
+                _attn_implementation=profile["attn_implementation"],
+            )
 
     if hasattr(base_model.config, "use_cache"):
         base_model.config.use_cache = False
@@ -321,7 +347,7 @@ def run_training(train_dataset, tokenizer, training_mode, model_name, processor,
         dataloader_num_workers=0,
         dataloader_persistent_workers=False,
         lr_scheduler_type=selected_scheduler,
-        bf16=True,
+        bf16=False,
         length_column_name="length",
         optim="paged_adamw_8bit",
         gradient_checkpointing=True,
@@ -350,6 +376,46 @@ def run_training(train_dataset, tokenizer, training_mode, model_name, processor,
         tokenizer, model_name, image_mode=image_mode, output_dir=output_dir,
         train_lm_head=getattr(parsed_args, "train_lm_head", False),
     )
+
+    # Chunked cross-entropy: the stock loss materialises
+    # [batch, seq, vocab] fp32 logits in one tensor (248k vocab * 2048 ctx
+    # ~= 2 GB) and OOMs 12 GB cards. Compute in T-sized chunks instead.
+    try:
+        import torch.nn.functional as _F
+        _T_CHUNK = 128
+
+        def _chunked_loss(logits, labels, num_items_in_batch=None, ignore_index=-100, **kwargs):
+            shift_logits = logits[:, :-1].contiguous()
+            shift_labels = labels[:, 1:].contiguous()
+            V = shift_logits.size(-1)
+            T = shift_labels.size(1)
+            total = torch.zeros((), dtype=torch.float32, device=logits.device)
+            count = 0
+            for start in range(0, T, _T_CHUNK):
+                lg = shift_logits[:, start:start + _T_CHUNK, :].float()
+                lb = shift_labels[:, start:start + _T_CHUNK]
+                part = _F.cross_entropy(
+                    lg.reshape(-1, V), lb.reshape(-1),
+                    ignore_index=ignore_index, reduction="sum",
+                )
+                total = total + part
+                count += int((lb != ignore_index).sum())
+            if num_items_in_batch is not None:
+                return total / max(int(num_items_in_batch), 1)
+            return total / max(count, 1)
+
+        patched = 0
+        for name, mod in model.named_modules():
+            cls_name = type(mod).__name__
+            if cls_name.endswith("ForCausalLM") or cls_name.endswith("ForConditionalGeneration"):
+                try:
+                    mod.loss_function = _chunked_loss
+                    patched += 1
+                except Exception:
+                    pass
+        _info(f"Chunked cross-entropy installed on {patched} module(s)")
+    except Exception as _cl_err:
+        _warn(f"Chunked loss patch not applied: {_cl_err}")
 
     if is_dpo:
         # TRL requires left padding and a pad token for the preference
