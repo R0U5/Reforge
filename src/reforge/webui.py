@@ -37,6 +37,7 @@ from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .display import _info, _title
+from .webui_config import build_argv, scan_models
 
 # ── Tunables ─────────────────────────────────────────────────────────
 DEFAULT_HOST = "127.0.0.1"
@@ -329,10 +330,8 @@ def _spawn(params: dict) -> tuple[bool, str]:
     if JOB.state == "running":
         return False, "A training run is already active."
 
-    try:
-        from .webui_config import build_argv
-    except ImportError:
-        return False, "argv builder lands in Phase 2 (docs/WEBUI_MIGRATION.md §6)"
+    if not isinstance(params, dict):
+        params = {}
     try:
         cmd = build_argv(params)
     except ValueError as e:
@@ -351,7 +350,10 @@ def _spawn(params: dict) -> tuple[bool, str]:
         return False, f"Launch failed: {e}"
 
     dataset = params.get("dataset") or params.get("hf_dataset") or ""
-    JOB.begin(proc, params.get("base_model") or "", dataset)
+    if isinstance(dataset, list):  # batch stages carry their own datasets
+        dataset = ""
+    JOB.begin(proc, base_model=params.get("base_model") or "",
+              dataset=str(dataset))
 
     for target, pipe in ((_reader_stdout, proc.stdout), (_reader_stderr, proc.stderr)):
         t = threading.Thread(target=target, args=(pipe,), daemon=True)
@@ -416,6 +418,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(200, INDEX_HTML.encode("utf-8"), "text/html; charset=utf-8")
         elif self.path == "/api/status":
             self._send_json(JOB.snapshot())
+        elif self.path == "/api/models":
+            self._send_json({"models": scan_models()})
         else:
             self._send_json({"error": "not found"}, 404)
 
@@ -426,6 +430,12 @@ class _Handler(BaseHTTPRequestHandler):
         elif self.path == "/api/stop":
             ok, msg = _stop()
             self._send_json({"ok": ok, "message": msg}, 200 if ok else 409)
+        elif self.path == "/api/preview":
+            params = self._read_json()
+            try:
+                self._send_json({"ok": True, "argv": build_argv(params, strict=False)})
+            except ValueError as e:
+                self._send_json({"ok": False, "message": str(e)}, 200)
         else:
             self._send_json({"error": "not found"}, 404)
 
