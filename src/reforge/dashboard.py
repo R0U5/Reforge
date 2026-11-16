@@ -7,6 +7,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -145,6 +146,19 @@ def trend_label(norm: float) -> str:
     elif norm <   1.0:     return "Weak Rise"
     elif norm <   3.0:     return "Moderate Rise"
     else:                  return "Strong Rise"
+
+
+def _fmt_hms(seconds) -> str:
+    """tqdm-style clock: 03:54, 1h12m05s. Unknown value -> --:--."""
+    try:
+        sec = int(float(seconds))
+    except (TypeError, ValueError):
+        return "--:--"
+    if sec < 0:
+        sec = 0
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}h{m:02d}m{s:02d}s" if h else f"{m:02d}:{s:02d}"
 
 
 def style_analysis_axes(fig, ax):
@@ -562,6 +576,10 @@ class ReforgeDashboard:
         self._stat_steps = self._stat(top, "steps", 0)
         self._stat_current = self._stat(top, "loss", "\u2014")
         self._stat_best = self._stat(top, "best", "\u2014")
+        self._stat_eta = self._stat(top, "eta", "\u2014")
+
+        # Progress card (tqdm/Docker-inspired): phase tracker + bar + ETA line
+        self._build_progress_card(right)
 
         self._live_fig = Figure(figsize=(6, 4), dpi=96)
         self._live_fig.patch.set_facecolor("#15151f")
@@ -601,6 +619,314 @@ class ReforgeDashboard:
             highlightthickness=1, highlightbackground=SURFACE3)
         box.pack(side="left", padx=(0, 6))
         return box
+
+    # ── Progress panel (tqdm/Docker-inspired) ─────────────────────────
+
+    # Pipeline phases shown as Docker-pull-style segments. Driven by the
+    # child's --agent NDJSON event stream (see agent.py for the contract).
+    _PHASES = ("dataset", "model", "train", "merge")
+    _PHASE_TITLES = {
+        "dataset": "DATASET",
+        "model":   "MODEL",
+        "train":   "TRAIN",
+        "merge":   "MERGE",
+    }
+    _PHASE_WAIT_TEXT = {
+        "dataset": "Loading dataset\u2026",
+        "model":   "Loading model\u2026",
+        "train":   "Training\u2026",
+        "merge":   "Merging LoRA\u2026",
+    }
+    _SPINNER_FRAMES = "|/-\\"
+
+    def _build_progress_card(self, parent):
+        card = tk.Frame(parent, bg=SURFACE, highlightthickness=1,
+                        highlightbackground=SURFACE3, highlightcolor=ACCENT)
+        card.pack(fill="x", pady=(0, 6))
+        inner = tk.Frame(card, bg=SURFACE, padx=10, pady=8)
+        inner.pack(fill="both", expand=True)
+
+        # Phase tracker row: DATASET → MODEL → TRAIN → MERGE (+ stage chip)
+        row = tk.Frame(inner, bg=SURFACE)
+        row.pack(fill="x")
+        self._lbl_stage_chip = tk.Label(
+            row, text="", bg=SURFACE, fg=ACCENT, font=(FONT, 8, "bold"))
+        self._lbl_stage_chip.pack(side="right")
+        self._phase_labels = {}
+        for i, phase in enumerate(self._PHASES):
+            if i:
+                tk.Label(row, text="\u2192", bg=SURFACE, fg=FAINT,
+                         font=(FONT, 8)).pack(side="left", padx=3)
+            lbl = tk.Label(row, text=self._PHASE_TITLES[phase], bg=SURFACE2,
+                           fg=MUTED, font=(FONT, 8, "bold"), padx=8, pady=2)
+            lbl.pack(side="left")
+            self._phase_labels[phase] = lbl
+
+        # Progress bar (custom canvas; tqdm-style text is drawn inside)
+        self._prog_canvas = tk.Canvas(inner, height=26, bg=SURFACE,
+                                      highlightthickness=0)
+        self._prog_canvas.pack(fill="x", pady=(8, 5))
+        self._prog_canvas.bind("<Configure>",
+                               lambda e: self._render_progress())
+
+        # tqdm-style info line: left = step counts, right = [elapsed<ETA, it/s]
+        info = tk.Frame(inner, bg=SURFACE)
+        info.pack(fill="x")
+        self._lbl_prog_left = tk.Label(info, text="waiting for run\u2026",
+                                       bg=SURFACE, fg=MUTED,
+                                       font=(FONT_MONO, 9))
+        self._lbl_prog_left.pack(side="left")
+        self._lbl_prog_right = tk.Label(info, text="", bg=SURFACE,
+                                        fg=PRIMARY, font=(FONT_MONO, 9))
+        self._lbl_prog_right.pack(side="right")
+
+        # Live progress state, updated from agent NDJSON events.
+        self._prog = dict(
+            phase=None,         # active phase name, or None when idle/done
+            failed=False,       # last terminal event was a failure
+            done=False,         # run reached a terminal event
+            step=0, total=0, pct=None, eta=None,
+            t_train=None,       # monotonic-ish wall clock of first step
+            step0=0, rate=None, # it/s estimate from first step to now
+            sweep=0.0, spinner=0,
+        )
+        self._reset_progress()
+
+    def _reset_progress(self, keep_chip=False):
+        p = self._prog
+        p.update(phase=None, failed=False, done=False,
+                 step=0, total=0, pct=None, eta=None,
+                 t_train=None, step0=0, rate=None,
+                 sweep=0.0, spinner=0)
+        for lbl in self._phase_labels.values():
+            lbl.configure(text=lbl.cget("text").split("  ", 1)[-1])
+            self._style_phase(lbl, "pending")
+        if not keep_chip:
+            self._lbl_stage_chip.configure(text="")
+        self._lbl_prog_left.configure(text="waiting for run\u2026")
+        self._lbl_prog_right.configure(text="")
+        self._stat_eta.configure(text="  ETA  \u2014  ")
+        self._render_progress()
+
+    def _style_phase(self, lbl, state):
+        styles = {
+            "pending": (SURFACE2, MUTED),
+            "active":  (ROW, ACCENT),
+            "done":    (SURFACE2, OK),
+            "failed":  (ROW, ERR),
+        }
+        bg, fg = styles.get(state, styles["pending"])
+        lbl.configure(bg=bg, fg=fg)
+
+    def _set_progress_phase(self, name):
+        """Activate `name`; earlier phases become done, later ones pending."""
+        p = self._prog
+        p["phase"] = name
+        p["failed"] = False
+        p["done"] = False
+        idx = self._PHASES.index(name)
+        for i, phase in enumerate(self._PHASES):
+            lbl = self._phase_labels[phase]
+            lbl.configure(text=self._PHASE_TITLES[phase])
+            self._style_phase(
+                lbl, "done" if i < idx else "active" if i == idx else "pending")
+        self._update_prog_labels()
+        self._render_progress()
+
+    def _mark_phase(self, name, state):
+        lbl = self._phase_labels.get(name)
+        if lbl:
+            lbl.configure(text=self._PHASE_TITLES[name])
+            self._style_phase(lbl, state)
+
+    def _update_prog_labels(self):
+        p = self._prog
+        phase = p["phase"]
+        if phase == "train" and p["total"]:
+            now = time.time()
+            elapsed = now - p["t_train"] if p["t_train"] else 0.0
+            if p["rate"] is None and elapsed > 0 and p["step"] > p["step0"]:
+                p["rate"] = (p["step"] - p["step0"]) / elapsed
+            eta = p["eta"]
+            if eta is None and p["rate"] and p["rate"] > 0:
+                eta = (p["total"] - p["step"]) / p["rate"]
+            shown_pct = p["pct"] if p["pct"] is not None else 0.0
+            left = f"step {p['step']}/{p['total']}"
+            right = (f"{shown_pct:.1f}%  \u00b7  [{_fmt_hms(elapsed)}"
+                     f"<{_fmt_hms(eta)}"
+                     f" \u00b7 {p['rate']:.2f} it/s]" if p["rate"] is not None
+                     else f"{shown_pct:.1f}%  \u00b7  [{_fmt_hms(elapsed)}<{_fmt_hms(eta)}]")
+            self._lbl_prog_left.configure(text=left)
+            self._lbl_prog_right.configure(text=right)
+            self._stat_eta.configure(
+                text=f"  ETA  {_fmt_hms(eta)}  " if eta is not None else "  ETA  \u2014  ")
+        elif p["done"]:
+            pass  # terminal text is set by the event handler
+        else:
+            self._lbl_prog_left.configure(
+                text=self._PHASE_WAIT_TEXT.get(phase, "waiting for run\u2026"))
+            self._lbl_prog_right.configure(text="")
+
+    def _render_progress(self):
+        canvas = self._prog_canvas
+        try:
+            w = int(canvas.winfo_width())
+        except Exception:
+            w = 0
+        h = 26
+        canvas.delete("all")
+        if w < 20:
+            return
+        pad = 2
+        track_w = w - 2 * pad
+        p = self._prog
+
+        canvas.create_rectangle(pad, pad, w - pad, h - pad,
+                                fill=SURFACE2, outline=SURFACE3)
+
+        # Determinate train bar; indeterminate sweep everywhere else
+        # (dataset/model load and the merge take minutes with no % to show,
+        # so they get Docker-pull-style motion instead of a frozen bar).
+        indeterminate = (p["phase"] is not None and not p["done"]
+                         and not (p["phase"] == "train" and p["total"]))
+        if indeterminate:
+            chunk = max(48, track_w // 6)
+            travel = track_w + chunk
+            x_off = int(p["sweep"] * travel) - chunk
+            canvas.create_rectangle(pad + x_off, pad, pad + x_off + chunk,
+                                    h - pad, fill=PRIMARY, width=0)
+        elif p["phase"] is not None or p["done"]:
+            pct = p["pct"]
+            if pct is None and p["total"]:
+                pct = 100.0 * p["step"] / max(p["total"], 1)
+            if pct is None:
+                pct = 100.0 if p["done"] else 0.0
+            pct = max(0.0, min(100.0, pct))
+            fill_color = ERR if p["failed"] else ACCENT
+            canvas.create_rectangle(pad, pad, pad + track_w * pct / 100.0,
+                                    h - pad, fill=fill_color, width=0)
+            # 10% tick marks over the filled region (Docker-style segments)
+            for i in range(1, 10):
+                x = pad + track_w * i / 10.0
+                canvas.create_line(x, pad + 1, x, h - pad - 1,
+                                   fill=SURFACE, width=1)
+            if p["done"] or p["pct"] is not None:
+                label = "100%" if pct >= 100 else f"{pct:.1f}%"
+                # shadow pass keeps the caption readable on both gold and dark
+                canvas.create_text(w / 2 + 1, h / 2 + 1, text=label,
+                                   fill="#101014", font=(FONT_MONO, 9, "bold"))
+                canvas.create_text(w / 2, h / 2, text=label,
+                                   fill=TEXT, font=(FONT_MONO, 9, "bold"))
+
+    # Event handlers -----------------------------------------------------
+
+    def _apply_agent_event(self, ev: dict):
+        """Route one NDJSON event from the child into the progress panel."""
+        event = ev.get("event")
+        p = self._prog
+
+        status_map = {
+            "run_started":       ("Starting\u2026", WARN),
+            "dataset_loaded":    ("Preparing\u2026", WARN),
+            "training_started":  ("Training\u2026", ACCENT),
+            "training_complete": ("Exporting\u2026", WARN),
+            "merge_started":     ("Exporting\u2026", WARN),
+            "run_complete":      ("Complete", OK),
+            "run_interrupted":   ("Interrupted (saving)\u2026", WARN),
+        }
+        if event in status_map:
+            self._set_status(*status_map[event])
+
+        if event == "run_started":
+            self._set_progress_phase("dataset")
+        elif event == "dataset_loaded":
+            self._mark_phase("dataset", "done")
+            self._set_progress_phase("model")
+        elif event == "training_started":
+            self._set_progress_phase("train")
+            p["total"] = int(ev.get("total_steps") or 0)
+            p["step"] = 0
+            p["pct"] = None
+            p["eta"] = None
+            p["t_train"] = None
+            p["rate"] = None
+            self._update_prog_labels()
+            self._render_progress()
+        elif event == "step":
+            if p["t_train"] is None:
+                p["t_train"] = time.time()
+                p["step0"] = int(ev.get("step") or 0)
+            p["step"] = int(ev.get("step") or p["step"])
+            if ev.get("total_steps"):
+                p["total"] = int(ev["total_steps"])
+            p["pct"] = float(ev["pct"]) if ev.get("pct") is not None else (
+                100.0 * p["step"] / max(p["total"], 1) if p["total"] else None)
+            p["eta"] = ev.get("eta_sec")
+            self._update_prog_labels()
+            self._render_progress()
+        elif event in ("training_complete", "merge_started"):
+            self._mark_phase("train", "done")
+            self._set_progress_phase("merge")
+        elif event == "merge_complete":
+            self._mark_phase("merge", "done")
+        elif event == "run_complete":
+            p["done"] = True
+            p["phase"] = None
+            p["pct"] = 100.0
+            for name in self._PHASES:
+                self._mark_phase(name, "done")
+            self._lbl_prog_left.configure(text="run complete")
+            self._lbl_prog_right.configure(text="")
+            self._stat_eta.configure(text="  ETA  \u2014  ")
+            self._render_progress()
+        elif event == "run_interrupted":
+            self._lbl_prog_left.configure(text="interrupted \u2014 saving state\u2026")
+        elif event == "run_failed":
+            p["failed"] = True
+            if p["phase"]:
+                self._mark_phase(p["phase"], "failed")
+            err = str(ev.get("error") or "run failed")
+            self._lbl_prog_left.configure(
+                text=("failed: " + err)[:80])
+            self._lbl_prog_right.configure(text="")
+            self._render_progress()
+        elif event == "batch_started":
+            total = ev.get("total_stages")
+            if total:
+                self._prog_stage_total = int(total)
+                self._prog_stage_done = 0
+                self._lbl_stage_chip.configure(text=f"0/{total} STAGES")
+        elif event == "stage_started":
+            idx = int(ev.get("index", 0)) + 1
+            total = self._stage_count() or idx
+            self._lbl_stage_chip.configure(text=f"STAGE {idx}/{total}")
+            self._reset_progress(keep_chip=True)
+            self._set_progress_phase("dataset")
+        elif event == "stage_completed":
+            self._bump_stage_count()
+        elif event == "batch_complete":
+            self._lbl_stage_chip.configure(text="BATCH DONE")
+        elif event in ("stage_failed", "batch_failed"):
+            p["failed"] = True
+            self._lbl_prog_left.configure(
+                text=("batch failed: " + str(ev.get("error") or ""))[:80])
+            self._render_progress()
+
+    def _stage_count(self):
+        return getattr(self, "_prog_stage_total", None)
+
+    def _bump_stage_count(self):
+        if self._stage_count():
+            self._prog_stage_done = getattr(self, "_prog_stage_done", 0) + 1
+            self._lbl_stage_chip.configure(
+                text=f"{self._prog_stage_done}/{self._prog_stage_total} STAGES")
+
+    def _apply_agent_event_safe(self, ev: dict):
+        try:
+            self._apply_agent_event(ev)
+        except Exception:
+            pass
+
 
     # ── Browsers ──────────────────────────────────────────────────────
 
@@ -831,6 +1157,19 @@ class ReforgeDashboard:
         self._var_batch_mode.set(True)
         self._batch_refresh()
 
+    def _append_agent_args(self, cmd: list[str], out_dir: str) -> None:
+        """Launch the child in agent mode so the dashboard gets NDJSON events.
+
+        The event stream drives the progress panel (phases, step/total, ETA).
+        The tee file is the durable copy for post-run analysis.
+        """
+        out_dir = out_dir or self._DEFAULTS["output_dir"]
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+        except Exception:
+            pass
+        cmd += ["--agent", "--agent_log", os.path.join(out_dir, "agent.ndjson")]
+
     def _build_batch_cmd(self, preview: bool = False) -> list[str]:
         base = self._var_base_model.get().strip()
         path = self._batch_manifest_path
@@ -844,6 +1183,8 @@ class ReforgeDashboard:
             cmd += ["--output_dir", od]
         if "--no_tqdm" not in cmd:
             cmd.append("--no_tqdm")
+        if "--agent" not in cmd:
+            self._append_agent_args(cmd, od)
         return cmd
 
     # ── Command construction ──────────────────────────────────────────
@@ -881,12 +1222,16 @@ class ReforgeDashboard:
         dpo_beta = self._var_dpo_beta.get().strip()
         if dpo_beta:
             cmd += ["--dpo_beta", dpo_beta]
-        # The child's tqdm bar writes progress to stdout; on some Windows
-        # setups that write starts failing EINVAL mid-run and crashes
-        # training. --no_tqdm removes the bar; loss rows arrive on stderr
+        # --no_tqdm removes the bar; loss rows arrive on stderr
         # via the trainers LossLineLogger instead (crash-proof).
         if "--no_tqdm" not in cmd:
             cmd.append("--no_tqdm")
+        # Agent mode feeds the dashboard's progress panel (phases, ETA).
+        # The contract is non-interactive: base model is required, which the
+        # start button already validates.
+        if "--agent" not in cmd:
+            self._append_agent_args(
+                cmd, self._var_output_dir.get().strip())
         return cmd
 
     def _update_cmd_preview(self):
@@ -977,6 +1322,13 @@ class ReforgeDashboard:
                     "No dataset",
                     "Select a .parquet file or enter a HuggingFace dataset ID.")
                 return
+            base = self._var_base_model.get().strip()
+            if not base:
+                messagebox.showwarning(
+                    "No base model",
+                    "Select a base model — the dashboard launches training in "
+                    "agent mode, which is non-interactive.")
+                return
 
             dataset_path = ds or hf
             # Local file goes as the positional arg; hub ID via --hf_dataset.
@@ -1023,6 +1375,9 @@ class ReforgeDashboard:
         self._live_ax.clear()
         self._reset_live_axes(title="Starting…")
         self._live_canvas.draw_idle()
+        self._prog_stage_total = None
+        self._prog_stage_done = 0
+        self._reset_progress()
 
         try:
             env = os.environ.copy()
@@ -1077,6 +1432,19 @@ class ReforgeDashboard:
                 line = raw.decode("utf-8", errors="replace")
                 if any(p in line for p in self._SUPPRESS_PATTERNS):
                     continue
+                stripped = line.strip()
+                if stripped.startswith("{") and stripped.endswith("}"):
+                    try:
+                        obj = json.loads(stripped)
+                    except Exception:
+                        obj = None
+                    if isinstance(obj, dict) and "event" in obj:
+                        # Agent-mode NDJSON event: drives the progress panel.
+                        # (Step events contain "loss", so this check must run
+                        # before the loss-dict filter below.)
+                        self._line_queue.put(("agent_event", obj))
+                        self._write_line(sys.stdout, line)
+                        continue
                 # Loss dicts are consumed from stderr (LossLineLogger) with
                 # line integrity; echoing the stdout copies here would
                 # double-count chart points, so filter them on this side.
@@ -1184,6 +1552,9 @@ class ReforgeDashboard:
             while True:
                 try:
                     entry = self._line_queue.get_nowait()
+                    if isinstance(entry, tuple) and entry[0] == "agent_event":
+                        self._apply_agent_event_safe(entry[1])
+                        continue
                     self._live_logs.append(entry)
                     dirty = True
                 except queue.Empty:
@@ -1191,6 +1562,8 @@ class ReforgeDashboard:
 
             if dirty:
                 self._refresh_live_chart()
+
+            self._progress_tick()
 
             if self._proc is not None:
                 retcode = self._proc.poll()
@@ -1209,6 +1582,33 @@ class ReforgeDashboard:
             # Always reschedule, even if a tick threw — a broken after-chain
             # used to freeze the live chart permanently.
             self.root.after(250, self._tick)
+
+    def _progress_tick(self):
+        """250 ms animation/refresh for the progress panel.
+
+        Sweeps the indeterminate bar during load/merge phases, spins the
+        active phase marker, and keeps [elapsed<ETA] fresh between step
+        events (a 25 s wall-clock gap between events would otherwise make
+        the ETA read stale).
+        """
+        p = self._prog
+        if not p["phase"] or p["done"] or p["failed"]:
+            return
+        try:
+            p["spinner"] = (p["spinner"] + 1) % len(self._SPINNER_FRAMES)
+            active = self._phase_labels.get(p["phase"])
+            if active:
+                frame = self._SPINNER_FRAMES[p["spinner"]]
+                active.configure(
+                    text=f"{frame}  {self._PHASE_TITLES[p['phase']]}")
+            indeterminate = not (p["phase"] == "train" and p["total"])
+            if indeterminate:
+                p["sweep"] = (p["sweep"] + 0.012) % 1.0
+                self._render_progress()
+            elif p["phase"] == "train" and p["total"]:
+                self._update_prog_labels()
+        except Exception:
+            pass
 
     # ── Live chart ────────────────────────────────────────────────────
 
