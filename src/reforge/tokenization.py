@@ -117,6 +117,55 @@ def _completion_text_of(*completions) -> str:
     return best
 
 
+def _find_content_start(full_ids, content, tokenizer) -> "int | None":
+    """Index of the assistant content's first token inside full_ids, or None.
+
+    Anchors on the encoded content text itself (full match first, then a
+    short prefix), scanning from the end: templates may repeat prompt text
+    inside the conversation, but the assistant content occurrence is the
+    last one. Overlong rows are dropped upstream, so the content is always
+    present in full (nothing truncated it away).
+    """
+    if not content:
+        return None
+    try:
+        ids = tokenizer.encode(content, add_special_tokens=False)
+    except Exception:
+        return None
+    if not ids:
+        return None
+    for anchor in (ids, ids[:8]):
+        n = len(anchor)
+        for i in range(len(full_ids) - n, -1, -1):
+            if full_ids[i:i + n] == anchor:
+                return i
+    return None
+
+
+def _align_boundary(full_ids, prompt_ids, content, tokenizer) -> int:
+    """Token index in full_ids where assistant supervision should start.
+
+    Primary technique: the prompt render (add_generation_prompt=True) is a
+    token-prefix of the full render — true for most templates — so the mask
+    boundary is simply its length. That is VERIFIED here, because a
+    length-only boundary silently mis-masks when BPE merges across the seam:
+    a SentencePiece '▁' can fuse the prompt's trailing space into the
+    answer's first token (Llama-2 / Mistral-v1 family), and Qwen3-style
+    think scaffolds tokenize differently solo ('\\n') vs in context
+    ('\\n\\n'). The same prefix-length blind spot is why TRL anchors on
+    response_template token ids instead. On mismatch, fall back to a
+    token-level search for the assistant content; if even that fails, keep
+    the historical length boundary (best effort).
+    """
+    boundary = len(prompt_ids)
+    if prompt_ids and full_ids[:boundary] == list(prompt_ids):
+        return boundary
+    start = _find_content_start(full_ids, content, tokenizer)
+    if start is not None and 0 < start < len(full_ids):
+        return start
+    return boundary
+
+
 def _decode_image(raw):
     if isinstance(raw, PILImage.Image):
         return raw.convert("RGB")
@@ -183,28 +232,32 @@ def tokenize(example, tokenizer, training_mode="sft", max_length=750, processor=
                 if messages[i].get("role") == "assistant":
                     last_assistant = i
                     break
-        if messages and last_assistant is not None:
+        if (messages and last_assistant is not None
+                and getattr(tokenizer, "chat_template", None)):
+            # Tokenize fully first: right-truncation would cut the trailing
+            # <|im_end|> off long assistant turns, teaching the model to
+            # never stop. Overlong rows are dropped instead (see below).
             full_tokens = tokenizer.apply_chat_template(
                 messages,
                 tokenize=True,
                 add_generation_prompt=False,
-                truncation=True,
-                max_length=max_length,
                 return_dict=True,
             )
             input_ids = full_tokens["input_ids"]
             attention_mask = full_tokens.get("attention_mask", [1] * len(input_ids))
+            if len(input_ids) > max_length:
+                return {"input_ids": [], "attention_mask": [], "labels": [], "length": len(input_ids)}
 
             # Everything before the final assistant message is the prompt.
             prompt_tokens = tokenizer.apply_chat_template(
                 messages[:last_assistant],
                 tokenize=True,
                 add_generation_prompt=True,
-                truncation=True,
-                max_length=max_length,
                 return_dict=True,
             )
-            boundary = len(prompt_tokens["input_ids"])
+            boundary = _align_boundary(
+                input_ids, prompt_tokens["input_ids"],
+                messages[last_assistant].get("content"), tokenizer)
 
             # Sanity: boundary must leave some response tokens to train on.
             if boundary <= 0 or boundary >= len(input_ids):
@@ -212,7 +265,9 @@ def tokenize(example, tokenizer, training_mode="sft", max_length=750, processor=
                     _join_chat_text(messages), tokenizer, max_length)
                 boundary = 0
         else:
-            # No assistant turn - train causally on the flattened conversation.
+            # No assistant turn, or no chat template (template-less
+            # tokenizers would raise inside apply_chat_template) — train
+            # causally on the flattened conversation.
             input_ids, attention_mask = _causal_tokenize(
                 _join_chat_text(messages), tokenizer, max_length)
             boundary = 0
@@ -231,19 +286,26 @@ def tokenize(example, tokenizer, training_mode="sft", max_length=750, processor=
         text = example.get("text", "") or ""
         question, answer = split_sft_pair(text, str(example.get("question") or ""))
 
-        if question and answer:
-            # Tokenize the FULL conversation with chat template
+        # A chat template is required for the templated path: template-less
+        # tokenizers (e.g. Phi-2) would raise inside apply_chat_template and
+        # kill the whole .map(). They fall through to the causal branch.
+        if question and answer and getattr(tokenizer, "chat_template", None):
+            # Tokenize the FULL conversation with chat template first.
+            # Right-truncating at max_length would sever the trailing
+            # <|im_end|> on long assistant turns and teach the model to
+            # never stop; overlong rows are dropped instead (labels stay
+            # intact for every row that trains).
             full_tokens = tokenizer.apply_chat_template(
                 [{"role": "user", "content": question},
                  {"role": "assistant", "content": answer}],
                 tokenize=True,
                 add_generation_prompt=False,
-                truncation=True,
-                max_length=max_length,
                 return_dict=True,
             )
             input_ids = full_tokens["input_ids"]
             attention_mask = full_tokens.get("attention_mask", [1] * len(input_ids))
+            if len(input_ids) > max_length:
+                return {"input_ids": [], "attention_mask": [], "labels": [], "length": len(input_ids)}
 
             # Tokenize ONLY the user message (question) with same chat template to find boundary
             # This gives us the EXACT token count of the prompt portion
@@ -251,11 +313,10 @@ def tokenize(example, tokenizer, training_mode="sft", max_length=750, processor=
                 [{"role": "user", "content": question}],
                 tokenize=True,
                 add_generation_prompt=True,  # Include assistant prompt marker
-                truncation=True,
-                max_length=max_length,
                 return_dict=True,
             )
-            boundary = len(user_tokens["input_ids"])
+            boundary = _align_boundary(
+                input_ids, user_tokens["input_ids"], answer, tokenizer)
 
             # Sanity: boundary must leave some response tokens to train on
             if boundary <= 0 or boundary >= len(input_ids):
