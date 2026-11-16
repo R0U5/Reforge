@@ -319,6 +319,29 @@ Phase numbering = order of attack. Check off when done AND tested.
 - Committed on `feature/web-ui`. NOTE: `python -m reforge webui` requires
   PYTHONPATH=src or `pip install -e .` in the target env.
 
+### Session 2 — 2026-11-16 (template deep dive + fixes + PR #23)
+- Chat-template deep dive (user request): found and FIXED three real issues
+  (see commits d20f974, da9298e, d3fddf0):
+  1. Mask boundary was length-only — now `_align_boundary` verifies the
+     prompt render as a token-prefix of the full render and falls back to a
+     content-token anchor (verified live on Qwen3.5-9B: seam divergence at
+     `防`, token 198 vs 271). Empirical test script:
+     `%TEMP%\opencode\template_boundary_test.py` / `template_fix_test.py`.
+  2. Merged models had no `generation_config.eos_token_id` when the base
+     ships no generation_config.json → HF generate() never stops; pinned at
+     merge (`__main__.py`, only when None).
+  3. Template-less tokenizers (Phi-2) crashed `apply_chat_template` inside
+     `.map()`; SFT/chat now gate on `chat_template` → causal fallback + warn
+     (`tokenization.py` + `dataset.py`).
+- Committed the user's coherent WIP with permission: Qwen3.5 multimodal
+  loading + chunked CE + REFORGE_LR/REFORGE_GRAD_ACCUM overrides
+  (d3fddf0), overlong-row drop + template fixes (da9298e). `.bak` files
+  remain untracked.
+- Pushed `feature/web-ui`; opened **PR #23 stacked on #22**
+  (feature/batch-training → main). After #22 merges, re-target/merge #23.
+- Working tree now clean except untracked `.bak` files. Next: web UI
+  Phase 2 per §9.
+
 ### Session 0 — 2026-11-15
 - Researched reforge (backend, agent contract, Tk dashboard inventory) and
   Lethe's `ui.py` (stdlib server + inline SPA + Job snapshot + polling).
