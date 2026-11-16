@@ -484,6 +484,50 @@ class ReforgeDashboard:
                  justify="left").grid(row=2, column=0, columnspan=4,
                                       sticky="w", pady=(4, 0))
 
+        # – Batch –
+        c = self._card(cfg, "Batch", row, 0); row += 1
+        self._var_batch_mode = tk.BooleanVar()
+        ttk.Checkbutton(c, text="--batch    (sequential stages, chained merges)",
+                        variable=self._var_batch_mode, style="Flag.TCheckbutton",
+                        command=self._update_cmd_preview).grid(
+            row=0, column=0, columnspan=4, sticky="w", pady=2)
+        self._batch_stages: list[dict] = []
+        self._batch_manifest_path: str | None = None
+        lst = tk.Frame(c, bg=SURFACE)
+        lst.grid(row=1, column=0, columnspan=4, sticky="ew")
+        self._batch_list = tk.Listbox(
+            lst, height=4, font=(FONT_MONO, 8), bg="#14141c", fg="#cfd3ea",
+            relief="flat", bd=1, highlightthickness=1,
+            highlightbackground=SURFACE3, highlightcolor=ACCENT,
+            selectbackground=ROW, selectforeground=PRIMARY, activestyle="none")
+        self._batch_list.pack(side="left", fill="x", expand=True)
+        _bsb = ttk.Scrollbar(lst, orient="vertical",
+                             command=self._batch_list.yview)
+        _bsb.pack(side="right", fill="y")
+        self._batch_list.configure(yscrollcommand=_bsb.set)
+
+        _bb = tk.Frame(c, bg=SURFACE)
+        _bb.grid(row=2, column=0, columnspan=4, sticky="w", pady=(4, 0))
+        for text, cb in (("Add", self._batch_add), ("Edit", self._batch_edit),
+                         ("Remove", self._batch_remove), ("\u2191", lambda: self._batch_move(-1)),
+                         ("\u2193", lambda: self._batch_move(1))):
+            ttk.Button(_bb, text=text, width=7 if len(text) > 2 else 4,
+                       style="Card.TButton", command=cb).pack(side="left", padx=2)
+
+        _bm = tk.Frame(c, bg=SURFACE)
+        _bm.grid(row=3, column=0, columnspan=4, sticky="w", pady=(4, 0))
+        ttk.Button(_bm, text="Save Manifest", width=13, style="Card.TButton",
+                   command=self._batch_save).pack(side="left", padx=2)
+        ttk.Button(_bm, text="Load Manifest", width=13, style="Card.TButton",
+                   command=self._batch_load).pack(side="left", padx=2)
+        tk.Label(c, text="Stages run in order; each trains on the previous "
+                         "stage's merge (SFT \u2192 ... \u2192 DPO). Batch requires "
+                         "a Base Model; the final model is the last stage's "
+                         "merged/.",
+                 bg=SURFACE, fg=FAINT, font=(FONT, 8), wraplength=340,
+                 justify="left").grid(row=4, column=0, columnspan=4,
+                                      sticky="w", pady=(4, 0))
+
         # – Command preview –
         c = self._card(cfg, "Command Preview", row, 0); row += 1
         self._cmd_preview = tk.Text(
@@ -504,6 +548,7 @@ class ReforgeDashboard:
         for v in (self._var_force, self._var_latex, self._var_code, self._var_image,
                   self._var_dpo, self._var_dpo_beta):
             v.trace_add("write", lambda *_: self._update_cmd_preview())
+        self._var_batch_mode.trace_add("write", lambda *_: self._update_cmd_preview())
 
         # – Right: live chart –
         right = tk.Frame(paned, bg=BG)
@@ -570,9 +615,242 @@ class ReforgeDashboard:
         if p:
             self._var_dataset.set(p)
 
+    # ── Batch stage editor ────────────────────────────────────────────
+
+    def _batch_refresh(self):
+        self._batch_list.delete(0, tk.END)
+        for i, s in enumerate(self._batch_stages):
+            bits = [s.get("dataset") and os.path.basename(s["dataset"])
+                    or s.get("hf_dataset") or "?"]
+            flags = []
+            if s.get("epochs") is not None:
+                flags.append(f"ep={s['epochs']}")
+            if s.get("steps") is not None:
+                flags.append(f"steps={s['steps']}")
+            if s.get("force"):
+                flags.append("force")
+            if s.get("dpo"):
+                flags.append("dpo")
+            if s.get("dpo_beta") is not None:
+                flags.append(f"beta={s['dpo_beta']}")
+            for k in ("latex", "code"):
+                if s.get(k):
+                    flags.append(k)
+            label = f"{i + 1:02d}. {bits[0]}"
+            if s.get("name"):
+                label += f"  [{s['name']}]"
+            if flags:
+                label += "  (" + ", ".join(flags) + ")"
+            self._batch_list.insert(tk.END, label)
+        self._update_cmd_preview()
+
+    def _batch_add(self):
+        self._stage_dialog(None)
+
+    def _batch_edit(self):
+        sel = self._batch_list.curselection()
+        if not sel:
+            messagebox.showinfo("Batch", "Select a stage to edit (or Add a new one).")
+            return
+        self._stage_dialog(sel[0])
+
+    def _batch_remove(self):
+        sel = self._batch_list.curselection()
+        if not sel:
+            return
+        del self._batch_stages[sel[0]]
+        self._batch_refresh()
+
+    def _batch_move(self, delta):
+        sel = self._batch_list.curselection()
+        if not sel:
+            return
+        i = sel[0]
+        j = i + delta
+        if not (0 <= j < len(self._batch_stages)):
+            return
+        self._batch_stages[i], self._batch_stages[j] = \
+            self._batch_stages[j], self._batch_stages[i]
+        self._batch_refresh()
+        self._batch_list.selection_set(j)
+
+    def _stage_dialog(self, index: int | None):
+        stage = dict(self._batch_stages[index]) if index is not None else {}
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Stage" if index is not None else "Add stage")
+        dlg.configure(bg=SURFACE, padx=12, pady=10)
+        dlg.transient(self.root)
+        dlg.grab_set()
+        dlg.resizable(False, False)
+
+        def _row(r, label, widget):
+            tk.Label(dlg, text=label, bg=SURFACE, fg=TEXT,
+                     font=(FONT, 9)).grid(row=r, column=0, sticky="w", pady=2)
+            widget.grid(row=r, column=1, sticky="ew", padx=(8, 0))
+
+        v_ds = tk.StringVar(value=stage.get("dataset", ""))
+        v_hf = tk.StringVar(value=stage.get("hf_dataset", ""))
+        v_name = tk.StringVar(value=stage.get("name", ""))
+        v_ep = tk.StringVar(value="" if stage.get("epochs") is None else str(stage["epochs"]))
+        v_steps = tk.StringVar(value="" if stage.get("steps") is None else str(stage["steps"]))
+        v_beta = tk.StringVar(value="" if stage.get("dpo_beta") is None else str(stage["dpo_beta"]))
+        v_force = tk.BooleanVar(value=bool(stage.get("force")))
+        v_dpo = tk.BooleanVar(value=bool(stage.get("dpo")))
+        v_latex = tk.BooleanVar(value=bool(stage.get("latex")))
+        v_code = tk.BooleanVar(value=bool(stage.get("code")))
+
+        _row(0, "Dataset (.parquet)", ttk.Entry(dlg, textvariable=v_ds, width=34,
+                                                style="Field.TEntry"))
+        ttk.Button(dlg, text="…", width=3, style="Card.TButton",
+                   command=lambda: self._browse_to(v_ds, "*.parquet")).grid(
+            row=0, column=2, padx=(4, 0))
+        _row(1, "HF Dataset ID", ttk.Entry(dlg, textvariable=v_hf, width=34,
+                                           style="Field.TEntry"))
+        _row(2, "Name", ttk.Entry(dlg, textvariable=v_name, width=34,
+                                  style="Field.TEntry"))
+        _row(3, "Epochs (blank = 1)", ttk.Entry(dlg, textvariable=v_ep, width=10,
+                                                style="Field.TEntry"))
+        _row(4, "Steps (blank = epochs)", ttk.Entry(dlg, textvariable=v_steps, width=10,
+                                                    style="Field.TEntry"))
+        _row(5, "DPO Beta (blank = 0.1)", ttk.Entry(dlg, textvariable=v_beta, width=10,
+                                                    style="Field.TEntry"))
+        checks = ttk.Frame(dlg, bg=SURFACE)
+        checks.grid(row=6, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        for col, (text, var) in enumerate((("force", v_force), ("dpo", v_dpo),
+                                           ("latex", v_latex), ("code", v_code))):
+            ttk.Checkbutton(checks, text=text, variable=var,
+                            style="Flag.TCheckbutton").grid(row=0, column=col, padx=4)
+
+        def _ok():
+            ds = v_ds.get().strip()
+            hf = v_hf.get().strip()
+            if not ds and not hf:
+                messagebox.showwarning("Stage", "Dataset path or HF dataset ID is required.",
+                                       parent=dlg)
+                return
+            if ds and not os.path.isfile(ds):
+                messagebox.showwarning("Stage", f"Dataset not found:\n{ds}", parent=dlg)
+                return
+            stage_new = dict(stage)  # preserve unknown keys
+            if ds:
+                stage_new["dataset"] = ds
+            else:
+                stage_new.pop("dataset", None)
+            if hf:
+                stage_new["hf_dataset"] = hf
+            else:
+                stage_new.pop("hf_dataset", None)
+            name = v_name.get().strip()
+            if name:
+                stage_new["name"] = name
+            elif "name" in stage_new and index is None:
+                stage_new.pop("name", None)
+            for var, key, cast in ((v_ep, "epochs", int), (v_steps, "steps", int),
+                                   (v_beta, "dpo_beta", float)):
+                raw = var.get().strip()
+                if raw:
+                    try:
+                        val = cast(raw)
+                    except ValueError:
+                        messagebox.showwarning("Stage", f"{key} must be a number.",
+                                               parent=dlg)
+                        return
+                    stage_new[key] = val
+                else:
+                    stage_new.pop(key, None)
+            for var, key in ((v_force, "force"), (v_dpo, "dpo"),
+                             (v_latex, "latex"), (v_code, "code")):
+                if var.get():
+                    stage_new[key] = True
+                else:
+                    stage_new.pop(key, None)
+            if index is None:
+                self._batch_stages.append(stage_new)
+            else:
+                self._batch_stages[index] = stage_new
+            self._batch_refresh()
+            dlg.destroy()
+
+        ttk.Button(dlg, text="OK", style="Accent.TButton", command=_ok).grid(
+            row=7, column=0, columnspan=2, sticky="e", pady=(10, 0))
+        ttk.Button(dlg, text="Cancel", style="Card.TButton",
+                   command=dlg.destroy).grid(row=7, column=2, sticky="w", pady=(10, 0))
+        dlg.columnconfigure(1, weight=1)
+
+    def _browse_to(self, var: tk.StringVar, pattern: str):
+        p = filedialog.askopenfilename(filetypes=[("Parquet files", pattern), ("All", "*.*")])
+        if p:
+            var.set(p)
+
+    def _batch_save(self):
+        if not self._batch_stages:
+            messagebox.showwarning("Batch", "No stages to save.")
+            return
+        default = self._batch_manifest_path or os.path.join(
+            self._var_output_dir.get().strip() or self._DEFAULTS["output_dir"],
+            "batch_manifest.json")
+        p = filedialog.asksaveasfilename(
+            defaultextension=".json", initialfile=os.path.basename(default),
+            initialdir=os.path.dirname(default) or ".",
+            filetypes=[("JSON manifest", "*.json")])
+        if not p:
+            return
+        manifest = {"base_model": self._var_base_model.get().strip() or None,
+                    "stages": self._batch_stages}
+        if not manifest["base_model"]:
+            manifest.pop("base_model")
+        try:
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump(manifest, f, indent=2)
+        except Exception as e:
+            messagebox.showerror("Batch", f"Save failed: {e}")
+            return
+        self._batch_manifest_path = p
+        self._update_cmd_preview()
+
+    def _batch_load(self):
+        p = filedialog.askopenfilename(
+            filetypes=[("JSON manifest", "*.json"), ("All", "*.*")])
+        if not p:
+            return
+        try:
+            with open(p, "r", encoding="utf-8-sig") as f:
+                manifest = json.load(f)
+        except Exception as e:
+            messagebox.showerror("Batch", f"Load failed: {e}")
+            return
+        stages = manifest.get("stages")
+        if not isinstance(stages, list) or not stages:
+            messagebox.showwarning("Batch", "Manifest has no 'stages' list.")
+            return
+        self._batch_stages = [s for s in stages if isinstance(s, dict)]
+        self._batch_manifest_path = p
+        base = manifest.get("base_model")
+        if base and not self._var_base_model.get().strip():
+            self._var_base_model.set(str(base))
+        self._var_batch_mode.set(True)
+        self._batch_refresh()
+
+    def _build_batch_cmd(self, preview: bool = False) -> list[str]:
+        base = self._var_base_model.get().strip()
+        path = self._batch_manifest_path
+        if preview:
+            path = path or f"<manifest: {len(self._batch_stages)} stages - Save Manifest first>"
+        cmd = [sys.executable, "-m", "reforge", "--batch", path]
+        if base:
+            cmd += ["--base_model", base]
+        od = self._var_output_dir.get().strip()
+        if od:
+            cmd += ["--output_dir", od]
+        if "--no_tqdm" not in cmd:
+            cmd.append("--no_tqdm")
+        return cmd
+
     # ── Command construction ──────────────────────────────────────────
 
     def _build_cmd(self) -> list[str]:
+        if self._var_batch_mode.get():
+            return self._build_batch_cmd(preview=True)
         cmd = [sys.executable, "-m", "reforge"]
         base = self._var_base_model.get().strip()
         if base:
@@ -656,48 +934,84 @@ class ReforgeDashboard:
             messagebox.showwarning("Busy", "A training run is already active.")
             return
 
-        ds = self._var_dataset.get().strip()
-        hf = self._var_hf_dataset.get().strip()
-        if not ds and not hf:
-            messagebox.showwarning(
-                "No dataset",
-                "Select a .parquet file or enter a HuggingFace dataset ID.")
-            return
-
-        dataset_path = ds or hf
-        # Local file goes as the positional arg; hub ID via --hf_dataset.
-        if ds:
-            if not os.path.exists(ds):
-                messagebox.showwarning("File not found",
-                                       f"Dataset path does not exist:\n{ds}")
+        if self._var_batch_mode.get():
+            if not self._batch_stages:
+                messagebox.showwarning(
+                    "Batch", "No stages configured. Add stages or untick "
+                             "--batch for a single-dataset run.")
                 return
-            if not ds.lower().endswith(".parquet"):
-                messagebox.showwarning("Invalid file",
-                                       "Local dataset must be a .parquet file.")
+            base = self._var_base_model.get().strip()
+            if not base:
+                messagebox.showwarning(
+                    "Batch", "Batch mode requires a Base Model (stage 1's base; "
+                             "batch never chains from a previous merged/).")
                 return
-
-        try:
-            epoch = self._parse_int_field(self._var_epoch, "Epochs") or 1
-            steps = self._parse_int_field(self._var_steps, "Fixed Steps")
-            batch = self._parse_int_field(self._var_batch, "Batch size")
-            grad  = self._parse_int_field(self._var_grad, "Grad. accumulation")
-        except ValueError:
-            return
-
-        dpo_beta_raw = self._var_dpo_beta.get().strip()
-        if dpo_beta_raw:
+            if not os.path.exists(base):
+                messagebox.showwarning("Batch", f"Base model not found:\n{base}")
+                return
+            for i, s in enumerate(self._batch_stages):
+                if not s.get("dataset") and not s.get("hf_dataset"):
+                    messagebox.showwarning("Batch", f"Stage {i + 1} has no dataset.")
+                    return
+                if s.get("dataset") and not os.path.isfile(s["dataset"]):
+                    messagebox.showwarning("Batch",
+                                           f"Stage {i + 1} dataset not found:\n{s['dataset']}")
+                    return
+            if not self._batch_manifest_path:
+                od = self._var_output_dir.get().strip() or self._DEFAULTS["output_dir"]
+                os.makedirs(od, exist_ok=True)
+                self._batch_manifest_path = os.path.join(od, "batch_manifest.json")
+            manifest = {"base_model": base, "stages": self._batch_stages}
             try:
-                dpo_beta = float(dpo_beta_raw)
-            except ValueError:
-                messagebox.showwarning(
-                    "Invalid value", f"DPO Beta must be a number (got {dpo_beta_raw!r}).")
+                with open(self._batch_manifest_path, "w", encoding="utf-8") as f:
+                    json.dump(manifest, f, indent=2)
+            except Exception as e:
+                messagebox.showerror("Batch", f"Manifest write failed: {e}")
                 return
-            if dpo_beta <= 0:
+            cmd = self._build_batch_cmd()
+        else:
+            ds = self._var_dataset.get().strip()
+            hf = self._var_hf_dataset.get().strip()
+            if not ds and not hf:
                 messagebox.showwarning(
-                    "Invalid value", f"DPO Beta must be > 0 (got {dpo_beta}).")
+                    "No dataset",
+                    "Select a .parquet file or enter a HuggingFace dataset ID.")
                 return
 
-        cmd = self._build_cmd()
+            dataset_path = ds or hf
+            # Local file goes as the positional arg; hub ID via --hf_dataset.
+            if ds:
+                if not os.path.exists(ds):
+                    messagebox.showwarning("File not found",
+                                           f"Dataset path does not exist:\n{ds}")
+                    return
+                if not ds.lower().endswith(".parquet"):
+                    messagebox.showwarning("Invalid file",
+                                           "Local dataset must be a .parquet file.")
+                    return
+
+            try:
+                epoch = self._parse_int_field(self._var_epoch, "Epochs") or 1
+                steps = self._parse_int_field(self._var_steps, "Fixed Steps")
+                batch = self._parse_int_field(self._var_batch, "Batch size")
+                grad  = self._parse_int_field(self._var_grad, "Grad. accumulation")
+            except ValueError:
+                return
+
+            dpo_beta_raw = self._var_dpo_beta.get().strip()
+            if dpo_beta_raw:
+                try:
+                    dpo_beta = float(dpo_beta_raw)
+                except ValueError:
+                    messagebox.showwarning(
+                        "Invalid value", f"DPO Beta must be a number (got {dpo_beta_raw!r}).")
+                    return
+                if dpo_beta <= 0:
+                    messagebox.showwarning(
+                        "Invalid value", f"DPO Beta must be > 0 (got {dpo_beta}).")
+                    return
+
+            cmd = self._build_cmd()
 
         self._live_logs.clear()
         while not self._line_queue.empty():

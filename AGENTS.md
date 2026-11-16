@@ -122,6 +122,8 @@ kill (see `pid` in run_state.json), or diagnose failures.
 | `tokenizer_load_failed` | install `sentencepiece`/`tiktoken`, or check the model's tokenizer files |
 | `missing_dependency` | install the required extra (e.g. `pip install trl` for DPO) |
 | `unknown_args` | unrecognized CLI flag (typo); see `--agent-schema` for valid flags |
+| `batch_manifest_invalid` | `--batch` arg is not a valid manifest/parquet list; check the JSON or dataset paths |
+| `batch_stage_failed` | a batch stage's child run failed; see `stage_failed` for the stage's own error_code |
 
 Unknown failures emit the message only. `hint` contains the remediation.
 
@@ -166,9 +168,40 @@ with the same math as the real run, without loading weights. Exit 0 = safe
 to launch; exit 2 = fix the listed errors first.
 
 Dry-run is non-interactive and requires `--base_model` + dataset, just like
-agent mode.
+agent mode. For batch runs, `--dry_run --batch manifest.json --base_model X`
+validates every stage and prints a per-stage plan array.
 
-## 8. Artifacts (all under `--output_dir`, default `~/Reforge_Output`)
+## 8. Batch mode: multiple datasets, chained merges
+
+```bash
+reforge --agent --batch sft1.parquet sft2.parquet pairs.parquet --base_model ~/HF_Models/phi-2
+reforge --agent --batch manifest.json --base_model ~/HF_Models/phi-2
+```
+
+Stages train **in order**; stage N trains on stage N-1's merged model. The
+last stage's merged dir is the final output. A stage whose dataset has
+`chosen`+`rejected` columns trains as DPO automatically.
+
+- **Base model is required** (`--base_model` or manifest `base_model`):
+  batch never chains from a stale `merged/` silently.
+- **Manifest** (single `.json` arg): `{"base_model": ..., "stages":
+  [{"dataset": ..., "epochs": 2}, {"dataset": ..., "code": true,
+  "steps": 300}, {"dataset": ..., "dpo_beta": 0.1}]}`. Stage keys mirror CLI
+  flags. Full spec: `reforge --agent-schema` -> `batch_mode`.
+- **Events**: `batch_started` -> (`stage_started` -> `stage_completed`)* ->
+  `batch_complete` (or `stage_failed`/`batch_interrupted`). In agent mode,
+  `<batch_dir>/run_state.json` tracks the batch; each stage also writes its
+  own `<batch_dir>/stage_0N/run_state.json` and `agent.ndjson` — poll those
+  for per-step loss during a stage.
+- **Resume**: Ctrl+C interrupts cleanly (the running stage saves its
+  adapter). Rerun with `--batch_dir <batch_dir>` to skip completed stages
+  and resume the interrupted one from its checkpoint. A stage whose merge
+  was interrupted (no `success.txt`) is wiped and restarted automatically.
+- **Disk**: stage N-1's merged is deleted once stage N completes (the
+  running stage only ever needs its predecessor). `"keep_stage_merges":
+  true` in the manifest keeps everything.
+
+## 9. Artifacts (all under `--output_dir`, default `~/Reforge_Output`)
 
 | Path | Meaning |
 |------|---------|
@@ -181,10 +214,19 @@ agent mode.
 | `merged/` | final merged model + tokenizer + `training_report.json` |
 | `merged/success.txt` | merge marker; when present the NEXT run uses `merged/` as base |
 
+Batch mode adds, under the batch dir:
+
+| Path | Meaning |
+|------|---------|
+| `batch_state.json` | per-stage status; the resume anchor (rewrite-atomic) |
+| `stage_01/` … `stage_0N/` | one complete reforge output dir per stage |
+| `stage_0N/agent.ndjson` | the stage's full NDJSON event stream (per-step loss lives here) |
+| `stage_0N/merged/` | the stage's merged model = next stage's base |
+
 Agents should check for `merged/success.txt` / `checkpoint-last` before
 launching — they silently change what the next run does (resume / chain).
 
-## 9. Conventions for changing Reforge itself
+## 10. Conventions for changing Reforge itself
 
 - Keep agent output machine-parseable: never print pretty text to stdout in
   agent mode; use `_info/_ok/_warn/_err/_banner` (they divert to stderr).
