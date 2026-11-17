@@ -250,7 +250,16 @@ Phase numbering = order of attack. Check off when done AND tested.
       (port `_build_cmd` + `_build_batch_cmd` from dashboard.py; append
       `--no_tqdm --agent --agent_log <out>/agent.ndjson`; create out dir;
       validate: base model + dataset required, .parquet exists, ints ≥ 1,
-      dpo_beta > 0). Unify candidate for the Tk dashboard later (D9).
+      dpo_beta > 0). ~~Unify candidate for the Tk dashboard later (D9).~~
+      → **Unified 2026-11-17**: the Tk dashboard now delegates to
+      `build_argv` via `ReforgeDashboard._collect_params`
+      (strict=False for the live preview, strict=True + optional
+      `manifest_path` for Start); `_build_cmd`/`_build_batch_cmd`/
+      `_append_agent_args`/`_parse_int_field` and the duplicated
+      `_start_training` validation block were removed. Smoke-tested the
+      real dashboard class (window withdrawn): preview incl.
+      incomplete-form message, all validation paths, fake-Popen happy
+      path, batch manifest default + custom Save-Manifest path.
 - [x] Wire `_spawn` in webui.py to it (real Popen with the readers/reaper)
 - [x] `POST /api/preview` returning the argv without launching (strict=False)
 - [x] Bonus: `GET /api/models` (scans `~/HF_Models` + HF hub cache for the
@@ -438,5 +447,6 @@ Phase numbering = order of attack. Check off when done AND tested.
 2. README: add the web UI to the dashboard section + structure tree
    (`reforge webui`, port 7861, agent-mode child).
 3. Optional follow-ups: manual browser pass (success + failure paths);
-   unify webui_config.build_argv with dashboard.py's builders (D9);
    `/api/import` if offline analysis is ever wanted.
+   ~~unify webui_config.build_argv with dashboard.py's builders (D9)~~ →
+   **done 2026-11-17**: dashboard.py delegates to build_argv (see Phase 2).

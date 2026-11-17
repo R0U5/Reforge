@@ -1157,82 +1157,45 @@ class ReforgeDashboard:
         self._var_batch_mode.set(True)
         self._batch_refresh()
 
-    def _append_agent_args(self, cmd: list[str], out_dir: str) -> None:
-        """Launch the child in agent mode so the dashboard gets NDJSON events.
+    def _collect_params(self) -> dict:
+        """Form state -> the shared ``build_argv`` params dict.
 
-        The event stream drives the progress panel (phases, step/total, ETA).
-        The tee file is the durable copy for post-run analysis.
+        D9: this is the single source of truth for command construction in
+        both UIs; the Tk dashboard no longer duplicates the argv builder or
+        the start validations (``webui_config.build_argv``).
         """
-        out_dir = out_dir or self._DEFAULTS["output_dir"]
-        try:
-            os.makedirs(out_dir, exist_ok=True)
-        except Exception:
-            pass
-        cmd += ["--agent", "--agent_log", os.path.join(out_dir, "agent.ndjson")]
-
-    def _build_batch_cmd(self, preview: bool = False) -> list[str]:
-        base = self._var_base_model.get().strip()
-        path = self._batch_manifest_path
-        if preview:
-            path = path or f"<manifest: {len(self._batch_stages)} stages - Save Manifest first>"
-        cmd = [sys.executable, "-m", "reforge", "--batch", path]
-        if base:
-            cmd += ["--base_model", base]
-        od = self._var_output_dir.get().strip()
-        if od:
-            cmd += ["--output_dir", od]
-        if "--no_tqdm" not in cmd:
-            cmd.append("--no_tqdm")
-        if "--agent" not in cmd:
-            self._append_agent_args(cmd, od)
-        return cmd
+        p = {
+            "base_model": self._var_base_model.get().strip(),
+            "output_dir": self._var_output_dir.get().strip(),
+            "dataset": self._var_dataset.get().strip(),
+            "hf_dataset": self._var_hf_dataset.get().strip(),
+            "epoch": self._var_epoch.get().strip(),
+            "steps": self._var_steps.get().strip(),
+            "batch_size": self._var_batch.get().strip(),
+            "grad_accum": self._var_grad.get().strip(),
+            "force": self._var_force.get(),
+            "latex": self._var_latex.get(),
+            "code": self._var_code.get(),
+            "image": self._var_image.get(),
+            "dpo": self._var_dpo.get(),
+            "dpo_beta": self._var_dpo_beta.get().strip(),
+        }
+        if self._var_batch_mode.get():
+            p["stages"] = [dict(s) for s in self._batch_stages]
+        return p
 
     # ── Command construction ──────────────────────────────────────────
 
     def _build_cmd(self) -> list[str]:
-        if self._var_batch_mode.get():
-            return self._build_batch_cmd(preview=True)
-        cmd = [sys.executable, "-m", "reforge"]
-        base = self._var_base_model.get().strip()
-        if base:
-            cmd += ["--base_model", base]
-        hf = self._var_hf_dataset.get().strip()
-        ds = self._var_dataset.get().strip()
-        if ds:
-            cmd += [ds]                      # positional dataset (local file)
-        if hf:
-            cmd += ["--hf_dataset", hf]      # hub ID stays on its own flag
-        epoch = self._var_epoch.get().strip()
-        if epoch:
-            cmd += ["--epoch", epoch]
-        steps = self._var_steps.get().strip()
-        if steps:
-            cmd += ["--steps", steps]
-        batch = self._var_batch.get().strip()
-        if batch:
-            cmd += ["--batch_size", batch]
-        grad = self._var_grad.get().strip()
-        if grad:
-            cmd += ["--grad_accum", grad]
-        if self._var_force.get():  cmd.append("--force")
-        if self._var_latex.get():  cmd.append("--latex")
-        if self._var_code.get():   cmd.append("--code")
-        if self._var_image.get():  cmd.append("--image")
-        if self._var_dpo.get():    cmd.append("--dpo")
-        dpo_beta = self._var_dpo_beta.get().strip()
-        if dpo_beta:
-            cmd += ["--dpo_beta", dpo_beta]
-        # --no_tqdm removes the bar; loss rows arrive on stderr
-        # via the trainers LossLineLogger instead (crash-proof).
-        if "--no_tqdm" not in cmd:
-            cmd.append("--no_tqdm")
-        # Agent mode feeds the dashboard's progress panel (phases, ETA).
-        # The contract is non-interactive: base model is required, which the
-        # start button already validates.
-        if "--agent" not in cmd:
-            self._append_agent_args(
-                cmd, self._var_output_dir.get().strip())
-        return cmd
+        """Preview argv (strict=False: no filesystem checks while typing)."""
+        from .webui_config import build_argv
+        try:
+            return build_argv(self._collect_params(), strict=False,
+                              manifest_path=self._batch_manifest_path or None)
+        except ValueError as e:
+            # Form incomplete/invalid: show the reason where the command
+            # would be (the web UI preview behaves the same).
+            return [f"(incomplete form) {e}"]
 
     def _update_cmd_preview(self):
         cmd = self._build_cmd()
@@ -1254,21 +1217,6 @@ class ReforgeDashboard:
         self._cmd_preview.insert("1.0", text)
         self._cmd_preview.configure(state="disabled")
 
-    def _parse_int_field(self, var: tk.StringVar, name: str) -> int | None:
-        """Blank → None (backend default); else validated int ≥ 1."""
-        raw = var.get().strip()
-        if not raw:
-            return None
-        try:
-            val = int(raw)
-        except ValueError:
-            messagebox.showwarning("Invalid value", f"{name} must be an integer (got {raw!r}).")
-            raise ValueError(name)
-        if val < 1:
-            messagebox.showwarning("Invalid value", f"{name} must be \u2265 1 (got {val}).")
-            raise ValueError(name)
-        return val
-
     def _set_status(self, text, color=MUTED):
         self._lbl_status.configure(text=f"\u25cf  {text}", fg=color)
 
@@ -1279,91 +1227,24 @@ class ReforgeDashboard:
             messagebox.showwarning("Busy", "A training run is already active.")
             return
 
-        if self._var_batch_mode.get():
-            if not self._batch_stages:
-                messagebox.showwarning(
-                    "Batch", "No stages configured. Add stages or untick "
-                             "--batch for a single-dataset run.")
-                return
-            base = self._var_base_model.get().strip()
-            if not base:
-                messagebox.showwarning(
-                    "Batch", "Batch mode requires a Base Model (stage 1's base; "
-                             "batch never chains from a previous merged/).")
-                return
-            if not os.path.exists(base):
-                messagebox.showwarning("Batch", f"Base model not found:\n{base}")
-                return
-            for i, s in enumerate(self._batch_stages):
-                if not s.get("dataset") and not s.get("hf_dataset"):
-                    messagebox.showwarning("Batch", f"Stage {i + 1} has no dataset.")
-                    return
-                if s.get("dataset") and not os.path.isfile(s["dataset"]):
-                    messagebox.showwarning("Batch",
-                                           f"Stage {i + 1} dataset not found:\n{s['dataset']}")
-                    return
-            if not self._batch_manifest_path:
-                od = self._var_output_dir.get().strip() or self._DEFAULTS["output_dir"]
+        # D9: validation + argv construction are shared with the web UI.
+        # Keep Tk's Save-Manifest target: build_argv writes the manifest
+        # there (or to <out>/batch_manifest.json) on this strict build.
+        if self._var_batch_mode.get() and not self._batch_manifest_path:
+            od = self._var_output_dir.get().strip() or self._DEFAULTS["output_dir"]
+            try:
                 os.makedirs(od, exist_ok=True)
-                self._batch_manifest_path = os.path.join(od, "batch_manifest.json")
-            manifest = {"base_model": base, "stages": self._batch_stages}
-            try:
-                with open(self._batch_manifest_path, "w", encoding="utf-8") as f:
-                    json.dump(manifest, f, indent=2)
-            except Exception as e:
-                messagebox.showerror("Batch", f"Manifest write failed: {e}")
-                return
-            cmd = self._build_batch_cmd()
-        else:
-            ds = self._var_dataset.get().strip()
-            hf = self._var_hf_dataset.get().strip()
-            if not ds and not hf:
-                messagebox.showwarning(
-                    "No dataset",
-                    "Select a .parquet file or enter a HuggingFace dataset ID.")
-                return
-            base = self._var_base_model.get().strip()
-            if not base:
-                messagebox.showwarning(
-                    "No base model",
-                    "Select a base model — the dashboard launches training in "
-                    "agent mode, which is non-interactive.")
-                return
+            except Exception:
+                pass
+            self._batch_manifest_path = os.path.join(od, "batch_manifest.json")
 
-            dataset_path = ds or hf
-            # Local file goes as the positional arg; hub ID via --hf_dataset.
-            if ds:
-                if not os.path.exists(ds):
-                    messagebox.showwarning("File not found",
-                                           f"Dataset path does not exist:\n{ds}")
-                    return
-                if not ds.lower().endswith(".parquet"):
-                    messagebox.showwarning("Invalid file",
-                                           "Local dataset must be a .parquet file.")
-                    return
-
-            try:
-                epoch = self._parse_int_field(self._var_epoch, "Epochs") or 1
-                steps = self._parse_int_field(self._var_steps, "Fixed Steps")
-                batch = self._parse_int_field(self._var_batch, "Batch size")
-                grad  = self._parse_int_field(self._var_grad, "Grad. accumulation")
-            except ValueError:
-                return
-
-            dpo_beta_raw = self._var_dpo_beta.get().strip()
-            if dpo_beta_raw:
-                try:
-                    dpo_beta = float(dpo_beta_raw)
-                except ValueError:
-                    messagebox.showwarning(
-                        "Invalid value", f"DPO Beta must be a number (got {dpo_beta_raw!r}).")
-                    return
-                if dpo_beta <= 0:
-                    messagebox.showwarning(
-                        "Invalid value", f"DPO Beta must be > 0 (got {dpo_beta}).")
-                    return
-
-            cmd = self._build_cmd()
+        from .webui_config import build_argv
+        try:
+            cmd = build_argv(self._collect_params(), strict=True,
+                             manifest_path=self._batch_manifest_path or None)
+        except ValueError as e:
+            messagebox.showwarning("Invalid input", str(e))
+            return
 
         self._live_logs.clear()
         while not self._line_queue.empty():

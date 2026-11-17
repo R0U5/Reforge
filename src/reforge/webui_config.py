@@ -1,22 +1,16 @@
 """Argv builder + validation for the Web UI's child training processes.
 
-``build_argv(params)`` turns the JSON body of ``POST /api/start`` into the
-``python -m reforge ...`` command line the supervisor (webui.py) spawns.
-Validation failures raise ``ValueError`` with a message that is shown to
-the user verbatim.
+``build_argv(params)`` turns the JSON body of ``POST /api/start`` (or the Tk
+dashboard's form, via ``ReforgeDashboard._collect_params``) into the
+``python -m reforge ...`` command line the UIs spawn. Validation failures
+raise ``ValueError`` with a message that is shown to the user verbatim.
 
-This is the web port of the Tk dashboard's ``_build_cmd`` /
-``_build_batch_cmd`` / ``_start_training`` validation (D9: duplicate for
-now; unify once the web UI is at parity). Differences from the Tk flow,
-all deliberate:
-
-* No file dialogs. Batch manifests are written from the JSON body's
-  ``stages`` list into the output directory.
-* ``strict=False`` (used by ``POST /api/preview``) builds the same argv
-  without filesystem existence checks, so the preview works while typing.
-* The child always runs in agent mode (``--no_tqdm --agent --agent_log``)
-  — the supervisor consumes its stdout NDJSON stream (D10: the tee file
-  is the durable copy for post-run analysis, not read by the UI).
+This is the single source of truth for both UIs (D9: the Tk dashboard
+delegates here since the web UI landed). ``strict=False`` (used by both
+command previews) builds the same argv without filesystem existence
+checks, so the preview works while typing. ``manifest_path`` lets the Tk
+dashboard target its Save-Manifest choice; the default is
+``<output_dir>/batch_manifest.json``.
 """
 
 from __future__ import annotations
@@ -96,17 +90,8 @@ def _validate_stage_list(params: dict, strict: bool) -> "list | None":
     return stages
 
 
-def _write_batch_manifest(out_dir: str, base_model: str, stages: list) -> str:
-    path = os.path.join(out_dir, "batch_manifest.json")
-    manifest = {"base_model": base_model or None, "stages": stages}
-    if not manifest["base_model"]:
-        manifest.pop("base_model")
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(manifest, f, indent=2)
-    return path
-
-
-def build_argv(params: dict, strict: bool = True) -> "list[str]":
+def build_argv(params: dict, strict: bool = True,
+               manifest_path: "str | None" = None) -> "list[str]":
     """Validated child command line; raises ValueError on bad input."""
     if not isinstance(params, dict):
         raise ValueError("Request body must be a JSON object.")
@@ -132,8 +117,8 @@ def build_argv(params: dict, strict: bool = True) -> "list[str]":
                 "Select a .parquet file or enter a HuggingFace dataset ID.")
         if not base:
             raise ValueError(
-                "A Base Model is required — the web UI launches training in "
-                "agent mode, which is non-interactive.")
+                "A Base Model is required — the dashboard launches training "
+                "in agent mode, which is non-interactive.")
         if ds:
             if strict:
                 if not os.path.exists(ds):
@@ -148,8 +133,20 @@ def build_argv(params: dict, strict: bool = True) -> "list[str]":
 
     cmd = [sys.executable, "-m", "reforge"]
     if is_batch:
-        manifest_path = _write_batch_manifest(out_dir, base, stages)
-        cmd += ["--batch", manifest_path]
+        # Manifest path: the Tk Save-Manifest choice wins; otherwise the
+        # default lives in the output dir. Written on strict builds (a real
+        # start); a non-strict preview only shows where Start will save it.
+        path = manifest_path or os.path.join(out_dir, "batch_manifest.json")
+        if strict:
+            manifest = {"base_model": base or None, "stages": stages}
+            if not manifest["base_model"]:
+                manifest.pop("base_model")
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(manifest, f, indent=2)
+            except Exception as e:
+                raise ValueError(f"Manifest write failed: {e}") from None
+        cmd += ["--batch", path]
         if base:
             cmd += ["--base_model", base]
         if str(params.get("output_dir") or "").strip():
