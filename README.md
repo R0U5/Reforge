@@ -1,6 +1,6 @@
 # Reforge
 
-A modular LoRA fine-tuning pipeline for Hugging Face causal language models and vision-language models. Reforge handles dataset loading, automatic schema detection, text cleaning, tokenization, training with smart early stopping (SFT or DPO preference tuning), LoRA merge, and final model export. Includes a Tkinter dashboard for interactive control.
+A modular LoRA fine-tuning pipeline for Hugging Face causal language models and vision-language models. Reforge handles dataset loading, automatic schema detection, text cleaning, tokenization, training with smart early stopping (SFT or DPO preference tuning), LoRA merge, and final model export. Includes a Tkinter dashboard and a browser-based web UI for interactive control.
 
 ## Project Structure
 
@@ -19,7 +19,9 @@ src/reforge/
 ├── reporting.py         # Training summary, loss curves, reports
 ├── agent.py             # Agent mode: NDJSON events + run_state.json
 ├── utils.py             # Model scanner, file picker, GC
-└── dashboard.py           # Tkinter GUI — `reforge dashboard` (the only launch path)
+├── webui_config.py      # Web UI: argv builder + validation, model scan
+├── webui.py             # Web UI server + SPA — `reforge webui` (port 7861)
+└── dashboard.py         # Tkinter GUI — `reforge dashboard`
 ```
 
 `AGENTS.md` (repo root) is the orientation guide for AI agents working on or driving Reforge.
@@ -39,6 +41,9 @@ pip install -e ".[dashboard]"
 
 # Launch the GUI dashboard
 reforge dashboard
+
+# Or the browser-based web UI (http://127.0.0.1:7861)
+reforge webui
 
 # Specify a Hugging Face Hub dataset
 python -m reforge --hf_dataset username/dataset-name
@@ -191,6 +196,7 @@ Behavior:
 - **Post-training summary** — formatted report with loss statistics, trend, and unicode sparkline. Writes a full `training_report.json`.
 - **Tkinter dashboard** (`reforge dashboard`, `python -m reforge dashboard`, or `-m reforge.dashboard`) — config editor, start/stop, and a live loss chart. Includes a DPO card (force checkbox, beta field, and the SFT→DPO chain hint) and shows `rewards/accuracies` as an `acc` column in the training log during DPO runs.
 - **Dashboard progress panel** (tqdm/Docker-inspired) — the dashboard launches training in agent mode and renders the NDJSON event stream live: a `DATASET → MODEL → TRAIN → MERGE` phase tracker (Docker-pull-style segments with spinner/✓/✗ states), a progress bar with the percent caption, and a tqdm-style info line `step 450/1000 · 45% · [03:12<03:54 · 1.9 it/s]` plus an ETA chip. Indeterminate sweep animation while loading/merging; batch runs get a `STAGE k/N` chip that resets the bar per stage.
+- **Web UI** (`reforge webui` / `reforge ui`, or `python -m reforge webui --port 7861 --no-browser`) — a dependency-free local server (stdlib `http.server`) serving a single-page dashboard at `http://127.0.0.1:7861` with the same feature set as the Tk dashboard: config cards (paths, training, performance, flags/DPO, batch stage editor with reorder), a live command preview, start/stop with the same validations, the phase tracker + progress bar + stat chips, a canvas loss chart, the full loss analysis (grade/trend/SNR/exposure/ideal-zone), a console tail, and a results view fed by `training_report.json`. Launches the child in agent mode and consumes the same NDJSON event stream; no extra packages required.
 
 ### Agent mode
 - **Self-describing contract** — `reforge --agent-schema` (or `reforge agent-schema`) prints the complete machine-readable contract as one JSON object: CLI arguments, event vocabulary and fields, `run_state.json` keys, exit codes, error codes, dataset schemas, model profiles, artifact map, and an example session. Generated from the live argparse parser and pipeline constants, so it cannot drift. **Agents should call this first.**

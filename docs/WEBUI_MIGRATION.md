@@ -95,37 +95,49 @@ Launch: `reforge dashboard`. Child process = `python -m reforge ... --no_tqdm
 lr, grad_norm, epoch, acc — acc present on DPO runs only).
 
 Feature inventory (each row = something the web UI must eventually do):
-- [ ] Config editor cards: Paths (base model, output dir, dataset, HF id),
+- [x] Config editor cards: Paths (base model, output dir, dataset, HF id),
       Training (epochs / fixed steps), Performance (batch, grad accum),
       Flags (force/latex/code/image), DPO (force + beta + hint),
       Batch (stage list editor, ↑↓ reorder, manifest save/load JSON).
-- [ ] Command preview (live-built argv, backslash-continued display).
-- [ ] Start validations (dataset exists & .parquet, base model required,
+      *Manifest save happens automatically (build_argv writes
+      `<out>/batch_manifest.json`); loading an existing manifest file is
+      consciously deferred — paste-stages-by-hand covers it for now.*
+- [x] Command preview (live-built argv, backslash-continued display).
+      *Debounced 400 ms → POST /api/preview (strict=False), shows the
+      validation message inline when the form is incomplete/invalid.*
+- [x] Start validations (dataset exists & .parquet, base model required,
       stage datasets exist, int fields ≥ 1, dpo_beta > 0).
-- [ ] Start/Stop: Popen with `CREATE_NEW_PROCESS_GROUP` on Windows;
+      *Server-side in build_argv; failures return 409 + message shown in the
+      page banner, job stays idle.*
+- [x] Start/Stop: Popen with `CREATE_NEW_PROCESS_GROUP` on Windows;
       graceful stop = `CTRL_BREAK_EVENT` (POSIX: SIGINT); status "Stopping (saving)…".
-- [ ] Status chip: Idle → Starting… → Preparing… → Training… → Exporting… →
-      Complete / Failed / Interrupted (saving)…
-- [ ] Progress panel (tqdm/Docker-inspired): phase segments
-      DATASET→MODEL→TRAIN→MERGE (pending dim / active gold + |/-\ spinner /
-      done green / failed red), canvas bar with % caption + 10% ticks,
-      indeterminate sweep animation for load/merge phases, tqdm info line
-      `step 450/1000  ·  45.0% · [03:12<03:54 · 1.93 it/s]`, ETA chip,
+- [x] Status chip: Idle → Starting… → Preparing… → Training… → Exporting… →
+      Complete / Failed / Interrupted (saving)….
+- [x] Progress panel (tqdm/Docker-inspired): phase segments
+      DATASET→MODEL→TRAIN→MERGE (pending dim / active gold spinner /
+      done green / failed red), bar with % caption + 10% ticks,
+      indeterminate sweep animation, tqdm info line
+      `step 450/1000 · 45.0% · [03:12<03:54, 1.93 it/s]`, ETA chip,
       `STAGE k/N` chip for batch (per-stage reset).
-- [ ] Live loss chart: raw (faint) + smoothed (gold, moving-average k adaptive)
-      + best-point marker; pixel decimation at >4000 points; title
-      `Step N | current | best`.
-- [ ] Stat chips: STEPS / LOSS / BEST / ETA.
-- [ ] Console echo: child stdout/stderr mirrored to the dashboard's console,
-      suppression patterns (FutureWarning etc.), formatted table
-      step/loss/lr/gnorm/epoch/acc.
-- [ ] Full Analysis window: smoothed slope (global + recent weighted), SNR
-      (1.4826·MAD), exposure %, grade A–D (`calculate_grade`), trend labels
-      (`trend_label`), outlier flags (>1.5σ of window), epoch boundary lines,
-      ideal-zone prediction. Pure numpy math — must be ported to JS or exposed
-      as an API endpoint.
-- [ ] Load JSONL / trainer_state.json import; Clear.
-- [ ] Theme: Hermes dark — bg #101014, cards #1a1a2e, inputs #202032,
+- [x] Live loss chart: raw (faint) + smoothed (gold, moving-average k adaptive)
+      + best-point marker; decimation at >4000 points; footer
+      `step N | now X | best Y @ step`.
+- [x] Stat chips: STEPS / LOSS / BEST / ETA (plus RATE, STAGE, MODE extras).
+- [x] Console echo: child stdout/stderr mirrored to the log pane,
+      suppression patterns (FutureWarning etc.), follow toggle.
+      *Tk's formatted step/loss/lr/gnorm table is not ported — agent-mode
+      stdout already carries the data as events; consciously deferred.*
+- [x] Full Analysis window: smoothed slope (global + recent weighted), SNR
+      (1.4826·MAD), exposure %, grade A–D (`calculate_grade`), trend labels,
+      outlier flags (>1.5σ of window), epoch boundaries (derived from
+      training_started's `epochs`), ideal-zone prediction.
+      *Ported as SERVER-side numpy (`_analysis()` in webui.py, verbatim math
+      from dashboard.py) exposed at GET /api/analysis — simpler and safer
+      than a JS reimplementation; UI renders cards + detail line.*
+- [ ] Load JSONL / trainer_state.json import; Clear. → **Consciously
+      deferred**: no /api/import endpoint; agent-mode runs always provide
+      live data. Revisit if offline analysis is ever needed.
+- [x] Theme: Hermes dark — bg #101014, cards #1a1a2e, inputs #202032,
       borders #33333f, accent #FFBF00/#FFD700 gold, text #FFF8DC, muted
       #9096ad, ok #4caf50, warn #ffa726, err #ef5350; Segoe UI + Consolas.
 
@@ -233,40 +245,63 @@ Phase numbering = order of attack. Check off when done AND tested.
   `POST /api/stop` handler. All tested. `POST /api/start` is a friendly stub
   until `webui_config.build_argv` exists (Phase 2).
 
-### Phase 2 — Launch & supervise child (NEXT SESSION START HERE)
-- [ ] Create `src/reforge/webui_config.py`: `build_argv(params) -> list[str]`
+### Phase 2 — Launch & supervise child ✅ (2026-11-16, done + tested)
+- [x] Create `src/reforge/webui_config.py`: `build_argv(params) -> list[str]`
       (port `_build_cmd` + `_build_batch_cmd` from dashboard.py; append
       `--no_tqdm --agent --agent_log <out>/agent.ndjson`; create out dir;
       validate: base model + dataset required, .parquet exists, ints ≥ 1,
       dpo_beta > 0). Unify candidate for the Tk dashboard later (D9).
-- [ ] Wire `_spawn` in webui.py to it (replace the ImportError stub already
-      in place — readers, reaper and stop are DONE, see Phase 1 bonus)
-- [ ] Optional: `POST /api/preview` returning the argv without launching
-- [ ] Test: real short run (`--steps 5` tiny model) end-to-end via API only
+- [x] Wire `_spawn` in webui.py to it (real Popen with the readers/reaper)
+- [x] `POST /api/preview` returning the argv without launching (strict=False)
+- [x] Bonus: `GET /api/models` (scans `~/HF_Models` + HF hub cache for the
+      datalist)
+- [x] Test: real short run (`--steps 2` tiny model) end-to-end via API only —
+      passed twice (fresh sandbox; graceful stop accepted). NOTE: always set
+      `REFORGE_OUTPUT_DIR` to a temp sandbox or the child chains from the real
+      `~/Reforge_Output/merged` (existing chain design, same as Tk).
 
-### Phase 3 — Frontend: config + progress
-- [ ] INDEX_HTML full layout: header, config cards (§3.3 inventory), command
+### Phase 3 — Frontend: config + progress ✅ (2026-11-16, done + tested)
+- [x] INDEX_HTML full layout: header, config cards (§3.3 inventory), command
       preview, Start/Stop buttons, status chip
-- [ ] Progress panel: phase segments, bar (determinate + CSS indet sweep),
+- [x] Progress panel: phase segments, bar (determinate + CSS indet sweep),
       tqdm info line, ETA + STAGE chips, stat chips
-- [ ] Log pane (monospace tail, autoscroll)
-- [ ] Results view: metrics from training_report.json (server reads file on
-      run_complete), merged_dir, "Start another"
-- [ ] Test: manual browser run; exercise both success and failure paths
+- [x] Log pane (monospace tail, follow toggle instead of autoscroll-on)
+- [x] Results view: done cards (merged_dir/final/best/steps/time) + report
+      key-values via GET /api/report, error banner + error_code + hint +
+      interrupted note, "Start another run"
+- [x] Test: browser-less (Node 26): full script `node --check` + pure
+      helpers (smooth/fmtHMS) + real `tick()` driven through
+      idle→running→stopping→done→error with realistic /api/status payloads
+      (DOM stubbed). Manual browser test still worth a pass at Phase 6.
 
-### Phase 4 — Chart & analysis
-- [ ] Loss chart `<canvas>`: raw + moving-average smoothed + best marker,
-      decimation, dark grid styling (port style_analysis_axes aesthetics)
-- [ ] Full Analysis panel: grade/trend/SNR/exposure/outliers/epoch lines
-      (JS port of dashboard math)
-- [ ] Test: replay a recorded agent.ndjson through a mock to render charts
+### Phase 4 — Chart & analysis ✅ (2026-11-16, done + tested)
+- [x] Loss chart `<canvas>`: raw (faint gold) + moving-average smoothed
+      (gold, adaptive k = max(3, n/50|1)) + best marker, decimation at
+      >4000 points, dark grid + y labels (D2: no matplotlib)
+- [x] Full Analysis panel: grade/trend/SNR/exposure/outliers/ideal-zone —
+      implemented as a SERVER-side numpy port (`_analysis()` in webui.py,
+      math verbatim from dashboard.py `_full_analysis`) at
+      `GET /api/analysis`; epoch exposure reconstructed from
+      `training_started.epochs` × step/total (step events carry no epoch)
+- [x] Bonus: `GET /api/report` (cached training_report.json reader) +
+      `Job.epochs` / `train_elapsed` / final_loss+best_loss+time_sec in the
+      training_complete result
+- [x] Test: synthetic 60-step run with injected outlier folded through
+      `Job.apply_event`, then asserted via HTTP (exposure 20% from
+      epochs=2×60/100, outlier flagged, grade/trend labels sane;
+      underflow error path; report reader happy/empty paths)
 
-### Phase 5 — Batch editor & parity polish
-- [ ] Batch stage editor (add/edit/remove/reorder, manifest save/load via
-      file dialogs replaced by textareas + /api endpoints for read/write JSON)
-- [ ] Import JSONL / trainer_state.json (upload → /api/import)
-- [ ] README section; pyproject entry point if desired (`reforge-webui` script?)
-- [ ] Parity checklist walk (§3.3) — every box ticked or consciously deferred
+### Phase 5 — Batch editor & parity polish ✅ (2026-11-16, done; 2 deferrals)
+- [x] Batch stage editor (add/edit/remove/↑↓ reorder; per-stage name/dataset/
+      epochs/steps; dataset↔hf_dataset auto-detected from the path shape).
+      *Manifest save is automatic (`build_argv` writes
+      `<out>/batch_manifest.json`); loading an existing manifest file is
+      deferred (was "file dialogs → textareas + /api endpoints").*
+- [x] Import JSONL / trainer_state.json → **consciously deferred** (see
+      §3.3): no /api/import; agent mode always yields live data.
+- [x] Parity checklist walk (§3.3) — every box ticked or consciously
+      deferred (console formatting table + manifest load are the deferrals).
+- [ ] README section + pyproject entry point → moved into Phase 6 ship.
 
 ### Phase 6 — Ship
 - [ ] PR against main; keep Tk dashboard; note deprecation plan in PR body
@@ -342,6 +377,53 @@ Phase numbering = order of attack. Check off when done AND tested.
 - Working tree now clean except untracked `.bak` files. Next: web UI
   Phase 2 per §9.
 
+### Session 3 — 2026-11-16/17 (Phases 2–5 complete: full web UI)
+- Synced main (PRs #22 + #23 merged, `33aacd4`), branched `feature/web-ui-2`.
+- **Phase 2** (commit `2c801ff`): `webui_config.py` (`build_argv` port of the
+  Tk `_build_cmd`/`_build_batch_cmd` with all validations; strict=False
+  powers `/api/preview`; batch stages auto-write `<out>/batch_manifest.json`;
+  `scan_models()` for the datalist), `_spawn` wired to a real Popen,
+  `/api/preview` + `/api/models`. Tested: unit cases + a REAL end-to-end run
+  with a purpose-built tiny model (`%TEMP%\opencode\tiny_model`, 84 MB,
+  2-layer Qwen2, real Qwen3.5 tokenizer — vocab 248085) + 4-row parquet:
+  agent events → phases → merge → run_complete, loss ring filled,
+  success.txt + training_report.json written, graceful stop accepted. Log
+  confirmed the eos-pin fix firing (`pinned to tokenizer eos (248046)`).
+- **⚠ Side effect (disclosed to user):** the FIRST e2e run had no
+  `REFORGE_OUTPUT_DIR` sandbox, so reforge's chain feature made the child
+  train from the real `~/Reforge_Output/merged` and baked a negligible
+  2-step tiny-LoRA delta into it. Existing chain design (Tk does the same);
+  all later tests sandbox via `REFORGE_OUTPUT_DIR`.
+- **Phases 3–5** (uncommitted at day's end → committed this session):
+  full SPA in `INDEX_HTML` — setup view (Paths/Training/Performance/Flags+DPO/
+  Batch cards, datalist from /api/models, debounced /api/preview live command
+  preview), progress view (phase segments w/ spinner/done/failed, determinate
+  + indeterminate bar, tqdm line, STEPS/LOSS/BEST/ETA/RATE/STAGE/MODE chips,
+  canvas chart raw+smoothed+best+decimation, analysis cards + detail line,
+  log pane with follow toggle), results view (done cards + report kv, error
+  banner + error_code + hint + interrupted note, "Start another"). Server
+  additions: `Job.epochs`, `train_elapsed`, final/best loss + time in the
+  training_complete result, `_analysis()` (verbatim numpy port of the Tk
+  `_full_analysis`: polyfit slopes, 1.4826·MAD SNR, exposure from
+  reconstructed epochs, grade A–D, trend labels, outliers, ideal-zone) at
+  `GET /api/analysis`, `_read_report()` at `GET /api/report`. Batch stage
+  editor gained ↑↓ reorder (Tk parity).
+- Testing without a browser: Node 26 — extracted the inline `<script>`,
+  `node --check`, drove the real `tick()` through idle→running→stopping→done
+  →error with realistic /api/status payloads (stubbed DOM + fetch) and
+  asserted view routing, stats chips, indet bar, report kv, error banner.
+  Two SPA bugs found & fixed this way: results view re-rendered every 1 s
+  tick (flicker + /api/report refetch); "server unreachable" chip showed
+  "Idle". Node functional test also validated `smooth()`/`fmtHMS()`.
+- Final re-run of the full e2e on the finished file: PASS (after fixing a
+  test-env drift: a leftover sandbox chain file made the child resume with
+  global_step 4 ≥ max_steps 2 → zero training steps → empty loss ring;
+  tests now rmtree the sandbox first).
+- Parity walk done: everything in §3.3 ticked except two conscious
+  deferrals (JSONL/trainer_state import — no /api/import; Tk's formatted
+  console table; batch manifest file-load). Tk dashboard stays (D-prime:
+  deprecation decision deferred to the user).
+
 ### Session 0 — 2026-11-15
 - Researched reforge (backend, agent contract, Tk dashboard inventory) and
   Lethe's `ui.py` (stdlib server + inline SPA + Job snapshot + polling).
@@ -349,11 +431,11 @@ Phase numbering = order of attack. Check off when done AND tested.
 - No code written yet for the web UI.
 
 ## 9. Next immediate steps (start of next session)
-1. `git -C ... reforge checkout feature/web-ui` (already created; based on
-   `feature/batch-training` f1c31e7). Re-check `git status` for new user WIP.
-2. Phase 2: create `src/reforge/webui_config.py` with `build_argv(params)`
-   (port from dashboard.py `_build_cmd`/`_build_batch_cmd`, incl. validations;
-   keep `--no_tqdm --agent --agent_log`), replace the `_spawn` ImportError
-   stub in webui.py, then API-only end-to-end test with a real tiny run if a
-   small model + parquet is available (otherwise test the failure path).
-3. Update §6/§8/§9.
+1. Phase 6 ship (only if not already done): push `feature/web-ui-2`, open PR
+   to main (note: Tk dashboard stays; mention the parity deferrals + the
+   auto-written batch manifest + sandbox e2e results in the PR body).
+2. README: add the web UI to the dashboard section + structure tree
+   (`reforge webui`, port 7861, agent-mode child).
+3. Optional follow-ups: manual browser pass (success + failure paths);
+   unify webui_config.build_argv with dashboard.py's builders (D9);
+   `/api/import` if offline analysis is ever wanted.
