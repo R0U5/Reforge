@@ -1,15 +1,16 @@
 """Argv builder + validation for the Web UI's child training processes.
 
-``build_argv(params)`` turns the JSON body of ``POST /api/start`` (or the Tk
-dashboard's form, via ``ReforgeDashboard._collect_params``) into the
-``python -m reforge ...`` command line the UIs spawn. Validation failures
-raise ``ValueError`` with a message that is shown to the user verbatim.
+``build_argv(params)`` turns the JSON body of ``POST /api/start`` into the
+``python -m reforge ...`` command line the web UI supervisor spawns.
+Validation failures raise ``ValueError`` with a message that is shown to
+the user verbatim.
 
-This is the single source of truth for both UIs (D9: the Tk dashboard
-delegates here since the web UI landed). ``strict=False`` (used by both
-command previews) builds the same argv without filesystem existence
-checks, so the preview works while typing. ``manifest_path`` lets the Tk
-dashboard target its Save-Manifest choice; the default is
+This is the single source of truth for command construction and start
+validation (D9; it previously also served the Tk dashboard, which was
+removed when the web UI reached parity). ``strict=False`` (used by the
+command preview) builds the same argv without filesystem existence
+checks, so the preview works while typing. ``manifest_path`` optionally
+overrides where a batch manifest is written; the default is
 ``<output_dir>/batch_manifest.json``.
 """
 

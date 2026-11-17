@@ -17,20 +17,6 @@ from .early_stopping import (select_scheduler, compute_min_steps,
 from .utils import select_base_model, select_file
 
 
-def _launch_dashboard() -> int:
-    """Run the Tkinter dashboard in this process (`reforge dashboard`)."""
-    _banner("Dashboard")
-    _info("Starting Reforge Dashboard...")
-    try:
-        from .dashboard import main as dashboard_main
-    except ImportError as e:
-        _err(f"Dashboard needs matplotlib to run: {e}")
-        _info("Install dashboard extras:  pip install -e .[dashboard]")
-        return 1
-    dashboard_main()
-    return 0
-
-
 def _launch_webui(argv_tail: list[str]) -> int:
     """Run the local web dashboard in this process (`reforge webui|ui`)."""
     import argparse as _argparse
@@ -66,14 +52,16 @@ def _resolve_cleaning_mode(parsed_args) -> str:
 def main():
     _enable_utf8_stdout()
 
-    # Subcommand dispatch: `reforge dashboard` opens the Tk UI.
-    # Intercepted before argparse so it isn't mistaken for the dataset
-    # positional. (Dashboards are launched only from the first token;
-    # a dataset file is expected to keep its .parquet extension.)
+    # Subcommand dispatch: `reforge webui` / `reforge ui` — browser
+    # dashboard (Lethe-style). Intercepted before argparse so it isn't
+    # mistaken for the dataset positional. (Dashboards are launched only
+    # from the first token; a dataset file is expected to keep its
+    # .parquet extension.)
     if len(sys.argv) > 1 and sys.argv[1] == "dashboard":
-        raise SystemExit(_launch_dashboard())
-
-    # `reforge webui` / `reforge ui` — browser dashboard (Lethe-style).
+        _err("The Tkinter dashboard was removed — it was replaced by the "
+             "browser-based web UI at feature parity.")
+        _info("Launch the web UI with:  reforge webui")
+        raise SystemExit(2)
     if len(sys.argv) > 1 and sys.argv[1] in ("webui", "ui"):
         raise SystemExit(_launch_webui(sys.argv[2:]))
 
@@ -132,7 +120,7 @@ def main():
                              "directory (printed when the batch started)")
     parser.add_argument('--no_tqdm', action='store_true',
                         help="Disable the tqdm progress bar and emit clean loss lines instead "
-                             "(the dashboard sets this automatically)")
+                             "(the web UI sets this automatically)")
     parsed_args, _unknown_args = parser.parse_known_args()
     image_mode = parsed_args.image
 
@@ -179,9 +167,9 @@ def main():
     merge_success_flag = os.path.join(merge_dir, "success.txt")
     os.makedirs(output_dir, exist_ok=True)
 
-    # Windows: map CTRL_BREAK to KeyboardInterrupt so a dashboard's
-    # "graceful stop" (both the Tk dashboard and the web UI send
-    # CTRL_BREAK_EVENT) takes the run_interrupted save path instead of the
+    # Windows: map CTRL_BREAK to KeyboardInterrupt so the web UI's
+    # "graceful stop" (which sends CTRL_BREAK_EVENT) takes the
+    # run_interrupted save path instead of the
     # default SIGBREAK action, which terminates the process outright
     # (exit 0xC000013A) without saving anything.
     import platform as _platform
