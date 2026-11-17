@@ -303,9 +303,10 @@ Phase numbering = order of attack. Check off when done AND tested.
       deferred (console formatting table + manifest load are the deferrals).
 - [ ] README section + pyproject entry point → moved into Phase 6 ship.
 
-### Phase 6 — Ship
-- [ ] PR against main; keep Tk dashboard; note deprecation plan in PR body
-- [ ] Update README dashboard section + structure tree
+### Phase 6 — Ship ✅ (2026-11-17)
+- [x] PR #24 against main; Tk dashboard stays; parity deferrals noted in PR body
+- [x] Update README dashboard section + structure tree (web UI bullet,
+      `reforge webui` quick-start line, `webui.py`/`webui_config.py` in tree)
 
 ---
 
