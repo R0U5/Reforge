@@ -1452,9 +1452,11 @@ class ReforgeDashboard:
                     self._running = False
                     self._btn_start.configure(state="normal")
                     self._btn_stop.configure(state="disabled")
+                    # 130 = graceful stop (run_interrupted save path)
+                    good = retcode in (0, 130)
                     self._set_status(
-                        "Done" if retcode == 0 else f"Exited ({retcode})",
-                        OK if retcode == 0 else ERR)
+                        "Done" if good else f"Exited ({retcode})",
+                        OK if good else ERR)
                     self._proc = None
                     self._refresh_live_chart()
         except Exception:

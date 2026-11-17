@@ -316,13 +316,20 @@ def _reader_stdout(pipe):
 
 
 def _reader_stderr(pipe):
-    """Tail child stderr (human output in agent mode) into the log pane."""
+    """Tail child stderr (human output in agent mode) into the log pane.
+
+    Raw per-step loss dicts (the LossLineLogger rows) are dropped — they
+    flood the pane and the same numbers arrive as `step` events for the
+    chart; the stdout reader applies the same rule.
+    """
     try:
         for raw in iter(pipe.readline, b""):
             line = raw.decode("utf-8", errors="replace").replace("\r", "")
             if not line.strip():
                 continue
             if any(p in line for p in _SUPPRESS_PATTERNS):
+                continue
+            if "'loss'" in line or '"loss"' in line:
                 continue
             JOB.add_log(line)
     except Exception:
@@ -691,6 +698,7 @@ INDEX_HTML = r"""<!doctype html>
   input[type=text],input[type=number]{width:100%;background:var(--card2);
     border:1px solid var(--line);border-radius:8px;color:var(--ink);
     padding:8px 10px;font-size:14px}
+  input[type=checkbox]{accent-color:var(--accent);width:16px;height:16px}
   input:focus{outline:none;border-color:var(--accent)}
   .checks{display:flex;gap:18px;flex-wrap:wrap;margin-top:6px}
   .checks label{display:flex;align-items:center;gap:7px;font-size:14px;
@@ -752,6 +760,7 @@ INDEX_HTML = r"""<!doctype html>
   /* results */
   .res{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px}
   .res .stat{min-height:74px}
+  .res .stat span.path{font-size:12px;word-break:break-all;line-height:1.45}
   .kv{font:13px/1.8 Consolas,monospace;color:var(--muted);white-space:pre-wrap}
   a{color:var(--accent)}
   [hidden]{display:none !important}
@@ -1197,14 +1206,15 @@ async function renderResults(s){
   }
   title.textContent = "Training complete";
   const r = s.result || {};
-  const card = (k, v, gold) => `<div class="stat${gold ? " gold" : ""}"><small>${k}</small><span>${esc(v ?? "—")}</span></div>`;
+  const card = (k, v, gold, path) => `<div class="stat${gold ? " gold" : ""}"><small>${k}</small><span${path ? " class=\"path\"" : ""}>${esc(v ?? "—")}</span></div>`;
   let html = `<div class="res">`
-    + card("Merged to", r.merged_dir || "—", true)
+    + card("Merged to", r.merged_dir || "—", true, true)
     + card("Final loss", r.final_loss !== null && r.final_loss !== undefined ? Number(r.final_loss).toFixed(4) : null)
     + card("Best loss", r.best_loss !== null && r.best_loss !== undefined ? Number(r.best_loss).toFixed(4) : null)
-    + card("Steps", s.total_steps)
+    + card("Steps", `${s.step}/${s.total_steps || "?"}`)
     + card("Time", fmtHMS(r.time_sec))
     + `</div>`;
+  if (s.interrupted) html += `<div class="banner warn">Run was stopped early — the adapter state was saved to the output dir (interrupted_adapter).</div>`;
   body.innerHTML = html;
   try{
     const rep = await jget("/api/report");
@@ -1252,6 +1262,7 @@ jget("/api/models").then(d => {
   $("models").innerHTML = (d.models || []).map(m => `<option value="${esc(m)}">`).join("");
 }).catch(() => {});
 route("idle");
+schedulePreview();   // show the base command / first validation hint on load
 setInterval(tick, 1000);
 tick();
 </script>

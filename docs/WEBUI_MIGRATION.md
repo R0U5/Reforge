@@ -429,6 +429,25 @@ Phase numbering = order of attack. Check off when done AND tested.
   test-env drift: a leftover sandbox chain file made the child resume with
   global_step 4 ≥ max_steps 2 → zero training steps → empty loss ring;
   tests now rmtree the sandbox first).
+- Visual pass 2026-11-17 (headless Edge screenshots against the live server,
+  real tiny runs): setup / progress / results / interrupted views verified.
+  Found & fixed:
+  1. **Graceful stop was not graceful on Windows** — CTRL_BREAK_EVENT killed
+     the child with 0xC000013A, no run_interrupted, no state save (the Tk
+     dashboard's stop had the same flaw). Fix: `__main__.py` now installs
+     SIGBREAK → default_int_handler on Windows so CTRL_BREAK raises
+     KeyboardInterrupt → run_interrupted → adapter saved → clean exit.
+     Verified live: stop mid-run → state done + interrupted note; also
+     verified `run_interrupted`, "Interrupted state saved", merge/export in
+     the console tail.
+  2. Console pane flooded by raw stderr loss-dict rows → dropped in
+     `_reader_stderr` (same rule as the stdout reader; data arrives as
+     step events). Console now shows compact `» event` echoes.
+  3. "Merged to" path clipped → `word-break:break-all` path style.
+  4. Steps card showed planned steps on a stopped run → now `step/total`.
+  5. Interrupted note added to the complete (not just error) results view;
+     boot-time preview hint; gold checkbox accents; Tk reaper shows
+     "Done" (green) for exit 130 stops.
 - Parity walk done: everything in §3.3 ticked except two conscious
   deferrals (JSONL/trainer_state import — no /api/import; Tk's formatted
   console table; batch manifest file-load). Tk dashboard stays (D-prime:
