@@ -179,6 +179,19 @@ def main():
     merge_success_flag = os.path.join(merge_dir, "success.txt")
     os.makedirs(output_dir, exist_ok=True)
 
+    # Windows: map CTRL_BREAK to KeyboardInterrupt so a dashboard's
+    # "graceful stop" (both the Tk dashboard and the web UI send
+    # CTRL_BREAK_EVENT) takes the run_interrupted save path instead of the
+    # default SIGBREAK action, which terminates the process outright
+    # (exit 0xC000013A) without saving anything.
+    import platform as _platform
+    import signal as _signal
+    if _platform.system() == "Windows":
+        try:
+            _signal.signal(_signal.SIGBREAK, _signal.default_int_handler)
+        except (AttributeError, ValueError, OSError):
+            pass
+
     # Agent mode: stdout becomes a pure NDJSON event stream and
     # <output_dir>/run_state.json tracks the latest snapshot. In batch mode
     # this happens inside _raise_batch (run_state.json lives in the batch dir).
