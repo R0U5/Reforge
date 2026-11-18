@@ -25,9 +25,10 @@ from .utils import roc
 class LossLineLogger(TrainerCallback):
     """Emits each loss-log event as a single-line dict, safe on any stream.
 
-    The dashboard parses these lines to feed the live loss chart. They are
-    written through _safe_print, so a broken console/pipe handle can never
-    abort the training run. Emitted on stderr so it stays independent of
+    Human-readable per-step loss lines for console workflows; the web UI
+    chart is fed by agent ``step`` events instead. They are written through
+    _safe_print, so a broken console/pipe handle can never abort the
+    training run. Emitted on stderr so it stays independent of
     stdout-side progress-bar writes.
     """
 
@@ -42,7 +43,8 @@ class LossLineLogger(TrainerCallback):
             "step": int(state.global_step),
         }
         # DPO runs also log preference alignment metrics; surface the
-        # chosen-over-rejected accuracy so the dashboard can display it.
+        # chosen-over-rejected accuracy so consumers (e.g. the web UI's
+        # ACC chip) can display it.
         if logs.get("rewards/accuracies") is not None:
             entry["acc"] = round(float(logs["rewards/accuracies"]), 4)
         try:

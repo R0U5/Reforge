@@ -462,10 +462,16 @@ Phase numbering = order of attack. Check off when done AND tested.
   removal: agent `step` events now carry `acc` (rewards/accuracies when
   present) and the web UI renders a gold ACC chip (agent.py schema docs
   updated too). Provenance comments in webui*.py kept.
+- Post-removal sweep: requirements.txt no longer lists matplotlib/scipy
+  as Tk-dashboard extras (scipy was unused by the web UI too); stale
+  training.py comments updated (loss lines are for console workflows -
+  the chart is fed by agent step events). Live "dashboard" references now
+  only describe the web dashboard or the friendly removal pointer.
 - Parity walk done: everything in §3.3 ticked except two conscious
   deferrals (JSONL/trainer_state import — no /api/import; Tk's formatted
-  console table; batch manifest file-load). Tk dashboard stays (D-prime:
-  deprecation decision deferred to the user).
+  console table; batch manifest file-load). The Tk dashboard deprecation
+  decision has since been made: it was removed (see the removal entry
+  above).
 
 ### Session 0 — 2026-11-15
 - Researched reforge (backend, agent contract, Tk dashboard inventory) and
