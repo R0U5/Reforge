@@ -473,6 +473,64 @@ Phase numbering = order of attack. Check off when done AND tested.
   decision has since been made: it was removed (see the removal entry
   above).
 
+### Session 4 — 2026-11-19 (full-repo review: confirmed bugs fixed)
+
+Read-through of the whole package; every change below was re-verified with
+the existing suites. No new runtime dependencies; the web UI stays
+stdlib-only.
+
+**Web UI supervisor / SPA**
+- `chip()` called `classList.add("")` for idle/unreachable — a real-browser
+  `SyntaxError` that aborted the first tick (so "Server unreachable" never
+  rendered). Empty classes are now skipped.
+- Stop semantics: `request_stop()` moves running→stopping atomically (a
+  second CTRL_BREAK cannot hit the save path); Start and the state check are
+  serialized by `_SPAWN_LOCK`; a stop during the child's imports (Windows
+  exit `0xC000013A`) or a SIGINT exit now settles as `done` + `interrupted`
+  instead of "Failed".
+- Interrupts handled outside the training loop now emit `run_interrupted`
+  and exit 130 (schema v5), not `run_failed` / `0xC000013A`. Ctrl+C on the
+  server also no longer orphans a child in its own process group: shutdown
+  waits (120 s) for the save/export, then terminates.
+- NaN/Inf loss/acc values are dropped from the live state; `/api/status`,
+  `/api/analysis` and `training_report.json` are strict JSON (a diverged run
+  can no longer break `JSON.parse`, the chart, or the report min/max).
+- Batch events (`batch_failed`, `stage_failed`, `batch_interrupted`,
+  `batch_complete`) are folded into the Job snapshot; setup failures enable
+  the bridge before emitting `batch_failed`; per-stage resets clear
+  loss/acc/best/rate; the report cache invalidates on mtime+size; request
+  bodies are validated and size-capped.
+
+**Batch**
+- Global CLI flags now actually apply to every stage (the README contract),
+  inline lists and manifests alike, dry-run included; per-stage values win.
+- `manifest_effective.json` records the resolved plan, so
+  `--batch_dir <dir>` alone resumes with identical options (inline lists
+  included). Web UI batch manifests bake global Performance/Flags form
+  values into every stage.
+- `image` and `train_lm_head` are valid stage keys.
+
+**Training / data / reporting**
+- `--latex --code` is parsed as a combined cleaning mode (`latex+code`);
+  previously both formatters were stripped.
+- Multimodal: two-turn Phi-3-Vision prompt with the answer supervised,
+  `image_sizes` passed through the collator, overlong rows dropped instead
+  of truncated mid-`<|end|>`, clearer drop warnings.
+- `apply_chat_template` works on transformers versions without
+  `return_dict`; every SFT/chat/measurement call site uses the wrapper.
+- Checkpoint cleanup can never mask a training failure; emergency saves go
+  to `<output_dir>/emergency_adapter`, never `merged/`.
+- All rows dropped after tokenization now raises a clear error.
+- Non-finite losses are filtered from report math and the eval display.
+
+**Verification**: compileall + pyflakes clean; extracted SPA passes
+`node --check` and the idle→running→stopping→done→error state test; phase
+2/3-4 endpoint suites; tiny-model e2e (train→merge→done); early-stop e2e
+(done + interrupted, exit `0xC000013A`); batch global-defaults /
+effective-manifest / `--batch_dir` dry-run-resume tests; `latex+code` and
+single-mode cleaning tests; multimodal mask/image_sizes test; interrupt
+handlers exit 130 for single and batch runs. Pushed to PR #25.
+
 ### Session 0 — 2026-11-15
 - Researched reforge (backend, agent contract, Tk dashboard inventory) and
   Lethe's `ui.py` (stdlib server + inline SPA + Job snapshot + polling).
@@ -480,12 +538,16 @@ Phase numbering = order of attack. Check off when done AND tested.
 - No code written yet for the web UI.
 
 ## 9. Next immediate steps (start of next session)
-1. Phase 6 ship (only if not already done): push `feature/web-ui-2`, open PR
-   to main (note: Tk dashboard stays; mention the parity deferrals + the
-   auto-written batch manifest + sandbox e2e results in the PR body).
-2. README: add the web UI to the dashboard section + structure tree
-   (`reforge webui`, port 7861, agent-mode child).
-3. Optional follow-ups: manual browser pass (success + failure paths);
-   `/api/import` if offline analysis is ever wanted.
+1. PR #25 (`feature/web-ui-2`) is open with the web UI + this review sweep;
+   the user merges it. No further code changes are queued here.
+2. Known deliberate limitations (not bugs): no `/api/import` (JSONL /
+   trainer_state analysis), no Tk-style formatted console table, no
+   batch-manifest file-load in the SPA.
+3. Watch item: a batch interrupt forwards CTRL_BREAK and waits only 60 s
+   before killing the stage child. A large-model CPU merge can exceed that,
+   leaving a partial `merged/`; batch resume wipes and retrains that stage
+   (correct, but slow). Raise the timeout if this shows up in practice.
+4. Optional polish: manual browser pass (success + failure paths).
    ~~unify webui_config.build_argv with dashboard.py's builders (D9)~~ →
    **done 2026-11-17**: dashboard.py delegates to build_argv (see Phase 2).
+   (dashboard.py has since been removed.)

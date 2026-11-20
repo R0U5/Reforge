@@ -70,7 +70,10 @@ def _now() -> str:
 # v4: Batch mode (--batch): batch_started/stage_started/stage_completed/
 #     stage_failed/batch_interrupted/batch_complete/batch_failed events,
 #     batch_state.json, batch_manifest_invalid/batch_stage_failed error codes.
-SCHEMA_VERSION = 4
+# v5: Interrupts outside the training loop emit run_interrupted with
+#     error_code "interrupted" and exit 130 (previously run_failed, and
+#     0xC000013A on Windows).
+SCHEMA_VERSION = 5
 
 
 # Status shown in run_state.json after each event type.
@@ -463,10 +466,16 @@ _EVENT_FIELDS = {
         },
     },
     "run_interrupted": {
-        "description": "KeyboardInterrupt/SIGINT. State is saved and export "
-                       "continues; run_state status becomes 'saving'.",
+        "description": "KeyboardInterrupt/SIGINT. During training the adapter "
+                       "state is saved and export continues (run_state status "
+                       "'saving'); elsewhere the process exits 130.",
         "stage": "training",
-        "fields": {},
+        "fields": {
+            "error": "str|null — set when the interrupt happened outside the "
+                     "training loop",
+            "error_code": '"interrupted"|null',
+            "exit_code": "int|null — 130 when the process is exiting",
+        },
     },
     "merge_started": {
         "description": "LoRA merge/export into the base model begins.",
@@ -494,6 +503,9 @@ _EVENT_FIELDS = {
             "error_code": "str|null — machine-branchable code (see error_codes)",
             "hint": "str|null — remediation suggestion",
             "exit_code": "int — 1 runtime, 2 invalid arguments/dataset, 130 interrupted",
+            "dataset": "str|null — dataset path when the failure is dataset-related",
+            "columns": "list[str]|null — parquet columns when schema detection failed",
+            "problems": "list[str]|null — every missing requirement (agent-mode preflight)",
         },
     },
     "batch_started": {
@@ -517,6 +529,7 @@ _EVENT_FIELDS = {
             "dataset": "str — this stage's dataset",
             "stage_dir": "str — the stage's own output dir (run_state.json, agent.ndjson)",
             "base_model": "str — previous stage's merged dir (or the explicit base for index 0)",
+            "batch_dir": "str — the batch_x/ directory",
         },
     },
     "stage_completed": {
@@ -526,6 +539,7 @@ _EVENT_FIELDS = {
             "index": "int", "name": "str", "dataset": "str",
             "merged_dir": "str — this stage's merged model (the next stage's base)",
             "training_mode": "str|null — detected mode from the stage's run_state.json",
+            "batch_dir": "str — the batch_x/ directory",
         },
     },
     "stage_failed": {
@@ -536,6 +550,8 @@ _EVENT_FIELDS = {
             "index": "int", "name": "str", "dataset": "str",
             "error": "str", "error_code": "str|null", "hint": "str|null",
             "returncode": "int — the child process exit code",
+            "batch_dir": "str — the batch_x/ directory",
+            "exit_code": "int — always 1 here",
         },
     },
     "batch_interrupted": {
@@ -544,10 +560,13 @@ _EVENT_FIELDS = {
                        "stages stay pending. Resume with --batch_dir.",
         "stage": "interrupted",
         "fields": {
-            "index": "int — the stage that was interrupted",
-            "name": "str",
-            "returncode": "int — usually 130",
-            "hint": "str — the exact resume command",
+            "index": "int|null — the stage that was interrupted",
+            "name": "str|null",
+            "returncode": "int|null — the interrupted child's exit code",
+            "hint": "str|null — the exact resume command",
+            "batch_dir": "str — the batch_x/ directory",
+            "error": "str|null — set when interrupted between stages",
+            "exit_code": "int — 130",
         },
     },
     "batch_complete": {
@@ -556,12 +575,18 @@ _EVENT_FIELDS = {
         "fields": {
             "final_merged": "str — the last stage's merged model directory",
             "completed_stages": "int",
+            "batch_dir": "str — the batch_x/ directory",
+            "exit_code": "int — 0",
         },
     },
     "batch_failed": {
         "description": "Batch aborted (manifest invalid or a stage failed). Terminal event.",
         "stage": "failed",
-        "fields": {"error": "str", "error_code": "str|null", "hint": "str|null"},
+        "fields": {
+            "error": "str", "error_code": "str|null", "hint": "str|null",
+            "batch_dir": "str|null — absent when setup failed before a dir existed",
+            "exit_code": "int — 1 stage/runtime failure, 2 invalid manifest",
+        },
     },
 }
 

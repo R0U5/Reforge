@@ -42,7 +42,9 @@ _STAGE_FLAGS = {
     "force": "--force",
     "latex": "--latex",
     "code": "--code",
+    "image": "--image",
     "dpo": "--dpo",
+    "train_lm_head": "--train_lm_head",
     "no_tqdm": "--no_tqdm",
 }
 _STAGE_VALUES = {
@@ -87,6 +89,42 @@ def load_manifest(batch_args):
                 "mixing manifests and inline datasets is ambiguous")
         stages.append({"dataset": arg, "name": f"stage_{i + 1:02d}"})
     return {"stages": stages}
+
+
+def global_stage_defaults(parsed_args) -> dict:
+    """Global CLI flags as per-stage defaults (README: inline --batch lists
+    apply global flags to every stage). Per-stage manifest keys win."""
+    defaults = {}
+    epoch = getattr(parsed_args, "epoch", None)
+    if epoch is not None and epoch != 1:       # 1 is the child default
+        defaults["epochs"] = epoch
+    for stage_key, arg_key in (("steps", "steps"),
+                               ("batch_size", "batch_size"),
+                               ("grad_accum", "grad_accum"),
+                               ("dpo_beta", "dpo_beta")):
+        value = getattr(parsed_args, arg_key, None)
+        if value is not None:
+            defaults[stage_key] = value
+    for stage_key in ("force", "latex", "code", "image", "dpo",
+                      "train_lm_head"):
+        if getattr(parsed_args, stage_key, False):
+            defaults[stage_key] = True
+    return defaults
+
+
+def apply_stage_defaults(manifest, defaults):
+    """Merge global defaults into every stage; stage values take priority."""
+    if not defaults or not isinstance(manifest, dict):
+        return manifest
+    stages = manifest.get("stages")
+    if not isinstance(stages, list):
+        return manifest
+    out = dict(manifest)
+    out["stages"] = [
+        ({**defaults, **stage} if isinstance(stage, dict) else stage)
+        for stage in stages
+    ]
+    return out
 
 
 def validate_manifest(manifest, base_model):
@@ -300,7 +338,8 @@ class BatchRunner:
         )
         _banner("Batch complete")
         _ok(f"Final model: {final_merged}")
-        _info(f"To resume or inspect this batch later: --batch_dir {self.batch_dir}")
+        _info(f"To resume or inspect this batch later: "
+              f"--batch <manifest> --batch_dir {self.batch_dir}")
         return 0
 
     # --------------------------------------------------------------- stages
@@ -380,10 +419,11 @@ class BatchRunner:
             _write_state(self.state_path, self.state)
             BRIDGE.emit("batch_interrupted", stage="training", index=i, name=label,
                         returncode=returncode, batch_dir=self.batch_dir,
-                        hint=f"rerun with --batch_dir {self.batch_dir} to resume",
+                        hint=f"rerun the same --batch arguments plus "
+                             f"--batch_dir {self.batch_dir} to resume",
                         exit_code=130)
             _warn(f"[{label}] interrupted (child exit {returncode}). "
-                  f"Resume with: --batch_dir {self.batch_dir}")
+                  f"Resume with: --batch <manifest> --batch_dir {self.batch_dir}")
             raise
 
         failed = _ndjson_tail(os.path.join(stage_dir, "agent.ndjson"), "run_failed")
