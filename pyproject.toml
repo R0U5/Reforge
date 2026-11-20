@@ -23,7 +23,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dashboard = ["matplotlib>=3.7.0"]
 emoji = ["emoji>=2.0.0"]
 
 [project.urls]

@@ -16,7 +16,8 @@ Event vocabulary
     dataset_loaded        dataset resolved (rows, training mode, column
                           mapping, cleaning mode)
     training_started      total steps, LR, scheduler, early-stop plan
-    step                  progress at every logged step (loss, pct, eta)
+    step                  progress at every logged step (loss, pct, eta; DPO
+                      runs also carry acc = rewards/accuracies)
     checkpoint_saved      Trainer checkpoint written
     early_stop_check      periodic early-stopping health snapshot
     early_stop_triggered  early stopping decided to stop the run
@@ -411,6 +412,7 @@ _EVENT_FIELDS = {
             "pct": "float — percent complete",
             "loss": "float — current training loss",
             "eta_sec": "int|null — estimated seconds remaining",
+            "acc": "float|null — rewards/accuracies, DPO runs only",
         },
     },
     "checkpoint_saved": {
@@ -816,6 +818,8 @@ class AgentProgressCallback(TrainerCallback):
             pct=round(100.0 * step / total, 2) if total else None,
             loss=round(float(loss), 6),
             eta_sec=eta_sec,
+            acc=(round(float(logs["rewards/accuracies"]), 6)
+                 if logs.get("rewards/accuracies") is not None else None),
         )
 
         es = self.early_stop

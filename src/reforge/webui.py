@@ -82,6 +82,7 @@ class Job:
         self.pct = None
         self.eta_sec = None
         self.latest_loss = None
+        self.latest_acc = None          # DPO runs: rewards/accuracies
         self.best_loss = None
         self.rate_it_s = None
         self.training_mode = None
@@ -184,6 +185,9 @@ class Job:
                     self.best_loss = (float(loss) if self.best_loss is None
                                       else min(self.best_loss, float(loss)))
                     self.losses.append({"step": self.step, "loss": float(loss)})
+                    acc = ev.get("acc")
+                    if acc is not None:
+                        self.latest_acc = float(acc)
                     import time
                     elapsed = time.time() - self._t_train if self._t_train else 0
                     done = self.step - self._step0
@@ -227,6 +231,7 @@ class Job:
                 self.pct = None
                 self.eta_sec = None
                 self.losses.clear()
+                self.latest_acc = None
                 self.error = None
                 self.error_code = None
             # batch_completed stage tracking
@@ -262,6 +267,7 @@ class Job:
                 "pct": None if self.pct is None else round(self.pct, 2),
                 "eta_sec": self.eta_sec,
                 "latest_loss": self.latest_loss,
+                "latest_acc": self.latest_acc,
                 "best_loss": self.best_loss,
                 "rate_it_s": (round(self.rate_it_s, 3)
                               if self.rate_it_s is not None else None),
@@ -1061,6 +1067,8 @@ function renderStats(s){
     add("LOSS", Number(s.latest_loss).toFixed(4), true);
   if (s.best_loss !== null && s.best_loss !== undefined)
     add("BEST", Number(s.best_loss).toFixed(4));
+  if (s.latest_acc !== null && s.latest_acc !== undefined)
+    add("ACC", (Number(s.latest_acc) * 100).toFixed(1) + "%", true);
   add("ETA", fmtHMS(s.eta_sec));
   if (s.rate_it_s) add("RATE", Number(s.rate_it_s).toFixed(2) + " it/s");
   if (s.stage) add("STAGE", `${(s.stage.index ?? -1) + 1}/${s.stage.total}`);

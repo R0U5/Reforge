@@ -89,6 +89,12 @@ Constraints / spirit:
   resume via `--batch_dir`.
 
 ### 3.3 Tk dashboard (src/reforge/dashboard.py, ~80 KB) — the feature checklist to port
+> **Removed 2026-11-17** (user decision): dashboard.py deleted, `reforge
+> dashboard` exits 2 with a pointer to `reforge webui`, the matplotlib
+> `[dashboard]` extra dropped, README/AGENTS.md scrubbed. The web UI is the
+> dashboard; the "ported from the Tk dashboard" comments in webui*.py are
+> provenance notes for the math/logic origins. The checklist below is kept
+> as the parity record.
 Launch: `reforge dashboard`. Child process = `python -m reforge ... --no_tqdm
 --agent --agent_log <out>/agent.ndjson`; reader threads parse stdout NDJSON
 (events → progress panel) + stderr loss dicts (LossLineLogger rows: step, loss,
@@ -448,10 +454,24 @@ Phase numbering = order of attack. Check off when done AND tested.
   5. Interrupted note added to the complete (not just error) results view;
      boot-time preview hint; gold checkbox accents; Tk reaper shows
      "Done" (green) for exit 130 stops.
+- Tk dashboard removed (user decision, 2026-11-17): `git rm
+  dashboard.py`; `reforge dashboard` now exits 2 with a pointer to
+  `reforge webui`; `[dashboard]` (matplotlib) extra dropped from
+  pyproject (`[emoji]` kept — dataset.py uses it optionally); README +
+  AGENTS.md scrubbed. DPO accuracy visibility preserved through the
+  removal: agent `step` events now carry `acc` (rewards/accuracies when
+  present) and the web UI renders a gold ACC chip (agent.py schema docs
+  updated too). Provenance comments in webui*.py kept.
+- Post-removal sweep: requirements.txt no longer lists matplotlib/scipy
+  as Tk-dashboard extras (scipy was unused by the web UI too); stale
+  training.py comments updated (loss lines are for console workflows -
+  the chart is fed by agent step events). Live "dashboard" references now
+  only describe the web dashboard or the friendly removal pointer.
 - Parity walk done: everything in §3.3 ticked except two conscious
   deferrals (JSONL/trainer_state import — no /api/import; Tk's formatted
-  console table; batch manifest file-load). Tk dashboard stays (D-prime:
-  deprecation decision deferred to the user).
+  console table; batch manifest file-load). The Tk dashboard deprecation
+  decision has since been made: it was removed (see the removal entry
+  above).
 
 ### Session 0 — 2026-11-15
 - Researched reforge (backend, agent contract, Tk dashboard inventory) and

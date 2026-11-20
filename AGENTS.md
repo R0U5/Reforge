@@ -48,7 +48,8 @@ src/reforge/
 ├── agent.py             # Agent mode: NDJSON events, run_state.json, --agent-schema contract
 ├── display.py           # Console output (diverted to stderr in agent mode)
 ├── utils.py             # Model scanner, file pickers, GC
-└── dashboard.py         # Tkinter GUI (`reforge dashboard`)
+├── webui_config.py      # Web UI argv builder + start validations (single source of truth)
+└── webui.py             # Web UI server + SPA (`reforge webui`, http://127.0.0.1:7861)
 ```
 
 Where to change things:

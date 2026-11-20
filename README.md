@@ -1,6 +1,6 @@
 # Reforge
 
-A modular LoRA fine-tuning pipeline for Hugging Face causal language models and vision-language models. Reforge handles dataset loading, automatic schema detection, text cleaning, tokenization, training with smart early stopping (SFT or DPO preference tuning), LoRA merge, and final model export. Includes a Tkinter dashboard and a browser-based web UI for interactive control.
+A modular LoRA fine-tuning pipeline for Hugging Face causal language models and vision-language models. Reforge handles dataset loading, automatic schema detection, text cleaning, tokenization, training with smart early stopping (SFT or DPO preference tuning), LoRA merge, and final model export. Includes a browser-based web UI for interactive control.
 
 ## Project Structure
 
@@ -20,8 +20,7 @@ src/reforge/
 ├── agent.py             # Agent mode: NDJSON events + run_state.json
 ├── utils.py             # Model scanner, file picker, GC
 ├── webui_config.py      # Web UI: argv builder + validation, model scan
-├── webui.py             # Web UI server + SPA — `reforge webui` (port 7861)
-└── dashboard.py         # Tkinter GUI — `reforge dashboard`
+└── webui.py             # Web UI server + SPA — `reforge webui` (port 7861)
 ```
 
 `AGENTS.md` (repo root) is the orientation guide for AI agents working on or driving Reforge.
@@ -36,13 +35,7 @@ python -m reforge
 pip install -e .
 reforge
 
-# Install with dashboard support (matplotlib)
-pip install -e ".[dashboard]"
-
-# Launch the GUI dashboard
-reforge dashboard
-
-# Or the browser-based web UI (http://127.0.0.1:7861)
+# Launch the browser-based web UI (http://127.0.0.1:7861)
 reforge webui
 
 # Specify a Hugging Face Hub dataset
@@ -126,7 +119,7 @@ the run fails preflight with `invalid_dataset` if both completions are missing.
 2. Run DPO on a preference-pair dataset **without passing `--base_model`** —
    the training chain picks up the SFT-merged model as the base automatically
    (or pass `--base_model /path/to/merged` explicitly).
-3. Watch `rewards/accuracies` climb in the dashboard log while loss decreases.
+3. Watch `rewards/accuracies` climb in the web UI log while loss decreases.
    `beta` (default 0.1) controls KL pressure vs the reference model: higher =
    stay closer to the SFT model, lower = more aggressive alignment.
 
@@ -182,7 +175,7 @@ Behavior:
 
 ### Core
 - **Automatic training mode detection** — inspects dataset columns and selects the right pipeline: SFT (instruction/response), DPO (preference pairs: chosen+rejected), causal (raw text), chat (messages), or multimodal (image+text).
-- **DPO (preference tuning)** — preference-pair datasets train with TRL's `DPOTrainer`: LoRA adapters on the 4-bit base with the adapter-disabled base weights acting as the reference model (no second copy in VRAM), `beta` configurable via `--dpo_beta`. Intended workflow: **SFT first, then DPO** — the SFT run's merged model automatically becomes the DPO run's base via the training chain. Preference alignment is visible live (`rewards/accuracies` in the dashboard log).
+- **DPO (preference tuning)** — preference-pair datasets train with TRL's `DPOTrainer`: LoRA adapters on the 4-bit base with the adapter-disabled base weights acting as the reference model (no second copy in VRAM), `beta` configurable via `--dpo_beta`. Intended workflow: **SFT first, then DPO** — the SFT run's merged model automatically becomes the DPO run's base via the training chain. Preference alignment is visible live (`rewards/accuracies` in the web UI console tail).
 - **Batch mode (`--batch`)** — train a list of datasets in order with chained merges (SFT → SFT → DPO). Per-stage control via a JSON manifest; automatic resume from `batch_state.json`; per-stage early stopping; disk-friendly (intermediate merges auto-reclaimed).
 - **Built-in data cleaning** — strips LaTeX, HTML, markdown artifacts, unicode garbage, emoji, junk tokens, and e-commerce noise. Configurable modes for math, LaTeX-preserving, and code-preserving workflows.
 - **Model profiles** — ships with tuned configs for Phi-2, Phi-3, Phi-3-Vision, and more. Falls back to sensible defaults for unlisted models.
@@ -194,9 +187,7 @@ Behavior:
 ### Interactive
 - **Local model picker** — scans `~/HF_Models/` and the Hugging Face hub cache, then presents an interactive numbered list.
 - **Post-training summary** — formatted report with loss statistics, trend, and unicode sparkline. Writes a full `training_report.json`.
-- **Tkinter dashboard** (`reforge dashboard`, `python -m reforge dashboard`, or `-m reforge.dashboard`) — config editor, start/stop, and a live loss chart. Includes a DPO card (force checkbox, beta field, and the SFT→DPO chain hint) and shows `rewards/accuracies` as an `acc` column in the training log during DPO runs.
-- **Dashboard progress panel** (tqdm/Docker-inspired) — the dashboard launches training in agent mode and renders the NDJSON event stream live: a `DATASET → MODEL → TRAIN → MERGE` phase tracker (Docker-pull-style segments with spinner/✓/✗ states), a progress bar with the percent caption, and a tqdm-style info line `step 450/1000 · 45% · [03:12<03:54 · 1.9 it/s]` plus an ETA chip. Indeterminate sweep animation while loading/merging; batch runs get a `STAGE k/N` chip that resets the bar per stage.
-- **Web UI** (`reforge webui` / `reforge ui`, or `python -m reforge webui --port 7861 --no-browser`) — a dependency-free local server (stdlib `http.server`) serving a single-page dashboard at `http://127.0.0.1:7861` with the same feature set as the Tk dashboard: config cards (paths, training, performance, flags/DPO, batch stage editor with reorder), a live command preview, start/stop with the same validations, the phase tracker + progress bar + stat chips, a canvas loss chart, the full loss analysis (grade/trend/SNR/exposure/ideal-zone), a console tail, and a results view fed by `training_report.json`. Launches the child in agent mode and consumes the same NDJSON event stream; no extra packages required.
+- **Web UI** (`reforge webui` / `reforge ui`, or `python -m reforge webui --port 7861 --no-browser`) — a dependency-free local server (stdlib `http.server`) serving a single-page dashboard at `http://127.0.0.1:7861`: config cards (paths, training, performance, flags/DPO, batch stage editor with reorder), a live command preview, start/stop with the same validations, a `DATASET → MODEL → TRAIN → MERGE` phase tracker (spinner/✓/✗ states) + progress bar with a tqdm-style info line `step 450/1000 · 45% · [03:12<03:54 · 1.9 it/s]` + ETA/stat chips, a canvas loss chart, the full loss analysis (grade/trend/SNR/exposure/ideal-zone), a console tail (shows `rewards/accuracies`-style DPO detail from the event stream), and a results view fed by `training_report.json`. Launches the child in agent mode and consumes the NDJSON event stream; no extra packages required.
 
 ### Agent mode
 - **Self-describing contract** — `reforge --agent-schema` (or `reforge agent-schema`) prints the complete machine-readable contract as one JSON object: CLI arguments, event vocabulary and fields, `run_state.json` keys, exit codes, error codes, dataset schemas, model profiles, artifact map, and an example session. Generated from the live argparse parser and pipeline constants, so it cannot drift. **Agents should call this first.**
