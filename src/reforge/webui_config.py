@@ -62,12 +62,21 @@ def _parse_dpo_beta(params: dict) -> "float | None":
     return val
 
 
-def _resolve_output_dir(params: dict) -> str:
+def _resolve_output_dir(params: dict, strict: bool = True) -> str:
     out = str(params.get("output_dir") or "").strip() or OUTPUT_DIR
+    if not strict:
+        # The live command preview must never create directories as a side
+        # effect of typing into the output-dir field.
+        return out
     try:
+        if os.path.exists(out) and not os.path.isdir(out):
+            raise ValueError(f"Output path is not a directory:\n{out}")
         os.makedirs(out, exist_ok=True)
-    except Exception:
-        pass
+    except ValueError:
+        raise
+    except OSError as e:
+        raise ValueError(
+            f"Output directory could not be created:\n{out}\n({e})") from None
     return out
 
 
@@ -78,17 +87,32 @@ def _validate_stage_list(params: dict, strict: bool) -> "list | None":
         return None
     if not isinstance(stages, list):
         raise ValueError("stages must be a list of stage objects.")
-    stages = [s for s in stages if isinstance(s, dict)]
+    if any(not isinstance(s, dict) for s in stages):
+        raise ValueError("Each batch stage must be an object.")
     if not stages:
         raise ValueError("Batch mode needs at least one stage.")
+    cleaned = []
     for i, s in enumerate(stages):
-        ds = str(s.get("dataset") or "").strip()
-        hf = str(s.get("hf_dataset") or "").strip()
+        # The editor sends every cell on a row edit, including blank
+        # epochs/steps/name. Drop blanks here: written verbatim into the
+        # manifest they become int("") failures in the child's validation.
+        s = {k: v for k, v in s.items() if v not in (None, "")}
+        for key in ("dataset", "hf_dataset", "name"):
+            if key in s:
+                s[key] = str(s[key]).strip()
+                if not s[key]:
+                    del s[key]
+        cleaned.append(s)
+        ds = s.get("dataset") or ""
+        hf = s.get("hf_dataset") or ""
         if not ds and not hf:
             raise ValueError(f"Stage {i + 1} has no dataset.")
-        if strict and ds and not os.path.isfile(ds):
-            raise ValueError(f"Stage {i + 1} dataset not found:\n{ds}")
-    return stages
+        if strict and ds:
+            if not os.path.isfile(ds):
+                raise ValueError(f"Stage {i + 1} dataset not found:\n{ds}")
+            if not ds.lower().endswith(".parquet"):
+                raise ValueError(f"Stage {i + 1} dataset must be a .parquet file.")
+    return cleaned
 
 
 def build_argv(params: dict, strict: bool = True,
@@ -127,7 +151,7 @@ def build_argv(params: dict, strict: bool = True,
                 if not ds.lower().endswith(".parquet"):
                     raise ValueError("Local dataset must be a .parquet file.")
 
-    out_dir = _resolve_output_dir(params)
+    out_dir = _resolve_output_dir(params, strict=strict)
 
     numeric = {name: _parse_int(params, name) for name in _INT_FIELDS}
     dpo_beta = _parse_dpo_beta(params)
@@ -139,6 +163,21 @@ def build_argv(params: dict, strict: bool = True,
         # start); a non-strict preview only shows where Start will save it.
         path = manifest_path or os.path.join(out_dir, "batch_manifest.json")
         if strict:
+            # Global Performance/Flags form values apply to every stage
+            # (README batch contract); per-stage editor values win.
+            stage_defaults = {}
+            if numeric["epoch"] is not None:
+                stage_defaults["epochs"] = numeric["epoch"]
+            for name in ("steps", "batch_size", "grad_accum"):
+                if numeric[name] is not None:
+                    stage_defaults[name] = numeric[name]
+            for name in _FLAG_FIELDS:
+                if _as_bool(params.get(name)):
+                    stage_defaults[name] = True
+            if dpo_beta is not None:
+                stage_defaults["dpo_beta"] = dpo_beta
+            if stage_defaults:
+                stages = [{**stage_defaults, **s} for s in stages]
             manifest = {"base_model": base or None, "stages": stages}
             if not manifest["base_model"]:
                 manifest.pop("base_model")

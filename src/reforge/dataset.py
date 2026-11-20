@@ -201,22 +201,30 @@ def clean_string(s, mode: str = "math"):
     if not s:
         return ""
 
+    # Modes combine with "+" (`--latex --code` -> "latex+code"). Compare
+    # components, not the whole string: an exact-match check treated
+    # "latex+code" as neither mode and stripped LaTeX/code formatting.
+    mode_set = {m.strip() for m in str(mode or "math").split("+") if m.strip()}
+    preserve_code = "code" in mode_set
+    preserve_latex = "latex" in mode_set
+    is_math = "math" in mode_set and not preserve_code and not preserve_latex
+
     s = unbox_field(s)
-    if mode != "code":
+    if not preserve_code:
         s = WHITESPACE_ESC_RE.sub(" ", s).strip()
     else:
         s = s.strip()
-    if mode != "code":
+    if not preserve_code:
         s = FORMAT_STRIP_RE.sub("", s)
 
-    if mode == "math":
+    if is_math:
         s = MATH_WRAPPERS_RE.sub(r"\1", s)
         s = DOLLAR_INLINE_RE.sub(r"\1", s)
         s = MATH_SIMPLE_MAP_RE.sub(lambda m: _MATH_SIMPLE_MAP[m.group(0)], s)
         s = MATH_SPACING_RE.sub(" ", s)
         s = RE_MULTISPACE.sub(" ", s).strip()
 
-    if mode not in {"latex", "math"}:
+    if not (preserve_latex or is_math):
         s = RE_LATEX_INLINE.sub(strip_latex, s)
         s = RE_TEX_INLINE.sub("", s)
         s = RE_MATHRM.sub("", s)
@@ -233,12 +241,12 @@ def clean_string(s, mode: str = "math"):
     s = RE_BOLD_MD.sub("", s)
     s = RE_UNICODE_GARBAGE.sub("", s)
     s = RE_MEDIA_PLACEHOLDERS.sub("", s)
-    if mode not in {"latex"}:
+    if not preserve_latex:
         s = RE_TRASH_PLACEHOLDER.sub("", s)
     s = s.translate(PUNC_TRANS)
     if _EMOJI_AVAILABLE:
         s = _emoji_mod.replace_emoji(s, "")
-    if mode not in {"latex", "code"}:
+    if not (preserve_latex or preserve_code):
         s = RE_NON_ASCII.sub("", s)
     if BAD_TOKENS_RE.search(s):
         return ""
@@ -302,15 +310,19 @@ def synthesize_prompt_dataset(raw_dataset, col_question, col_chosen, col_rejecte
     elif training_mode == "multimodal":
         def build_multimodal_row(row):
             parts = []
+            question = ""
             if col_question:
                 q = row.get(col_question, "") or ""
                 if str(q).strip():
-                    parts.append(clean(str(q)))
+                    question = clean(str(q))
+                    parts.append(question)
             if col_chosen:
                 a = row.get(col_chosen, "") or ""
                 if str(a).strip():
                     parts.append(clean(str(a)))
-            return {"text": "\n\n".join(parts)}
+            # Keep the question separate so tokenize() can put the answer in
+            # the assistant turn (text alone cannot be split reliably).
+            return {"text": "\n\n".join(parts), "question": question}
 
         processed = raw_dataset.map(
             build_multimodal_row,
@@ -321,7 +333,8 @@ def synthesize_prompt_dataset(raw_dataset, col_question, col_chosen, col_rejecte
         # which would collide with the rename) and everything else dropped.
         if col_image and col_image != "image" and col_image in processed.column_names:
             processed = processed.rename_column(col_image, "image")
-        cols_to_drop = [c for c in processed.column_names if c not in ("text", "image")]
+        cols_to_drop = [c for c in processed.column_names
+                        if c not in ("text", "question", "image")]
         if cols_to_drop:
             processed = processed.remove_columns(cols_to_drop)
         processed = processed.filter(lambda e: bool(str(e["text"] or "").strip()), num_proc=1)
@@ -535,6 +548,13 @@ def load_and_prepare_dataset(dataset_path, cleaning_mode, image_mode=False, base
     _banner("Tokenization")
     _info("Measuring sequence lengths...")
     processed, auto_len = measure_lengths(processed, tokenizer, training_mode=training_mode)
+    if image_mode:
+        # measure_lengths sees text only. The vision processor expands each
+        # <|image_n|> tag into hundreds/thousands of image-placeholder
+        # tokens (num_crops * ~144 + global), so the text P95 would mark
+        # every image row as overlong and drop it.
+        auto_len = max(auto_len, 4096)
+        _info(f"Multimodal: max_length floor 4096 to fit image tokens -> {auto_len}")
 
     if training_mode == "dpo":
         # TRL's DPOTrainer tokenizes prompt/chosen/rejected internally
@@ -572,7 +592,8 @@ def load_and_prepare_dataset(dataset_path, cleaning_mode, image_mode=False, base
             )
             dropped = before - len(tokenized)
             if dropped:
-                _warn(f"Dropped {dropped} rows with unreadable images")
+                _warn(f"Dropped {dropped} rows with unreadable images or overlong "
+                      f"sequences (>{auto_len} tokens)")
         else:
             before = len(tokenized)
             tokenized = tokenized.filter(
@@ -581,6 +602,12 @@ def load_and_prepare_dataset(dataset_path, cleaning_mode, image_mode=False, base
             dropped = before - len(tokenized)
             if dropped:
                 _warn(f"Dropped {dropped} rows longer than max_length (kept out to preserve <|im_end|> supervision)")
+
+        if len(tokenized) == 0:
+            raise ValueError(
+                f"No usable rows after tokenization: all {before:,} rows exceeded "
+                f"max_length={auto_len} or had unreadable data. Raise "
+                "REFORGE_MAX_LENGTH or provide shorter examples.")
 
         _info("Casting columns to tensor format...")
         tokenized = tokenized.cast_column("input_ids", Sequence(Value("int64")))
@@ -594,6 +621,8 @@ def load_and_prepare_dataset(dataset_path, cleaning_mode, image_mode=False, base
             fmt_cols.append("length")
         if image_mode and "pixel_values" in tokenized.column_names:
             fmt_cols.append("pixel_values")
+        if image_mode and "image_sizes" in tokenized.column_names:
+            fmt_cols.append("image_sizes")
 
         tokenized.set_format(type="torch", columns=fmt_cols)
         roc()

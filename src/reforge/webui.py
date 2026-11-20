@@ -26,6 +26,7 @@ Phases (WIP skeleton): config form and progress rendering land in Phases
 from __future__ import annotations
 
 import json
+import math
 import os
 import platform
 import signal
@@ -37,7 +38,7 @@ import webbrowser
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from .display import _info, _title
+from .display import _info, _title, _warn
 from .webui_config import build_argv, scan_models
 
 # ── Tunables ─────────────────────────────────────────────────────────
@@ -45,6 +46,15 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 7861          # 7860 is Lethe's default; both may run side by side
 MAX_LOG_LINES = 400          # ring buffer for the console pane
 LOG_TAIL = 80                # lines sent per status poll
+
+# Exit codes that mean "the user interrupted the child". A stop requested
+# through the UI is not a failure, but the child cannot always report 130:
+#  - 130 is our own SystemExit after a handled KeyboardInterrupt;
+#  - -2 / -15 are POSIX SIGINT/SIGTERM (Popen reports negative signals);
+#  - 3221225786 (0xC000013A, or its signed form) is Windows' unhandled
+#    CTRL_BREAK exit, e.g. a stop during the child's heavy imports before
+#    its SIGBREAK handler is installed.
+_INTERRUPT_EXIT_CODES = (130, -2, -15, 3221225786, -1073741510)
 MAX_CHART_POINTS = 5000      # loss ring for the live chart
 
 # Child stdout suppression (same list as the Tk dashboard keeps).
@@ -106,6 +116,7 @@ class Job:
     def begin(self, proc, base_model, dataset):
         with self._lock:
             self._reset()
+            self._threads.clear()
             self.state = "running"
             self.phase = "dataset"
             self.phases["dataset"] = "active"
@@ -116,7 +127,27 @@ class Job:
 
     def add_log(self, line: str):
         with self._lock:
-            self.log.append(line.rstrip("\n"))
+            self.log.append(line.rstrip("\r\n"))
+
+    def request_stop(self):
+        """Atomically move running -> stopping; return the child or None.
+
+        The SPA renders a distinct "Stopping (saving)…" state and the
+        supervisor refuses new starts while the child is winding down, so
+        a second CTRL_BREAK can never interrupt the interrupted-adapter
+        save path.
+        """
+        with self._lock:
+            if self.state != "running" or self.proc is None:
+                return None
+            self.state = "stopping"
+            return self.proc
+
+    def cancel_stop(self):
+        """Roll back request_stop() when the signal could not be sent."""
+        with self._lock:
+            if self.state == "stopping":
+                self.state = "running"
 
     def _style_phase(self, event: str):
         """Phase machine — ported from the Tk dashboard's _apply_agent_event."""
@@ -147,9 +178,14 @@ class Job:
                 ph[p] = "done"
             self.phase = None
             self.pct = 100.0
-        elif event == "run_failed":
+        elif event in ("run_failed", "batch_failed", "stage_failed"):
             if self.phase:
                 ph[self.phase] = "failed"
+        elif event == "batch_complete":
+            for p in order:
+                ph[p] = "done"
+            self.phase = None
+            self.pct = 100.0
 
     def apply_event(self, ev: dict):
         """Fold one agent NDJSON event into the snapshot."""
@@ -181,13 +217,20 @@ class Job:
                 self.eta_sec = ev.get("eta_sec")
                 loss = ev.get("loss")
                 if loss is not None:
-                    self.latest_loss = float(loss)
-                    self.best_loss = (float(loss) if self.best_loss is None
-                                      else min(self.best_loss, float(loss)))
-                    self.losses.append({"step": self.step, "loss": float(loss)})
+                    # A diverging run can emit NaN/Inf. Storing it poisons
+                    # best_loss and the chart (Math.min -> NaN); drop the
+                    # point instead of only sanitizing the JSON response.
+                    loss = float(loss)
+                    if math.isfinite(loss):
+                        self.latest_loss = loss
+                        self.best_loss = (loss if self.best_loss is None
+                                          else min(self.best_loss, loss))
+                        self.losses.append({"step": self.step, "loss": loss})
                     acc = ev.get("acc")
                     if acc is not None:
-                        self.latest_acc = float(acc)
+                        acc = float(acc)
+                        if math.isfinite(acc):
+                            self.latest_acc = acc
                     import time
                     elapsed = time.time() - self._t_train if self._t_train else 0
                     done = self.step - self._step0
@@ -212,7 +255,19 @@ class Job:
                 self.error_code = ev.get("error_code")
                 self.hint = ev.get("hint")
                 self.exit_code = ev.get("exit_code")
-            elif event == "run_interrupted":
+            elif event in ("batch_failed", "stage_failed"):
+                # Batch children report failures as batch_failed (stage_failed
+                # is emitted just before it); without this the results view
+                # degraded to a bare "child exited with code 1".
+                self.error = ev.get("error") or self.error
+                self.error_code = ev.get("error_code") or self.error_code
+                self.hint = ev.get("hint") or self.hint
+                self.exit_code = ev.get("exit_code") or self.exit_code
+            elif event == "batch_complete":
+                self.result = {**(self.result or {}),
+                               "merged_dir": (ev.get("final_merged")
+                                              or (self.result or {}).get("merged_dir"))}
+            elif event in ("run_interrupted", "batch_interrupted"):
                 self.interrupted = True
             elif event == "batch_started":
                 total = ev.get("total_stages")
@@ -231,7 +286,11 @@ class Job:
                 self.pct = None
                 self.eta_sec = None
                 self.losses.clear()
+                self.latest_loss = None
                 self.latest_acc = None
+                self.best_loss = None
+                self.rate_it_s = None
+                self._t_train = None
                 self.error = None
                 self.error_code = None
             # batch_completed stage tracking
@@ -244,13 +303,20 @@ class Job:
         """Child process exited: settle the terminal state."""
         with self._lock:
             if self.state == "stopping":
-                self.state = "done" if exit_code in (0, 130) else "error"
+                if exit_code in _INTERRUPT_EXIT_CODES:
+                    self.state = "done"
+                    self.interrupted = True
+                else:
+                    self.state = "done" if exit_code == 0 else "error"
             elif self.state == "running":
                 # No terminal event arrived (crash/old backend): derive state.
                 self.state = "done" if exit_code == 0 else "error"
             self.exit_code = self.exit_code if self.exit_code is not None else exit_code
             if self.state == "error" and not self.error:
                 self.error = f"child exited with code {exit_code}"
+            if self.state == "error" and self.phase:
+                # Crash with no terminal event: don't leave an active spinner.
+                self.phases[self.phase] = "failed"
             self.phases["merge"] = "done" if self.state == "done" else self.phases["merge"]
             self.proc = None
 
@@ -347,43 +413,50 @@ def _reader_stderr(pipe):
             pass
 
 
+_SPAWN_LOCK = threading.Lock()
+
+
 def _spawn(params: dict) -> tuple[bool, str]:
     """Validate params, build argv, spawn the reforge child with readers."""
-    if JOB.state == "running":
-        return False, "A training run is already active."
+    # Serialize the check-then-spawn sequence: ThreadingHTTPServer handles
+    # requests concurrently, so two rapid Start clicks could both pass the
+    # state check and launch two children into the same output_dir.
+    with _SPAWN_LOCK:
+        if JOB.state in ("running", "stopping"):
+            return False, "A training run is already active."
 
-    if not isinstance(params, dict):
-        params = {}
-    try:
-        cmd = build_argv(params)
-    except ValueError as e:
-        return False, str(e)
+        if not isinstance(params, dict):
+            params = {}
+        try:
+            cmd = build_argv(params)
+        except ValueError as e:
+            return False, str(e)
 
-    env = os.environ.copy()
-    env["PYTHONIOENCODING"] = "utf-8"
-    env["PYTHONUNBUFFERED"] = "1"
-    kwargs = {}
-    if platform.system() == "Windows":
-        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-    try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, **kwargs)
-    except Exception as e:
-        return False, f"Launch failed: {e}"
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUNBUFFERED"] = "1"
+        kwargs = {}
+        if platform.system() == "Windows":
+            kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, **kwargs)
+        except Exception as e:
+            return False, f"Launch failed: {e}"
 
-    dataset = params.get("dataset") or params.get("hf_dataset") or ""
-    if isinstance(dataset, list):  # batch stages carry their own datasets
-        dataset = ""
-    JOB.begin(proc, base_model=params.get("base_model") or "",
-              dataset=str(dataset))
+        dataset = params.get("dataset") or params.get("hf_dataset") or ""
+        if isinstance(dataset, list):  # batch stages carry their own datasets
+            dataset = ""
+        JOB.begin(proc, base_model=params.get("base_model") or "",
+                  dataset=str(dataset))
 
-    for target, pipe in ((_reader_stdout, proc.stdout), (_reader_stderr, proc.stderr)):
-        t = threading.Thread(target=target, args=(pipe,), daemon=True)
-        t.start()
-        JOB._threads.append(t)
+        for target, pipe in ((_reader_stdout, proc.stdout), (_reader_stderr, proc.stderr)):
+            t = threading.Thread(target=target, args=(pipe,), daemon=True)
+            t.start()
+            JOB._threads.append(t)
 
-    threading.Thread(target=_reaper, args=(proc,), daemon=True).start()
-    return True, "started"
+        threading.Thread(target=_reaper, args=(proc,), daemon=True).start()
+        return True, "started"
 
 
 def _reaper(proc: subprocess.Popen):
@@ -396,8 +469,10 @@ def _reaper(proc: subprocess.Popen):
 
 
 def _stop() -> tuple[bool, str]:
-    proc = JOB.proc
-    if not proc:
+    proc = JOB.request_stop()
+    if proc is None:
+        if JOB.state == "stopping":
+            return True, "stop already requested"
         return False, "No active run."
     try:
         if platform.system() == "Windows":
@@ -405,6 +480,7 @@ def _stop() -> tuple[bool, str]:
         else:
             proc.send_signal(signal.SIGINT)
     except Exception as e:
+        JOB.cancel_stop()   # let the user try again
         return False, f"Could not send interrupt: {e}"
     JOB.add_log(f"[{_now()}] stop requested — child is saving state…")
     return True, "stop requested"
@@ -504,6 +580,14 @@ def _analysis() -> dict:
     best_v = float(y[best_i])
     since_best = n - (best_i + 1)
 
+    # Degenerate series (e.g. duplicate step values make polyfit singular)
+    # can produce NaN/inf. Serializing that as JSON null would crash the
+    # browser's .toFixed() calls; report "unavailable" instead.
+    if not all(math.isfinite(float(v)) for v in
+               (y_mean, y_med, y_std, drop_pct, gslope_n, rslope_n, r_snr,
+                best_v)):
+        return {"ok": False, "error": "Loss analysis unavailable (non-finite values)."}
+
     if slope < -1e-6:
         to_t = max(0, int((y[-1] - (best_v + 0.05)) / -slope))
         pred = f"step {int(steps[-1]) + to_t} (~{to_t} more)"
@@ -540,24 +624,46 @@ def _analysis() -> dict:
     }
 
 
-_REPORT_CACHE = {"path": None, "data": None}
+_REPORT_CACHE = {"key": None, "data": None}
 
 
 def _read_report() -> dict:
-    """training_report.json from the finished run (cached per path)."""
+    """training_report.json from the finished run (cached per file version).
+
+    The key includes mtime/size so a second run into the same output_dir
+    cannot serve the previous run's cached report.
+    """
     path = (JOB.snapshot().get("result") or {}).get("report")
     if not path:
         return {"ok": False, "error": "No report available."}
-    if _REPORT_CACHE["path"] == path and _REPORT_CACHE["data"] is not None:
-        return _REPORT_CACHE["data"]
     try:
+        st = os.stat(path)
+        key = (path, st.st_mtime_ns, st.st_size)
+        if _REPORT_CACHE["key"] == key and _REPORT_CACHE["data"] is not None:
+            return _REPORT_CACHE["data"]
         with open(path, "r", encoding="utf-8") as f:
             import json as _json
             data = {"ok": True, "report": _json.load(f)}
     except Exception as e:
         return {"ok": False, "error": f"Could not read report: {e}"}
-    _REPORT_CACHE["path"], _REPORT_CACHE["data"] = path, data
+    _REPORT_CACHE["key"], _REPORT_CACHE["data"] = key, data
     return data
+
+
+def _finite_json(obj):
+    """Replace NaN/Infinity with None so the browser's JSON.parse succeeds.
+
+    A diverging run can log a NaN loss; Python's json.dumps emits a bare
+    ``NaN`` token which is invalid JSON, and one such status poll would
+    break the whole SPA (it falls back to "server unreachable").
+    """
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _finite_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_finite_json(v) for v in obj]
+    return obj
 
 
 # ── HTTP handler ─────────────────────────────────────────────────────
@@ -573,12 +679,15 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _send_json(self, obj, code: int = 200) -> None:
-        self._send(code, json.dumps(obj).encode("utf-8"),
-                   "application/json; charset=utf-8")
+        payload = json.dumps(_finite_json(obj), allow_nan=False).encode("utf-8")
+        self._send(code, payload, "application/json; charset=utf-8")
 
     def _read_json(self) -> dict:
-        length = int(self.headers.get("Content-Length", 0) or 0)
-        if not length:
+        try:
+            length = int(self.headers.get("Content-Length", 0) or 0)
+        except (TypeError, ValueError):
+            return {}
+        if length <= 0 or length > 8 * 1024 * 1024:
             return {}
         try:
             return json.loads(self.rfile.read(length).decode("utf-8"))
@@ -640,8 +749,25 @@ def launch(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
         server.serve_forever()
     except KeyboardInterrupt:
         _info("Shutting down.")
-        if JOB.proc:
+        if JOB.proc is not None:
             _stop()
+            # Do not orphan the child: it lives in its own process group, so
+            # it would keep training after this server exits. Give it time to
+            # save and finish its export, then kill a stuck child (resume from
+            # the checkpoint still works). Poll JOB.proc instead of calling
+            # Popen.wait() here: the reaper thread owns that wait and settles
+            # the job (and clears proc) when the child exits.
+            deadline = time.time() + 120
+            while JOB.proc is not None and time.time() < deadline:
+                time.sleep(0.2)
+            stuck = JOB.proc
+            if stuck is not None:
+                _warn("Child did not exit in time — terminating it.")
+                try:
+                    stuck.kill()
+                    stuck.wait(timeout=10)
+                except Exception:
+                    pass
     finally:
         server.server_close()
 
@@ -1028,7 +1154,7 @@ function route(state){
   prog.hidden  = !(state === "running" || state === "stopping");
   res.hidden   = !(state === "done" || state === "error");
   $("btn-start").hidden = !(state === "idle" || state === "done" || state === "error");
-  $("btn-stop").hidden  = !(state === "running" || state === "stopping");
+  $("btn-stop").hidden  = state !== "running";
 }
 
 function chip(state, s){
@@ -1040,7 +1166,7 @@ function chip(state, s){
   else if (state === "done"){ cls = "done"; text = "Complete"; }
   else if (state === "error"){ cls = "err"; text = "Failed"; }
   if (s.interrupted) text += " · interrupted";
-  el.classList.add(cls);
+  if (cls) el.classList.add(cls);   // classList.add("") throws a SyntaxError
   $("chip-text").textContent = text;
 }
 
@@ -1194,8 +1320,8 @@ async function renderAnalysis(){
 function renderLog(s, elId){
   const el = $(elId);
   const atBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 4;
-  el.textContent = (s.log || []).join("");
-  if (elId === "log" && $("log-follow").checked && !atBottom) el.scrollTop = el.scrollHeight;
+  el.textContent = (s.log || []).join("\n");
+  if (elId === "log" && $("log-follow").checked && atBottom) el.scrollTop = el.scrollHeight;
 }
 
 /* ── results view ──────────────────────────────────────────────────── */
@@ -1207,7 +1333,7 @@ async function renderResults(s){
       + (s.error_code ? ` <span class="chip"><span class="dot"></span>${esc(s.error_code)}</span>` : "")
       + `</div>`;
     if (s.hint) html += `<div class="hint">💡 ${esc(s.hint)}</div>`;
-    if (s.interrupted) html += `<div class="banner warn">Run was interrupted — progress was saved.</div>`;
+    if (s.interrupted) html += `<div class="banner warn">Run was stopped before completion.</div>`;
     body.innerHTML = html;
     renderLog(s, "res-log");
     return;
@@ -1222,7 +1348,7 @@ async function renderResults(s){
     + card("Steps", `${s.step}/${s.total_steps || "?"}`)
     + card("Time", fmtHMS(r.time_sec))
     + `</div>`;
-  if (s.interrupted) html += `<div class="banner warn">Run was stopped early — the adapter state was saved to the output dir (interrupted_adapter).</div>`;
+  if (s.interrupted) html += `<div class="banner warn">Run was stopped before completion — any saved state is in the output dir.</div>`;
   body.innerHTML = html;
   try{
     const rep = await jget("/api/report");

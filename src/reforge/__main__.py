@@ -147,6 +147,24 @@ def main():
         sys.stdout.flush()
         raise SystemExit(0)
 
+    # `--batch_dir` alone is the documented resume path. Recover the
+    # manifest recorded in batch_state.json instead of silently falling
+    # through to a single-dataset run (only --batch dispatches to the batch
+    # flow) or enabling the agent bridge in the wrong directory.
+    if parsed_args.batch_dir and not parsed_args.batch:
+        _state_path = os.path.join(parsed_args.batch_dir, "batch_state.json")
+        try:
+            with open(_state_path, "r", encoding="utf-8") as _f:
+                _recorded = (json.load(_f) or {}).get("manifest_path")
+        except Exception:
+            _recorded = None
+        if not _recorded or not os.path.isfile(_recorded):
+            _err(f"Cannot resume batch: no usable manifest recorded in {_state_path}.\n"
+                 f"Pass the original arguments too: --batch <manifest.json> "
+                 f"--batch_dir {parsed_args.batch_dir}")
+            raise SystemExit(2)
+        parsed_args.batch = [_recorded]
+
     # `--dry_run`: non-interactive preflight, also keeps stdout pure JSON.
     if parsed_args.dry_run:
         _set_stream(sys.stderr)
@@ -214,9 +232,14 @@ def main():
     except SystemExit:
         raise
     except KeyboardInterrupt:
-        BRIDGE.emit("run_failed", error="Interrupted by user (KeyboardInterrupt)",
-                    exit_code=130)
-        raise
+        # A user interrupt is not a failure. Emit run_interrupted (so the web
+        # UI marks the run stopped, not failed) and exit 130, the documented
+        # interrupted code. Re-raising would make Windows exit 0xC000013A,
+        # which supervisors cannot distinguish from a crash.
+        BRIDGE.emit("run_interrupted", error="Interrupted by user",
+                    error_code="interrupted", exit_code=130)
+        _warn("Interrupted by user")
+        raise SystemExit(130)
     except Exception as e:
         error = str(e)
         error_code, hint = classify_error(error)
@@ -346,7 +369,8 @@ def _dry_run(parsed_args) -> int:
             batch_size = BATCH_SIZE
 
         if rows is not None:
-            estimated_steps = max(0, rows // (batch_size * grad_accum))
+            _denom = batch_size * grad_accum
+            estimated_steps = (rows + _denom - 1) // _denom  # ceil, same as Trainer
             if parsed_args.steps is not None:
                 use_steps = True
                 total_steps = parsed_args.steps
@@ -628,7 +652,6 @@ def _run_pipeline(parsed_args, image_mode, output_dir, merge_dir, merge_success_
     import shutil
     import torch
     from peft import PeftModel
-    from transformers import AutoModelForCausalLM, AutoModelForImageTextToText
 
     save_profile = None
     if isinstance(model, PeftModel):
@@ -698,6 +721,15 @@ def _run_pipeline(parsed_args, image_mode, output_dir, merge_dir, merge_success_
 
     _info(f"Saving to: {merge_dir_actual}")
     os.makedirs(merge_dir_actual, exist_ok=True)
+    # Invalidate the previous run's success marker before overwriting the
+    # directory: a failure mid-save must never leave a stale "merge
+    # complete" flag that the next run/chained stage would trust.
+    _success_path = os.path.join(merge_dir_actual, "success.txt")
+    try:
+        if os.path.isfile(_success_path):
+            os.remove(_success_path)
+    except OSError as _flag_err:
+        _warn(f"Could not clear old success.txt: {_flag_err}")
 
     # Serve-time stopping: training teaches the template's end-of-turn token
     # (<|im_end|> etc.), but the merged model's generation_config is whatever
@@ -745,14 +777,16 @@ def _run_pipeline(parsed_args, image_mode, output_dir, merge_dir, merge_success_
 
 def _raise_batch(parsed_args, agent_mode) -> None:
     """Top-level batch flow: sequential stages with chained merges."""
-    from .batch import BatchRunner, load_manifest
-
+    from .batch import (BatchRunner, load_manifest,
+                        global_stage_defaults, apply_stage_defaults)
     _fallback_log = os.path.join(
         (parsed_args.output_dir or OUTPUT_DIR).rstrip("\\/"), "console.log")
     _install_safe_streams(_fallback_log)
 
     try:
         manifest = load_manifest(parsed_args.batch)
+        _defaults = global_stage_defaults(parsed_args)
+        manifest = apply_stage_defaults(manifest, _defaults)
         runner = BatchRunner(
             manifest,
             base_model=parsed_args.base_model or manifest.get("base_model"),
@@ -760,11 +794,38 @@ def _raise_batch(parsed_args, agent_mode) -> None:
             output_dir=parsed_args.output_dir,
             extra_flags=("--no_tqdm",) if parsed_args.no_tqdm else (),
         )
+        # Record the effective plan (global defaults included, inline lists
+        # materialized) so `--batch_dir <dir>` alone can resume with exactly
+        # the same per-stage options.
+        if _defaults or not manifest.get("_manifest_path"):
+            from .batch import _write_state
+            try:
+                os.makedirs(runner.batch_dir, exist_ok=True)
+                _eff_path = os.path.join(runner.batch_dir,
+                                         "manifest_effective.json")
+                with open(_eff_path, "w", encoding="utf-8") as _f:
+                    json.dump({"base_model": runner.base_model,
+                               "stages": runner.stages,
+                               "keep_stage_merges": runner.keep_stage_merges},
+                              _f, indent=2)
+                runner.manifest["_manifest_path"] = _eff_path
+                if runner.state:
+                    runner.state["manifest_path"] = _eff_path
+                    _write_state(runner.state_path, runner.state)
+            except Exception as _eff_err:
+                _warn(f"Could not record effective batch manifest: {_eff_err}")
     except Exception as e:
         from .batch import _BatchError
         error_code = "batch_manifest_invalid" if isinstance(e, _BatchError) else None
         _err(str(e) if isinstance(e, _BatchError) else f"Batch setup failed: {e}")
         if agent_mode:
+            if not BRIDGE.enabled:
+                # Setup failed before a batch_dir existed. Enable the bridge
+                # just for the terminal event so the UI receives the real
+                # message instead of a bare "child exited with code 2".
+                _setup_out = parsed_args.output_dir or OUTPUT_DIR
+                BRIDGE.enable(_setup_out, os.path.join(_setup_out, "merged"),
+                              log_path=parsed_args.agent_log)
             BRIDGE.emit("batch_failed", error=str(e), error_code=error_code
                         or "batch_setup_failed", exit_code=2)
         raise SystemExit(2)
@@ -783,9 +844,12 @@ def _raise_batch(parsed_args, agent_mode) -> None:
         _warn("Batch interrupted. Resume with: "
               f"--batch {parsed_args.batch[0] if len(parsed_args.batch) == 1 else ' '.join(parsed_args.batch)} "
               f"--batch_dir {runner.batch_dir}")
-        raise
+        raise SystemExit(130)
     except Exception as e:
         _err(f"Batch error: {e}")
+        if agent_mode:
+            BRIDGE.emit("batch_failed", error=str(e),
+                        error_code="batch_error", exit_code=1)
         raise SystemExit(1)
     raise SystemExit(code)
 
@@ -793,7 +857,8 @@ def _raise_batch(parsed_args, agent_mode) -> None:
 def _dry_run_batch(parsed_args) -> int:
     """Preflight for --batch: validate every stage, print one JSON plan."""
     import json as _json
-    from .batch import dry_run_batch, load_manifest
+    from .batch import (dry_run_batch, load_manifest,
+                        global_stage_defaults, apply_stage_defaults)
 
     result = {"dry_run": True, "ok": True, "errors": [], "warnings": []}
 
@@ -807,6 +872,8 @@ def _dry_run_batch(parsed_args) -> int:
 
     try:
         manifest = load_manifest(parsed_args.batch)
+        manifest = apply_stage_defaults(manifest,
+                                        global_stage_defaults(parsed_args))
     except Exception as e:
         _add_error("batch_manifest_invalid", str(e),
                    "check --batch (a .json manifest or a list of .parquet paths)")

@@ -1,7 +1,24 @@
 import json
+import math
 import os
 
 from .display import _ok, _warn, _banner, _table, _safe_print, _c, _ANSI_BCYAN, _ANSI_DIM, _fmt_duration
+
+
+def _json_safe(obj):
+    """Replace non-finite floats with None so the report is strict JSON.
+
+    Trainer log entries can carry NaN/Inf from a diverged run. Python's
+    json.dump writes bare NaN, which is invalid JSON for every non-Python
+    consumer of training_report.json.
+    """
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    return obj
 
 
 def _loss_sparkline(values: list, width: int = 48) -> str:
@@ -43,8 +60,16 @@ def summarize_training(
     steps_per_sec = 0.0
     for entry in log:
         if "loss" in entry and "eval_loss" not in entry:
+            try:
+                loss = float(entry["loss"])
+            except (TypeError, ValueError):
+                continue
+            # A diverging run can log NaN/Inf. One non-finite point would
+            # poison min/max and crash the sparkline after a completed run.
+            if not math.isfinite(loss):
+                continue
             loss_steps.append(int(entry.get("step", len(loss_steps) + 1)))
-            loss_values.append(float(entry["loss"]))
+            loss_values.append(loss)
         if "eval_loss" in entry:
             eval_entries.append(entry)
         if "train_runtime" in entry:
@@ -139,18 +164,20 @@ def summarize_training(
     if eval_entries:
         final_eval = eval_entries[-1]
         ev_loss = final_eval.get("eval_loss")
-        if ev_loss is not None:
+        if ev_loss is not None and math.isfinite(float(ev_loss)):
             _table("Evaluation", [
                 ("Final eval loss", f"{float(ev_loss):.4f}"),
                 ("Eval points",     f"{len(eval_entries)}"),
             ])
+        elif ev_loss is not None:
+            _warn("Final eval loss is non-finite (diverged run) \u2014 omitted")
     _safe_print()
 
     if report_path:
         try:
             os.makedirs(os.path.dirname(report_path) or ".", exist_ok=True)
             with open(report_path, "w", encoding="utf-8") as f:
-                json.dump(report, f, indent=2)
+                json.dump(_json_safe(report), f, indent=2, allow_nan=False)
             _ok(f"Report written: {report_path}")
         except Exception as e:
             _warn(f"Could not write training_report.json: {e}")

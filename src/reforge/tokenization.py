@@ -8,6 +8,34 @@ from PIL import Image as PILImage
 from .display import _info
 
 
+def _apply_chat_template_ids(tokenizer, messages, *, add_generation_prompt):
+    """``apply_chat_template`` -> ``(input_ids, attention_mask)`` across versions.
+
+    ``return_dict=True`` only exists in newer transformers; the declared
+    minimum (>=4.41) returns a plain list. Try the structured call first,
+    then fall back, so both behave identically here.
+    """
+    try:
+        out = tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=add_generation_prompt,
+            return_dict=True,
+        )
+    except TypeError:
+        out = tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=add_generation_prompt,
+        )
+    if hasattr(out, "get"):
+        ids = list(out["input_ids"])
+        mask = out.get("attention_mask")
+        return ids, list(mask) if mask is not None else [1] * len(ids)
+    ids = list(out)
+    return ids, [1] * len(ids)
+
+
 class DynamicCausalCollator:
     def __init__(self, tokenizer, pad_to_multiple_of=8, image_mode=False):
         self.tokenizer = tokenizer
@@ -52,6 +80,11 @@ class DynamicCausalCollator:
                     batch["pixel_values"] = torch.cat(
                         [p.unsqueeze(0) if p.dim() == 3 else p for p in pixel_list], dim=0
                     )
+            sizes = [f.get("image_sizes") for f in features]
+            if sizes and all(s is not None for s in sizes):
+                batch["image_sizes"] = torch.stack(
+                    [torch.as_tensor(s, dtype=torch.long).reshape(-1)
+                     for s in sizes])
 
         return batch
 
@@ -184,20 +217,40 @@ def tokenize(example, tokenizer, training_mode="sft", max_length=750, processor=
             image = _decode_image(example["image"])
         except Exception as e:
             print(f"[WARN] Skipping unreadable image: {e}")
-            return {"input_ids": [], "attention_mask": [], "labels": [], "pixel_values": None}
+            return {"input_ids": [], "attention_mask": [], "labels": [],
+                    "pixel_values": None, "image_sizes": None}
 
         text = example.get("text", "")
-        prompt = f"<|user|>\n<|image_1|>\n{text}<|end|>\n<|assistant|>"
+        q, a = split_sft_pair(text, example.get("question") or "")
+        answer = a or text          # caption-only rows: the text is the answer
+        # Two-turn Phi-3-Vision format. The answer must live in the assistant
+        # turn: the old single-turn prompt put it in the user turn, leaving
+        # every label at -100 (NaN loss).
+        prompt = (f"<|user|>\n<|image_1|>\n{q}<|end|>\n"
+                  f"<|assistant|>\n{answer}<|end|>")
         encoded = processor(
             text=prompt,
             images=image,
-            truncation=True,
-            max_length=max_length,
+            truncation=False,       # drop overlong rows instead of cutting <|end|>
             return_tensors="pt"
         )
         input_ids      = encoded["input_ids"][0].tolist()
         attention_mask = encoded["attention_mask"][0].tolist()
         pixel_values   = encoded["pixel_values"][0]
+        # Phi3V's forward skips vision embeddings entirely unless image_sizes
+        # is supplied; dropping it silently trains on negative placeholder
+        # ids (i.e. no image information at all).
+        raw_sizes = encoded.get("image_sizes")
+        if raw_sizes is not None:
+            raw_sizes = raw_sizes[0]
+            image_sizes = (raw_sizes.tolist() if hasattr(raw_sizes, "tolist")
+                           else list(raw_sizes))
+        else:
+            image_sizes = None
+        if len(input_ids) > max_length:
+            return {"input_ids": [], "attention_mask": [], "labels": [],
+                    "length": len(input_ids), "pixel_values": None,
+                    "image_sizes": None}
 
         assistant_token_ids = tokenizer.encode("<|assistant|>", add_special_tokens=False)
         labels = [-100] * len(input_ids)
@@ -218,6 +271,7 @@ def tokenize(example, tokenizer, training_mode="sft", max_length=750, processor=
             "attention_mask": [int(x) for x in attention_mask],
             "labels":         [int(x) for x in labels],
             "pixel_values":   pixel_values,
+            "image_sizes":    image_sizes,
             "length":         len(input_ids),
         }
 
@@ -237,26 +291,16 @@ def tokenize(example, tokenizer, training_mode="sft", max_length=750, processor=
             # Tokenize fully first: right-truncation would cut the trailing
             # <|im_end|> off long assistant turns, teaching the model to
             # never stop. Overlong rows are dropped instead (see below).
-            full_tokens = tokenizer.apply_chat_template(
-                messages,
-                tokenize=True,
-                add_generation_prompt=False,
-                return_dict=True,
-            )
-            input_ids = full_tokens["input_ids"]
-            attention_mask = full_tokens.get("attention_mask", [1] * len(input_ids))
+            input_ids, attention_mask = _apply_chat_template_ids(
+                tokenizer, messages, add_generation_prompt=False)
             if len(input_ids) > max_length:
                 return {"input_ids": [], "attention_mask": [], "labels": [], "length": len(input_ids)}
 
             # Everything before the final assistant message is the prompt.
-            prompt_tokens = tokenizer.apply_chat_template(
-                messages[:last_assistant],
-                tokenize=True,
-                add_generation_prompt=True,
-                return_dict=True,
-            )
+            prompt_ids, _ = _apply_chat_template_ids(
+                tokenizer, messages[:last_assistant], add_generation_prompt=True)
             boundary = _align_boundary(
-                input_ids, prompt_tokens["input_ids"],
+                input_ids, prompt_ids,
                 messages[last_assistant].get("content"), tokenizer)
 
             # Sanity: boundary must leave some response tokens to train on.
@@ -295,28 +339,22 @@ def tokenize(example, tokenizer, training_mode="sft", max_length=750, processor=
             # <|im_end|> on long assistant turns and teach the model to
             # never stop; overlong rows are dropped instead (labels stay
             # intact for every row that trains).
-            full_tokens = tokenizer.apply_chat_template(
+            input_ids, attention_mask = _apply_chat_template_ids(
+                tokenizer,
                 [{"role": "user", "content": question},
                  {"role": "assistant", "content": answer}],
-                tokenize=True,
-                add_generation_prompt=False,
-                return_dict=True,
-            )
-            input_ids = full_tokens["input_ids"]
-            attention_mask = full_tokens.get("attention_mask", [1] * len(input_ids))
+                add_generation_prompt=False)
             if len(input_ids) > max_length:
                 return {"input_ids": [], "attention_mask": [], "labels": [], "length": len(input_ids)}
 
             # Tokenize ONLY the user message (question) with same chat template to find boundary
             # This gives us the EXACT token count of the prompt portion
-            user_tokens = tokenizer.apply_chat_template(
+            prompt_ids, _ = _apply_chat_template_ids(
+                tokenizer,
                 [{"role": "user", "content": question}],
-                tokenize=True,
-                add_generation_prompt=True,  # Include assistant prompt marker
-                return_dict=True,
-            )
+                add_generation_prompt=True)  # include assistant prompt marker
             boundary = _align_boundary(
-                input_ids, user_tokens["input_ids"], answer, tokenizer)
+                input_ids, prompt_ids, answer, tokenizer)
 
             # Sanity: boundary must leave some response tokens to train on
             if boundary <= 0 or boundary >= len(input_ids):
@@ -364,12 +402,8 @@ def measure_lengths(ds, tokenizer, training_mode=None):
     def _template_len(tokenizer, messages) -> int | None:
         """Token length of a conversation under its chat template, or None."""
         try:
-            ids = tokenizer.apply_chat_template(
-                messages, tokenize=True, add_generation_prompt=False)
-            # Newer transformers wrap the ids in a BatchEncoding; plain lists
-            # are returned by older versions.
-            if hasattr(ids, "get"):
-                ids = ids["input_ids"]
+            ids, _ = _apply_chat_template_ids(
+                tokenizer, messages, add_generation_prompt=False)
             return len(ids)
         except Exception:
             return None
