@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import shutil
 
@@ -13,7 +14,7 @@ from transformers import (
 )
 
 from .config import BATCH_SIZE, LOG_STEPS, SAVE_STEPS, SAVE_LIMITS, OUTPUT_DIR, MERGED_DIR
-from .display import _info, _ok, _warn, _err, _banner, _table, _safe_print
+from .display import _info, _ok, _warn, _err, _banner, _table
 from .agent import BRIDGE, AgentProgressCallback, classify_error
 from .profiles import resolve_model_profile
 from .early_stopping import select_scheduler, EarlyStopByLoss, compute_min_steps, dynamic_early_stop_cap
@@ -249,7 +250,10 @@ def run_training(train_dataset, tokenizer, training_mode, model_name, processor,
     _info(f"Model profile: {os.path.basename(model_name)}  |  grad_accum: {grad_accum}"
           + ("" if grad_accum == profile["grad_accum"] else f"  (profile default: {profile['grad_accum']})")
           + f"  |  lr: {profile['learning_rate']}")
-    estimated_steps = len(train_dataset) // (batch_size * grad_accum)
+    # Match Trainer's step count (ceil over the accumulation window): floor
+    # division rejects small datasets (e.g. 4 rows, batch 2 x accum 8) that
+    # Trainer trains in one step.
+    estimated_steps = math.ceil(len(train_dataset) / (batch_size * grad_accum))
     use_steps = parsed_args.steps is not None
 
     if use_steps:
@@ -525,42 +529,54 @@ def run_training(train_dataset, tokenizer, training_mode, model_name, processor,
                     hint=_hint, emergency_save=True)
         _err(f"Training error: {e}")
         _warn("Attempting emergency save before merge...")
+        # Same rule as the interrupt path: never write adapter files into
+        # merge_dir. A previous run's success.txt may still be there, and
+        # adapter_config.json would contradict it on the next resume/chain.
+        _emergency_dir = os.path.join(output_dir, "emergency_adapter")
         try:
+            os.makedirs(_emergency_dir, exist_ok=True)
             if isinstance(model, PeftModel):
-                model.save_pretrained(merge_dir)
+                model.save_pretrained(_emergency_dir)
             else:
-                trainer.save_model(merge_dir)
+                trainer.save_model(_emergency_dir)
+            _ok(f"Emergency adapter saved to {_emergency_dir}")
         except Exception as save_err:
             _err(f"Emergency save also failed: {save_err}")
     finally:
-        _banner("Cleanup")
-        _info("Cleaning checkpoints...")
-        ckpts = [d for d in os.listdir(output_dir) if d.startswith("checkpoint-")]
-        ckpts = sorted(
-            [d for d in ckpts if d.split("-")[-1].isdigit()],
-            key=lambda d: int(d.split("-")[-1])
-        )
+        # Checkpoint housekeeping must never turn a finished training run
+        # into a failure (e.g. antivirus locking the checkpoint dir on
+        # Windows), and must never mask the original training exception.
+        try:
+            _banner("Cleanup")
+            _info("Cleaning checkpoints...")
+            ckpts = [d for d in os.listdir(output_dir) if d.startswith("checkpoint-")]
+            ckpts = sorted(
+                [d for d in ckpts if d.split("-")[-1].isdigit()],
+                key=lambda d: int(d.split("-")[-1])
+            )
 
-        if ckpts:
-            latest = ckpts[-1]
-            last_path = os.path.join(output_dir, latest)
-            symlink_path = os.path.join(output_dir, "checkpoint-last")
+            if ckpts:
+                latest = ckpts[-1]
+                last_path = os.path.join(output_dir, latest)
+                symlink_path = os.path.join(output_dir, "checkpoint-last")
 
-            if os.path.islink(symlink_path) or os.path.exists(symlink_path):
+                if os.path.islink(symlink_path) or os.path.exists(symlink_path):
+                    try:
+                        os.unlink(symlink_path)
+                    except OSError:
+                        shutil.rmtree(symlink_path)
+
                 try:
-                    os.unlink(symlink_path)
-                except OSError:
-                    shutil.rmtree(symlink_path)
+                    os.symlink(last_path, symlink_path, target_is_directory=True)
+                except (OSError, NotImplementedError):
+                    _warn("Could not create symlink \u2014 copying instead")
+                    shutil.copytree(last_path, symlink_path)
+                _ok(f"checkpoint-last \u2192 {latest}")
 
-            try:
-                os.symlink(last_path, symlink_path, target_is_directory=True)
-            except (OSError, NotImplementedError):
-                _warn("Could not create symlink \u2014 copying instead")
-                shutil.copytree(last_path, symlink_path)
-            _ok(f"checkpoint-last \u2192 {latest}")
-
-            backup_path = os.path.join(output_dir, "last_good_ckpt")
-            shutil.copytree(last_path, backup_path, dirs_exist_ok=True)
-            _ok("Last checkpoint backed up")
+                backup_path = os.path.join(output_dir, "last_good_ckpt")
+                shutil.copytree(last_path, backup_path, dirs_exist_ok=True)
+                _ok("Last checkpoint backed up")
+        except Exception as e:
+            _warn(f"Checkpoint cleanup skipped: {e}")
 
     return model, trainer, _training_error
