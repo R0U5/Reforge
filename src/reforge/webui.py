@@ -1,26 +1,33 @@
-"""Local web UI for Reforge — a browser dashboard in the style of Lethe's UI.
+"""Local web UI for Reforge — a modern browser dashboard.
 
 Zero third-party dependencies: a stdlib ``http.server`` serves one
-self-contained page and a small JSON API. Launch with ``reforge webui``
-(alias ``reforge ui``) and open http://127.0.0.1:7861.
+self-contained page (``webui_assets.py``) and a small JSON API. Launch with
+``reforge webui`` (alias ``reforge ui``) and open http://127.0.0.1:7861.
 
 Architecture (see docs/WEBUI_MIGRATION.md, decisions D1-D11):
     The server is a thin supervisor. ``POST /api/start`` validates the
-    config and spawns ``python -m reforge --agent ...`` as a child process
-    (same isolation model as the Tk dashboard). Reader threads tail the
-    child's stdout (NDJSON agent events) and stderr (human log + loss
-    rows); events update a thread-safe ``Job`` snapshot that the page
-    polls every second. ``POST /api/stop`` sends CTRL_BREAK/SIGINT for a
-    graceful checkpoint save.
+    config and spawns ``python -m reforge --agent ...`` as a child process.
+    Reader threads tail the child's stdout (NDJSON agent events) and stderr
+    (human log + loss rows); events update a thread-safe ``Job`` snapshot
+    that the page polls every second. ``POST /api/stop`` sends
+    CTRL_BREAK/SIGINT for a graceful checkpoint save.
 
 Endpoints:
     GET  /              the single-page app
     GET  /api/status    current job state (polled by the page)
+    GET  /api/models    local model candidates for the base-model field
+    GET  /api/places    filesystem shortcuts for the folder picker
+    GET  /api/browse    directory listing for the folder picker
+    GET  /api/analysis  loss-analysis math over the live loss ring
+    GET  /api/report    training_report.json for the finished run
     POST /api/start     begin a training job   -> {ok} | {error}
     POST /api/stop      graceful stop (checkpoint save)
+    POST /api/preview   validated command preview (no side effects)
+    POST /api/mkdir     create a folder from the picker
+    POST /api/reveal    open a file/folder in the OS file manager
 
-Phases (WIP skeleton): config form and progress rendering land in Phases
-3-4. /api/status already carries the full event-driven state machine.
+Filesystem endpoints are localhost-only: they return 403 when the server
+is bound to a non-loopback address and accessed remotely.
 """
 
 from __future__ import annotations
@@ -30,6 +37,7 @@ import math
 import os
 import platform
 import signal
+import string
 import subprocess
 import sys
 import threading
@@ -37,15 +45,21 @@ import time
 import webbrowser
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlsplit
 
+from .config import DEFAULT_HF_MODELS_DIR, OUTPUT_DIR
 from .display import _info, _title, _warn
+from .webui_assets import INDEX_HTML
 from .webui_config import build_argv, scan_models
 
 # ── Tunables ─────────────────────────────────────────────────────────
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 7861          # 7860 is Lethe's default; both may run side by side
-MAX_LOG_LINES = 400          # ring buffer for the console pane
-LOG_TAIL = 80                # lines sent per status poll
+MAX_LOG_LINES = 800          # ring buffer for the console pane
+LOG_TAIL = 160               # lines sent per status poll
+MAX_SIGNALS = 60             # recent activity timeline entries
+MAX_ES_CHECKS = 240          # EMA points kept for the chart overlay
+MAX_BROWSE_ENTRIES = 2000    # guard against enormous directories
 
 # Exit codes that mean "the user interrupted the child". A stop requested
 # through the UI is not a failure, but the child cannot always report 130:
@@ -68,6 +82,17 @@ _SUPPRESS_PATTERNS = (
 def _now() -> str:
     import datetime
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _num(value):
+    """Finite float or None — agent events must never poison the chart."""
+    if value is None:
+        return None
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
 
 
 # ── Job state ────────────────────────────────────────────────────────
@@ -94,13 +119,35 @@ class Job:
         self.latest_loss = None
         self.latest_acc = None          # DPO runs: rewards/accuracies
         self.best_loss = None
+        self.latest_grad_norm = None    # per-step telemetry (agent v6)
+        self.learning_rate = None
+        self.epoch = None
         self.rate_it_s = None
         self.training_mode = None
         self.base_model = None
         self.dataset = None
         self.stage = None            # batch mode: {"index": i, "total": n}
         self.log = deque(maxlen=MAX_LOG_LINES)
-        self.losses = deque(maxlen=MAX_CHART_POINTS)   # {"step": n, "loss": f}
+        # Each point: step, loss, grad_norm, lr, epoch (None when absent).
+        self.losses = deque(maxlen=MAX_CHART_POINTS)
+        # Early-stopping health (agent early_stop_check events).
+        self.ema = None
+        self.best_ema = None
+        self.since_best = None
+        self.patience = None
+        self.verdict = None
+        self.early_stop_enabled = None
+        self.beta = None
+        self.early_stop_triggered = None
+        self.es_checks = deque(maxlen=MAX_ES_CHECKS)  # {step, ema, best_ema}
+        # Checkpoints + a compact activity timeline for the UI.
+        self.checkpoint = None          # {"step", "path", "ts"}
+        self.checkpoint_count = 0
+        self.signals = deque(maxlen=MAX_SIGNALS)
+        # Training plan and dataset facts for the sidebar.
+        self.plan = {}
+        self.dataset_info = {}
+        self.run_config = {}
         self.error = None
         self.error_code = None
         self.hint = None
@@ -111,6 +158,42 @@ class Job:
         self._threads: list[threading.Thread] = []
         self._t_train = None         # wall clock of first step (it/s estimate)
         self._step0 = 0
+        self.started_at = None       # wall clock of child launch
+        self._reset_training_metrics()
+
+    def _reset_training_metrics(self):
+        """Clear per-stage training telemetry without touching run metadata."""
+        self.step = 0
+        self.pct = None
+        self.eta_sec = None
+        self.latest_loss = None
+        self.latest_acc = None
+        self.best_loss = None
+        self.latest_grad_norm = None
+        self.epoch = None
+        self.rate_it_s = None
+        self.losses.clear()
+        self.ema = None
+        self.best_ema = None
+        self.since_best = None
+        self.patience = None
+        self.verdict = None
+        self.early_stop_triggered = None
+        self.es_checks.clear()
+        self.checkpoint = None
+        self.checkpoint_count = 0
+        self._t_train = None
+        self._step0 = 0
+
+    def _signal(self, event, text, tone="info", **extra):
+        """Append an activity-timeline entry (caller holds the lock)."""
+        entry = {"ts": _now(), "event": event, "text": text, "tone": tone}
+        entry.update(extra)
+        self.signals.append(entry)
+
+    def add_signal(self, event, text, tone="info", **extra):
+        with self._lock:
+            self._signal(event, text, tone, **extra)
 
     # -- mutation ------------------------------------------------------
     def begin(self, proc, base_model, dataset):
@@ -123,7 +206,9 @@ class Job:
             self.base_model = base_model
             self.dataset = dataset
             self.proc = proc
+            self.started_at = time.time()
             self.log.append(f"[{_now()}] launched: {os.path.basename(sys.executable)} -m reforge --agent …")
+            self._signal("run_started", "Run started", "info")
 
     def add_log(self, line: str):
         with self._lock:
@@ -178,7 +263,8 @@ class Job:
                 ph[p] = "done"
             self.phase = None
             self.pct = 100.0
-        elif event in ("run_failed", "batch_failed", "stage_failed"):
+        elif event in ("run_failed", "training_failed", "batch_failed",
+                       "stage_failed"):
             if self.phase:
                 ph[self.phase] = "failed"
         elif event == "batch_complete":
@@ -192,20 +278,37 @@ class Job:
         event = ev.get("event")
         with self._lock:
             if event == "run_started":
-                pass  # base_model/dataset already known from argv
+                self.run_config = {k: ev.get(k) for k in (
+                    "output_dir", "dataset", "hf_dataset", "base_model",
+                    "image_mode", "dpo", "dpo_beta", "force", "epoch", "steps")}
             elif event == "dataset_loaded":
                 self.training_mode = ev.get("training_mode")
                 self.dataset = ev.get("dataset") or self.dataset
                 self.base_model = ev.get("base_model") or self.base_model
+                self.dataset_info = {k: ev.get(k) for k in (
+                    "rows", "eval_rows", "columns", "mapped_roles",
+                    "cleaning_mode", "shuffle_seed")}
+                rows = ev.get("rows")
+                rows_txt = f" · {rows:,} rows" if isinstance(rows, int) else ""
+                mode = ev.get("training_mode") or "dataset"
+                self._signal("dataset_loaded",
+                             f"Dataset ready{rows_txt} · {mode}", "info")
             elif event == "training_started":
+                self._reset_training_metrics()
                 self.total_steps = int(ev.get("total_steps") or 0)
                 self.epochs = ev.get("epochs")
-                self.step = 0
-                self.pct = None
-                self.eta_sec = None
+                self.plan = {k: ev.get(k) for k in (
+                    "lr", "batch_size", "grad_accum", "early_stop",
+                    "scheduler", "warmup_steps", "beta")}
+                self.learning_rate = _num(ev.get("lr"))
+                self.early_stop_enabled = ev.get("early_stop")
+                self.beta = ev.get("beta")
+                steps_txt = (f" · {self.total_steps:,} steps"
+                             if self.total_steps else "")
+                self._signal("training_started",
+                             f"Training started{steps_txt}", "info")
             elif event == "step":
                 if self._t_train is None:
-                    import time
                     self._t_train = time.time()
                     self._step0 = int(ev.get("step") or 0)
                 self.step = int(ev.get("step") or self.step)
@@ -215,27 +318,69 @@ class Job:
                             else (100.0 * self.step / self.total_steps
                                   if self.total_steps else None))
                 self.eta_sec = ev.get("eta_sec")
-                loss = ev.get("loss")
+                loss = _num(ev.get("loss"))
                 if loss is not None:
                     # A diverging run can emit NaN/Inf. Storing it poisons
                     # best_loss and the chart (Math.min -> NaN); drop the
                     # point instead of only sanitizing the JSON response.
-                    loss = float(loss)
-                    if math.isfinite(loss):
-                        self.latest_loss = loss
-                        self.best_loss = (loss if self.best_loss is None
-                                          else min(self.best_loss, loss))
-                        self.losses.append({"step": self.step, "loss": loss})
-                    acc = ev.get("acc")
+                    self.latest_loss = loss
+                    self.best_loss = (loss if self.best_loss is None
+                                      else min(self.best_loss, loss))
+                    grad = _num(ev.get("grad_norm"))
+                    if grad is not None:
+                        self.latest_grad_norm = grad
+                    lr = _num(ev.get("learning_rate"))
+                    if lr is not None:
+                        self.learning_rate = lr
+                    epoch = _num(ev.get("epoch"))
+                    if epoch is not None:
+                        self.epoch = epoch
+                    acc = _num(ev.get("acc"))
                     if acc is not None:
-                        acc = float(acc)
-                        if math.isfinite(acc):
-                            self.latest_acc = acc
-                    import time
-                    elapsed = time.time() - self._t_train if self._t_train else 0
+                        self.latest_acc = acc
+                    self.losses.append({
+                        "step": self.step, "loss": loss,
+                        "grad_norm": grad,
+                        "lr": self.learning_rate,
+                        "epoch": self.epoch,
+                    })
+                    elapsed = (time.time() - self._t_train
+                               if self._t_train else 0)
                     done = self.step - self._step0
                     if elapsed > 0 and done > 0:
                         self.rate_it_s = done / elapsed
+            elif event == "early_stop_check":
+                self.ema = _num(ev.get("ema"))
+                self.best_ema = _num(ev.get("best_ema"))
+                self.since_best = ev.get("since_best")
+                self.patience = ev.get("patience")
+                self.verdict = ev.get("verdict")
+                self.es_checks.append({"step": int(ev.get("step") or 0),
+                                       "ema": self.ema,
+                                       "best_ema": self.best_ema})
+                ema_txt = (f"{self.ema:.4f}" if self.ema is not None else "—")
+                best_txt = (f"{self.best_ema:.4f}"
+                            if self.best_ema is not None else "—")
+                self._signal("early_stop_check",
+                             f"EMA check · {ema_txt} (best {best_txt}) · "
+                             f"{self.verdict or 'continue'}",
+                             "warn" if self.verdict == "stop" else "info")
+            elif event == "checkpoint_saved":
+                step = int(ev.get("step") or 0)
+                path = ev.get("path") or ""
+                self.checkpoint = {"step": step, "path": path, "ts": ev.get("ts")}
+                self.checkpoint_count += 1
+                self._signal("checkpoint_saved",
+                             f"Checkpoint saved · step {step:,}", "ok",
+                             step=step, path=path)
+            elif event == "early_stop_triggered":
+                self.early_stop_triggered = {
+                    k: ev.get(k) for k in (
+                        "step", "ema", "best_ema", "steps_total",
+                        "hard_cap_steps")}
+                step = int(ev.get("step") or 0)
+                self._signal("early_stop_triggered",
+                             f"Early stop triggered · step {step:,}", "warn")
             elif event == "training_complete":
                 self.step = int(ev.get("steps") or self.step)
                 result = {"merged_dir": None, "report": ev.get("report"),
@@ -243,18 +388,26 @@ class Job:
                           "best_loss": ev.get("best_loss"),
                           "time_sec": ev.get("time_sec")}
                 self.result = {**(self.result or {}), **result}
+                self._signal("training_complete",
+                             "Training complete", "ok")
+            elif event == "merge_started":
+                self._signal("merge_started", "Merging adapter into base", "info")
             elif event == "merge_complete":
                 self.result = {**(self.result or {}),
                                "merged_dir": ev.get("merged_dir"),
                                "report": ev.get("report") or (self.result or {}).get("report")}
+                self._signal("merge_complete", "Merge complete", "ok")
             elif event == "run_complete":
                 self.result = {**(self.result or {}),
                                "merged_dir": ev.get("merged_dir") or (self.result or {}).get("merged_dir")}
-            elif event == "run_failed":
-                self.error = ev.get("error")
-                self.error_code = ev.get("error_code")
-                self.hint = ev.get("hint")
-                self.exit_code = ev.get("exit_code")
+                self._signal("run_complete", "Run complete", "ok")
+            elif event in ("run_failed", "training_failed"):
+                self.error = ev.get("error") or self.error
+                self.error_code = ev.get("error_code") or self.error_code
+                self.hint = ev.get("hint") or self.hint
+                self.exit_code = ev.get("exit_code") or self.exit_code
+                self._signal("run_failed",
+                             f"Run failed · {self.error_code or 'error'}", "bad")
             elif event in ("batch_failed", "stage_failed"):
                 # Batch children report failures as batch_failed (stage_failed
                 # is emitted just before it); without this the results view
@@ -263,15 +416,21 @@ class Job:
                 self.error_code = ev.get("error_code") or self.error_code
                 self.hint = ev.get("hint") or self.hint
                 self.exit_code = ev.get("exit_code") or self.exit_code
+                self._signal(event, f"{event.replace('_', ' ').title()}", "bad")
             elif event == "batch_complete":
                 self.result = {**(self.result or {}),
                                "merged_dir": (ev.get("final_merged")
                                               or (self.result or {}).get("merged_dir"))}
+                self._signal("batch_complete", "Batch complete", "ok")
             elif event in ("run_interrupted", "batch_interrupted"):
                 self.interrupted = True
+                self._signal(event, "Run interrupted", "warn")
             elif event == "batch_started":
                 total = ev.get("total_stages")
                 self.stage = {"index": -1, "total": int(total)} if total else None
+                if total:
+                    self._signal("batch_started",
+                                 f"Batch started · {int(total)} stages", "info")
             elif event == "stage_started":
                 if self.stage:
                     self.stage = {"index": int(ev.get("index", 0)),
@@ -281,22 +440,22 @@ class Job:
                     self.phases[p] = "pending"
                 self.phase = "dataset"
                 self.phases["dataset"] = "active"
-                self.step = 0
+                self._reset_training_metrics()
                 self.total_steps = 0
-                self.pct = None
-                self.eta_sec = None
-                self.losses.clear()
-                self.latest_loss = None
-                self.latest_acc = None
-                self.best_loss = None
-                self.rate_it_s = None
-                self._t_train = None
                 self.error = None
                 self.error_code = None
-            # batch_completed stage tracking
+                self.hint = None
+                index = int(ev.get("index", 0)) + 1
+                total = (self.stage or {}).get("total")
+                label = f"Stage {index}" + (f"/{total}" if total else "")
+                self._signal("stage_started", f"{label} started", "info")
             elif event == "stage_completed":
                 if self.stage:
                     self.stage["index"] = int(ev.get("index", 0))
+                index = int(ev.get("index", 0)) + 1
+                total = (self.stage or {}).get("total")
+                label = f"Stage {index}" + (f"/{total}" if total else "")
+                self._signal("stage_completed", f"{label} complete", "ok")
             self._style_phase(event)
 
     def finish(self, exit_code: int):
@@ -318,6 +477,9 @@ class Job:
                 # Crash with no terminal event: don't leave an active spinner.
                 self.phases[self.phase] = "failed"
             self.phases["merge"] = "done" if self.state == "done" else self.phases["merge"]
+            if self.state == "error" and not self.signals:
+                self._signal("run_failed", f"Child exited with code {exit_code}",
+                             "bad")
             self.proc = None
 
     # -- read ----------------------------------------------------------
@@ -335,13 +497,33 @@ class Job:
                 "latest_loss": self.latest_loss,
                 "latest_acc": self.latest_acc,
                 "best_loss": self.best_loss,
+                "latest_grad_norm": self.latest_grad_norm,
+                "learning_rate": self.learning_rate,
+                "epoch": self.epoch,
                 "rate_it_s": (round(self.rate_it_s, 3)
                               if self.rate_it_s is not None else None),
                 "train_elapsed": (int(time.time() - self._t_train)
                                   if self._t_train is not None else None),
+                "run_elapsed": (int(time.time() - self.started_at)
+                                if self.started_at is not None else None),
                 "training_mode": self.training_mode,
                 "base_model": self.base_model,
                 "dataset": self.dataset,
+                "dataset_info": dict(self.dataset_info),
+                "plan": dict(self.plan),
+                "run_config": dict(self.run_config),
+                "ema": self.ema,
+                "best_ema": self.best_ema,
+                "since_best": self.since_best,
+                "patience": self.patience,
+                "verdict": self.verdict,
+                "early_stop_enabled": self.early_stop_enabled,
+                "early_stop_triggered": self.early_stop_triggered,
+                "beta": self.beta,
+                "checkpoint": dict(self.checkpoint) if self.checkpoint else None,
+                "checkpoint_count": self.checkpoint_count,
+                "es_checks": list(self.es_checks),
+                "signals": list(self.signals),
                 "stage": dict(self.stage) if self.stage else None,
                 "log": list(self.log)[-LOG_TAIL:],
                 "losses": list(self.losses),
@@ -373,7 +555,10 @@ def _reader_stdout(pipe):
                     obj = None
                 if isinstance(obj, dict) and "event" in obj:
                     JOB.apply_event(obj)
-                    JOB.add_log(f"» {obj.get('event')}")
+                    # High-volume per-step events drive the metrics/chart;
+                    # echoing them would flood the console pane.
+                    if obj.get("event") not in ("step", "early_stop_check"):
+                        JOB.add_log(f"» {obj.get('event')}")
                     continue
             if "'loss'" in line or '"loss"' in line:
                 continue  # chart data arrives via step events
@@ -528,9 +713,9 @@ def _trend_label(norm: float) -> str:
 def _analysis() -> dict:
     """Full loss analysis over the live loss ring (Tk _full_analysis port).
 
-    The agent's `step` events carry no epoch, so the epoch schedule is
-    reconstructed linearly from training_started's `epochs` — the same
-    value the Tk analysis window read from the stderr loss rows.
+    Step events carry the real fractional `epoch` since agent schema v6.
+    Older/partial streams fall back to a linear reconstruction from
+    training_started's `epochs` and the step/total ratio.
     """
     try:
         import numpy as np
@@ -548,8 +733,14 @@ def _analysis() -> dict:
     snap = JOB.snapshot()
     epochs_total = snap.get("epochs") or 0.0
     total = snap.get("total_steps") or 0
-    # Reconstructed per-point epoch: E * step/total (≈ what the stderr rows log)
-    epochs = [epochs_total * (s / total) for s in steps] if epochs_total and total else [0.0] * n
+    # Prefer the real per-step epoch; reconstruct only when it is absent.
+    epochs = []
+    for entry, step in zip(losses, steps):
+        epoch = _num(entry.get("epoch"))
+        if epoch is None:
+            epoch = (epochs_total * (step / total)
+                     if epochs_total and total else 0.0)
+        epochs.append(float(epoch))
 
     last_ep = epochs[-1]
     exposure = (last_ep - int(last_ep)) if last_ep >= 1.0 else last_ep
@@ -620,6 +811,7 @@ def _analysis() -> dict:
         "slope_global": round(gslope_n, 2), "slope_recent": round(rslope_n, 2),
         "trend_global": _trend_label(gslope_n), "trend_recent": _trend_label(rslope_n),
         "drop_pct": round(drop_pct, 1), "exposure_pct": exposure_pct,
+        "latest_epoch": round(epochs[-1], 4),
         "ideal_zone": pred, "outliers": outliers, "epoch_lines": epoch_lines,
     }
 
@@ -666,6 +858,196 @@ def _finite_json(obj):
     return obj
 
 
+# ── Filesystem browsing (localhost-only) ─────────────────────────────
+def _clean_path(path: str) -> str:
+    raw = str(path or "").strip().strip('"')
+    if not raw:
+        return os.path.expanduser("~")
+    return os.path.abspath(os.path.expandvars(os.path.expanduser(raw)))
+
+
+def _places() -> dict:
+    """Favorites + drive roots shown in the folder-picker sidebar."""
+    home = os.path.expanduser("~")
+    shortcuts = []
+    for label, path, kind in (
+        ("Home", home, "home"),
+        ("Desktop", os.path.join(home, "Desktop"), "desktop"),
+        ("Documents", os.path.join(home, "Documents"), "documents"),
+        ("Downloads", os.path.join(home, "Downloads"), "downloads"),
+        ("Models", DEFAULT_HF_MODELS_DIR, "models"),
+        ("Reforge output", OUTPUT_DIR, "output"),
+    ):
+        try:
+            if os.path.isdir(path):
+                shortcuts.append({"label": label, "path": path, "kind": kind})
+        except OSError:
+            pass
+    drives = []
+    if os.name == "nt":
+        for letter in string.ascii_uppercase:
+            root = f"{letter}:\\"
+            try:
+                if os.path.exists(root):
+                    drives.append({"label": f"{letter}:", "path": root,
+                                   "kind": "drive"})
+            except OSError:
+                pass
+    return {
+        "home": home,
+        "shortcuts": shortcuts,
+        "drives": drives,
+        "default_output": OUTPUT_DIR,
+        "models_dir": DEFAULT_HF_MODELS_DIR,
+    }
+
+
+def _crumbs(path: str) -> list:
+    """Breadcrumb segments for a path, root first."""
+    cur = os.path.abspath(path)
+    parts = []
+    seen = set()
+    while cur not in seen:
+        seen.add(cur)
+        label = os.path.basename(cur.rstrip("\\/")) or cur
+        parts.append({"label": label, "path": cur})
+        parent = os.path.dirname(cur)
+        if not parent or parent == cur:
+            break
+        cur = parent
+    return list(reversed(parts))
+
+
+def _browse(path: str = "", mode: str = "dir", filter_ext: str = "",
+            show_all: bool = False, show_hidden: bool = False) -> dict:
+    """One directory listing for the SPA folder picker.
+
+    ``mode="file"`` includes files (filtered by ``filter_ext`` unless
+    ``show_all``); ``mode="dir"`` lists folders only. Errors are returned
+    as ``{ok: false}`` so the picker can show them without a 500.
+    """
+    mode = "file" if mode == "file" else "dir"
+    target = _clean_path(path)
+    if os.path.isfile(target):
+        target = os.path.dirname(target)
+    base = {**_places(), "mode": mode, "filter": filter_ext,
+            "show_all": show_all, "show_hidden": show_hidden}
+    if not os.path.isdir(target):
+        return {"ok": False, "error": f"Not a folder: {target}",
+                "path": target, "parent": os.path.dirname(target),
+                "crumbs": _crumbs(target) if target else [], **base}
+
+    entries = []
+    truncated = False
+    try:
+        with os.scandir(target) as it:
+            for entry in it:
+                if len(entries) >= MAX_BROWSE_ENTRIES:
+                    truncated = True
+                    break
+                name = entry.name
+                if not show_hidden and name.startswith("."):
+                    continue
+                try:
+                    is_dir = entry.is_dir()
+                except OSError:
+                    continue
+                if not is_dir:
+                    if mode != "file":
+                        continue
+                    if (filter_ext and not show_all
+                            and not name.lower().endswith(filter_ext.lower())):
+                        continue
+                is_model = False
+                if is_dir:
+                    try:
+                        is_model = os.path.isfile(
+                            os.path.join(entry.path, "config.json"))
+                    except OSError:
+                        pass
+                size = mtime = None
+                try:
+                    st = entry.stat()
+                    mtime = st.st_mtime
+                    if not is_dir:
+                        size = st.st_size
+                except OSError:
+                    pass
+                entries.append({
+                    "name": name,
+                    "path": entry.path,
+                    "is_dir": is_dir,
+                    "is_model": is_model,
+                    "size": size,
+                    "mtime": mtime,
+                })
+    except OSError as e:
+        return {"ok": False, "error": f"Could not read folder: {e}",
+                "path": target, "parent": os.path.dirname(target),
+                "crumbs": _crumbs(target), **base}
+
+    entries.sort(key=lambda e: (not e["is_dir"], e["name"].lower()))
+    parent = os.path.dirname(target)
+    if parent == target:
+        parent = None
+    return {
+        "ok": True,
+        "path": target,
+        "parent": parent,
+        "crumbs": _crumbs(target),
+        "entries": entries,
+        "truncated": truncated,
+        **base,
+    }
+
+
+def _mkdir(parent: str, name: str) -> dict:
+    parent = _clean_path(parent)
+    name = str(name or "").strip()
+    if not name:
+        return {"ok": False, "message": "Enter a folder name."}
+    if name in (".", "..") or any(ch in name for ch in ("/", "\\")):
+        return {"ok": False, "message": "Folder names cannot contain slashes."}
+    if os.name == "nt" and (":" in name or name.endswith((" ", "."))):
+        return {"ok": False,
+                "message": "Windows folder names cannot contain ':' or end "
+                           "with a space/dot."}
+    if not os.path.isdir(parent):
+        return {"ok": False, "message": f"Parent folder not found: {parent}"}
+    target = os.path.join(parent, name)
+    try:
+        os.mkdir(target)
+    except FileExistsError:
+        return {"ok": False, "message": "A folder with that name already exists."}
+    except OSError as e:
+        return {"ok": False, "message": f"Could not create folder: {e}"}
+    return {"ok": True, "path": target}
+
+
+def _reveal(path: str) -> dict:
+    target = _clean_path(path)
+    if not os.path.exists(target):
+        return {"ok": False, "message": f"Path not found: {target}"}
+    try:
+        system = platform.system()
+        if system == "Windows":
+            os.startfile(target)  # type: ignore[attr-defined]
+        elif system == "Darwin":
+            subprocess.Popen(["open", target])
+        else:
+            subprocess.Popen(["xdg-open", target])
+    except Exception as e:
+        return {"ok": False, "message": f"Could not open: {e}"}
+    return {"ok": True, "message": "Opened."}
+
+
+def _client_is_local(handler) -> bool:
+    """Filesystem APIs are for the local operator, not network clients."""
+    addr = (handler.client_address or ("",))[0]
+    return (addr in ("127.0.0.1", "::1", "localhost", "::ffff:127.0.0.1")
+            or addr.startswith("127.") or addr.startswith("::ffff:127."))
+
+
 # ── HTTP handler ─────────────────────────────────────────────────────
 class _Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):  # keep the console clean
@@ -695,32 +1077,66 @@ class _Handler(BaseHTTPRequestHandler):
             return {}
 
     def do_GET(self):
-        if self.path in ("/", "/index.html"):
-            self._send(200, INDEX_HTML.encode("utf-8"), "text/html; charset=utf-8")
-        elif self.path == "/api/status":
+        parsed = urlsplit(self.path)
+        route = parsed.path
+        if route in ("/", "/index.html"):
+            self._send(200, INDEX_HTML.encode("utf-8"),
+                       "text/html; charset=utf-8")
+        elif route == "/api/status":
             self._send_json(JOB.snapshot())
-        elif self.path == "/api/models":
+        elif route == "/api/models":
             self._send_json({"models": scan_models()})
-        elif self.path == "/api/analysis":
+        elif route == "/api/places":
+            if not _client_is_local(self):
+                self._send_json({"ok": False, "error": "Local access only."}, 403)
+                return
+            self._send_json(_places())
+        elif route == "/api/browse":
+            if not _client_is_local(self):
+                self._send_json({"ok": False, "error": "Local access only."}, 403)
+                return
+            q = parse_qs(parsed.query)
+            self._send_json(_browse(
+                path=(q.get("path") or [""])[0],
+                mode=(q.get("mode") or ["dir"])[0],
+                filter_ext=(q.get("filter") or [""])[0],
+                show_all=(q.get("all") or ["0"])[0] in ("1", "true", "yes"),
+                show_hidden=(q.get("hidden") or ["0"])[0] in ("1", "true", "yes"),
+            ))
+        elif route == "/api/analysis":
             self._send_json(_analysis())
-        elif self.path == "/api/report":
+        elif route == "/api/report":
             self._send_json(_read_report())
         else:
             self._send_json({"error": "not found"}, 404)
 
     def do_POST(self):
-        if self.path == "/api/start":
+        route = urlsplit(self.path).path
+        if route == "/api/start":
             ok, msg = _spawn(self._read_json())
             self._send_json({"ok": ok, "message": msg}, 200 if ok else 409)
-        elif self.path == "/api/stop":
+        elif route == "/api/stop":
             ok, msg = _stop()
             self._send_json({"ok": ok, "message": msg}, 200 if ok else 409)
-        elif self.path == "/api/preview":
+        elif route == "/api/preview":
             params = self._read_json()
             try:
                 self._send_json({"ok": True, "argv": build_argv(params, strict=False)})
             except ValueError as e:
                 self._send_json({"ok": False, "message": str(e)}, 200)
+        elif route == "/api/mkdir":
+            if not _client_is_local(self):
+                self._send_json({"ok": False, "message": "Local access only."}, 403)
+                return
+            body = self._read_json()
+            self._send_json(_mkdir(body.get("parent") or "",
+                                   body.get("name") or ""))
+        elif route == "/api/reveal":
+            if not _client_is_local(self):
+                self._send_json({"ok": False, "message": "Local access only."}, 403)
+                return
+            body = self._read_json()
+            self._send_json(_reveal(body.get("path") or ""))
         else:
             self._send_json({"error": "not found"}, 404)
 
@@ -783,623 +1199,3 @@ def _enable_utf8():
             sys.stderr.reconfigure(encoding="utf-8", errors="replace")
         except Exception:
             pass
-
-
-# ── Single-page app (Phases 3-5: config, progress, chart, results) ──
-INDEX_HTML = r"""<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Reforge</title>
-<style>
-  :root{
-    --bg:#101014; --card:#1a1a2e; --card2:#202032; --line:#33333f;
-    --ink:#FFF8DC; --muted:#9096ad; --accent:#FFBF00; --accent2:#FFD700;
-    --ok:#4caf50; --warn:#ffa726; --bad:#ef5350;
-  }
-  *{box-sizing:border-box}
-  body{margin:0;background:var(--bg);color:var(--ink);
-    font:15px/1.5 "Segoe UI",system-ui,sans-serif}
-  .wrap{max-width:1100px;margin:0 auto;padding:20px 20px 90px}
-  header{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:18px}
-  h1{color:var(--accent);margin:0;font-size:26px;letter-spacing:1px}
-  .chip{display:inline-flex;align-items:center;gap:7px;padding:3px 12px;
-    border:1px solid var(--line);border-radius:20px;font-size:13px;color:var(--muted)}
-  .chip .dot{width:9px;height:9px;border-radius:50%;background:var(--muted)}
-  .chip.run .dot{background:var(--accent);animation:pulse 1.1s infinite}
-  .chip.stop .dot{background:var(--warn)}
-  .chip.done .dot{background:var(--ok)}
-  .chip.err  .dot{background:var(--bad)}
-  @keyframes pulse{50%{opacity:.35}}
-  .spacer{flex:1}
-  button{background:var(--card2);color:var(--ink);border:1px solid var(--line);
-    border-radius:8px;padding:8px 18px;font-size:14px;cursor:pointer}
-  button:hover{border-color:var(--accent)}
-  button.accent{background:var(--accent);border-color:var(--accent);
-    color:#141414;font-weight:600}
-  button.accent:hover{background:var(--accent2)}
-  button.ghost{background:transparent}
-  button:disabled{opacity:.45;cursor:not-allowed}
-  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;
-    padding:16px 18px;margin-bottom:16px}
-  .card h2{margin:0 0 12px;font-size:14px;color:var(--accent);
-    text-transform:uppercase;letter-spacing:1.5px}
-  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px}
-  label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px}
-  input[type=text],input[type=number]{width:100%;background:var(--card2);
-    border:1px solid var(--line);border-radius:8px;color:var(--ink);
-    padding:8px 10px;font-size:14px}
-  input[type=checkbox]{accent-color:var(--accent);width:16px;height:16px}
-  input:focus{outline:none;border-color:var(--accent)}
-  .checks{display:flex;gap:18px;flex-wrap:wrap;margin-top:6px}
-  .checks label{display:flex;align-items:center;gap:7px;font-size:14px;
-    color:var(--ink);margin:0}
-  .checks input{width:auto}
-  .hint{color:var(--muted);font-size:12.5px;margin-top:8px}
-  pre{background:var(--card2);border:1px solid var(--line);border-radius:9px;
-    padding:12px;font:12.5px/1.5 Consolas,monospace;color:var(--muted);
-    white-space:pre-wrap;max-height:260px;overflow:auto;margin:0}
-  .banner{border:1px solid var(--bad);background:rgba(239,83,80,.08);
-    border-radius:10px;padding:12px 16px;margin-bottom:16px;white-space:pre-wrap}
-  .banner.warn{border-color:var(--warn);background:rgba(255,167,38,.08)}
-  /* phase tracker */
-  .phases{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:14px}
-  .ph{display:flex;align-items:center;gap:8px;padding:6px 14px;border:1px solid
-    var(--line);border-radius:20px;font-size:12.5px;letter-spacing:1px;
-    color:var(--muted)}
-  .ph.active{border-color:var(--accent);color:var(--accent)}
-  .ph.done{border-color:var(--ok);color:var(--ok)}
-  .ph.failed{border-color:var(--bad);color:var(--bad)}
-  .ph .spin{width:11px;height:11px;border:2px solid var(--accent);
-    border-top-color:transparent;border-radius:50%;animation:rot .8s linear infinite}
-  @keyframes rot{to{transform:rotate(360deg)}}
-  .arrow{color:var(--line)}
-  /* progress bar */
-  .bar{position:relative;height:22px;background:var(--card2);border:1px solid
-    var(--line);border-radius:11px;overflow:hidden;
-    background-image:repeating-linear-gradient(90deg,transparent 0 10%,rgba(255,255,255,.05) 10% 10.2%)}
-  .bar i{position:absolute;inset:0 auto 0 0;width:0;background:linear-gradient(90deg,#b58a00,var(--accent));
-    transition:width .6s ease;border-radius:11px}
-  .bar.indet i{width:18%;animation:sweep 1.15s ease-in-out infinite}
-  @keyframes sweep{0%{left:-18%}100%{left:100%}}
-  .bar b{position:absolute;right:10px;top:0;line-height:22px;font-size:12px;
-    color:var(--ink);text-shadow:0 0 3px #000}
-  .tqdm{font:13px Consolas,monospace;color:var(--muted);margin:8px 0 14px}
-  .stats{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px}
-  .stat{background:var(--card2);border:1px solid var(--line);border-radius:10px;
-    padding:7px 14px;min-width:100px}
-  .stat small{display:block;font-size:10.5px;color:var(--muted);letter-spacing:1px}
-  .stat span{font:15px Consolas,monospace;color:var(--ink)}
-  .stat.gold span{color:var(--accent)}
-  .stagechip{background:rgba(255,191,0,.1);border-color:var(--accent);color:var(--accent)}
-  canvas#chart{width:100%;height:230px;display:block;background:var(--card2);
-    border:1px solid var(--line);border-radius:10px}
-  .analysis{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px}
-  .alog{font:12px/1.6 Consolas,monospace;color:var(--muted);margin-top:10px}
-  .logpane{max-height:300px}
-  .logpane .bar2{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
-  .logpane label{display:flex;align-items:center;gap:6px;margin:0;color:var(--muted);font-size:12px}
-  /* batch editor */
-  .stage{display:grid;grid-template-columns:34px 1fr 1fr 90px 90px 30px 30px 30px;
-    gap:8px;align-items:center;margin-bottom:8px}
-  .stage .n{color:var(--muted);font:13px Consolas,monospace;text-align:center}
-  .stage input{padding:6px 8px;font-size:13px}
-  .stage button{padding:3px 8px;font-size:12px}
-  .ibtn{background:transparent;border:1px solid var(--line);border-radius:6px;
-    color:var(--muted);cursor:pointer}
-  .ibtn:hover{color:var(--accent);border-color:var(--accent)}
-  /* results */
-  .res{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px}
-  .res .stat{min-height:74px}
-  .res .stat span.path{font-size:12px;word-break:break-all;line-height:1.45}
-  .kv{font:13px/1.8 Consolas,monospace;color:var(--muted);white-space:pre-wrap}
-  a{color:var(--accent)}
-  [hidden]{display:none !important}
-</style>
-</head>
-<body>
-<div class="wrap">
-  <header>
-    <h1>REFORGE</h1>
-    <span class="chip" id="chip"><span class="dot"></span><span id="chip-text">Idle</span></span>
-    <span class="spacer"></span>
-    <button id="btn-stop" hidden>Stop</button>
-    <button id="btn-start" class="accent" hidden>Start training</button>
-  </header>
-
-  <div id="msg-banner" class="banner" hidden></div>
-
-  <!-- ── Setup ─────────────────────────────────────────────────────── -->
-  <section id="view-setup">
-    <div class="card">
-      <h2>Paths</h2>
-      <div class="grid">
-        <div><label>Base model (local path)</label>
-          <input type="text" id="p-base" list="models" placeholder="C:\HF_Models\…">
-          <datalist id="models"></datalist></div>
-        <div><label>Output directory</label>
-          <input type="text" id="p-out" placeholder="~/Reforge_Output"></div>
-        <div><label>Dataset (.parquet)</label>
-          <input type="text" id="p-ds" placeholder="C:\data\train.parquet"></div>
-        <div><label>…or HuggingFace dataset ID</label>
-          <input type="text" id="p-hf" placeholder="org/dataset"></div>
-      </div>
-    </div>
-    <div class="card">
-      <h2>Training &amp; performance</h2>
-      <div class="grid">
-        <div><label>Epochs</label><input type="text" id="p-epoch" placeholder="1"></div>
-        <div><label>Fixed steps (overrides epochs)</label><input type="text" id="p-steps"></div>
-        <div><label>Batch size</label><input type="text" id="p-batch"></div>
-        <div><label>Grad. accumulation</label><input type="text" id="p-grad"></div>
-      </div>
-      <div class="checks">
-        <label><input type="checkbox" id="p-force"> Force (no early stop)</label>
-        <label><input type="checkbox" id="p-lmhead"> Train lm_head</label>
-      </div>
-    </div>
-    <div class="card">
-      <h2>Flags &amp; DPO</h2>
-      <div class="checks">
-        <label><input type="checkbox" id="p-latex"> Preserve LaTeX</label>
-        <label><input type="checkbox" id="p-code"> Preserve code</label>
-        <label><input type="checkbox" id="p-image"> Multimodal (image)</label>
-        <label><input type="checkbox" id="p-dpo"> DPO</label>
-      </div>
-      <div class="grid" style="margin-top:10px">
-        <div><label>DPO beta</label><input type="text" id="p-dpo-beta" placeholder="0.1"></div>
-      </div>
-      <div class="hint">DPO needs chosen/rejected columns. SFT→DPO chains: leave
-        base model empty after an SFT merge and reforge chains from the merged dir.</div>
-    </div>
-    <div class="card">
-      <h2>Batch mode</h2>
-      <div class="checks">
-        <label><input type="checkbox" id="p-batchmode"> Enable batch (stages below)</label>
-      </div>
-      <div id="batch-editor" hidden style="margin-top:12px">
-        <div class="stage" style="font-size:11px;color:var(--muted)">
-          <span></span><span>name (opt.)</span><span>dataset / hf id</span>
-          <span>epochs</span><span>steps</span><span></span><span></span><span></span>
-        </div>
-        <div id="stage-list"></div>
-        <button class="ghost" id="btn-addstage">+ Add stage</button>
-        <div class="hint">Stage 1's base model is the Base model field above;
-          later stages chain from the previous stage's merged output.</div>
-      </div>
-    </div>
-    <div class="card">
-      <h2>Command preview</h2>
-      <pre id="cmd-preview">fill in the fields…</pre>
-    </div>
-  </section>
-
-  <!-- ── Progress ──────────────────────────────────────────────────── -->
-  <section id="view-progress" hidden>
-    <div class="card">
-      <div class="phases" id="phases"></div>
-      <div class="bar indet" id="bar"><i></i><b id="bar-cap"></b></div>
-      <div class="tqdm" id="tqdm">waiting for the child…</div>
-      <div class="stats" id="stats"></div>
-      <canvas id="chart"></canvas>
-      <div class="analysis" id="analysis"></div>
-      <div class="alog" id="alog"></div>
-    </div>
-    <div class="card logpane">
-      <div class="bar2">
-        <h2 style="margin:0">Console</h2>
-        <label><input type="checkbox" id="log-follow" checked> follow</label>
-      </div>
-      <pre id="log"></pre>
-    </div>
-  </section>
-
-  <!-- ── Results ───────────────────────────────────────────────────── -->
-  <section id="view-results" hidden>
-    <div class="card">
-      <h2 id="res-title">Result</h2>
-      <div id="res-body"></div>
-      <div style="margin-top:14px;display:flex;gap:10px">
-        <button class="accent" id="btn-again">Start another run</button>
-      </div>
-    </div>
-    <div class="card logpane">
-      <div class="bar2"><h2 style="margin:0">Console tail</h2></div>
-      <pre id="res-log"></pre>
-    </div>
-  </section>
-</div>
-
-<script>
-"use strict";
-const $ = id => document.getElementById(id);
-const esc = s => String(s ?? "").replace(/[&<>"']/g,
-  c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
-const PHASES = ["dataset", "model", "train", "merge"];
-const PHASE_LABEL = {dataset:"DATASET", model:"MODEL", train:"TRAIN", merge:"MERGE"};
-
-let last = null;          // last /api/status snapshot
-let analysis = null;      // last /api/analysis
-let previewTimer = null;
-let anaTimer = 0;
-
-function fmtHMS(sec){
-  if (sec === null || sec === undefined || isNaN(sec)) return "--:--";
-  sec = Math.max(0, Math.floor(sec));
-  const h = Math.floor(sec/3600), m = Math.floor((sec%3600)/60), s = sec%60;
-  const p = n => String(n).padStart(2, "0");
-  return h ? `${h}h${p(m)}m${p(s)}s` : `${p(m)}:${p(s)}`;
-}
-
-async function jget(url){ const r = await fetch(url); return r.json(); }
-async function jpost(url, body){
-  const r = await fetch(url, {method:"POST", headers:{"Content-Type":"application/json"},
-                              body: JSON.stringify(body ?? {})});
-  let data = {}; try{ data = await r.json(); }catch(e){}
-  return {code: r.status, data};
-}
-
-/* ── params & preview ──────────────────────────────────────────────── */
-function stages(){
-  return window._stages || [];
-}
-function collectParams(){
-  const v = id => $(id).value.trim();
-  const c = id => $(id).checked;
-  const p = {
-    base_model: v("p-base"), output_dir: v("p-out"),
-    dataset: v("p-ds"), hf_dataset: v("p-hf"),
-    epoch: v("p-epoch"), steps: v("p-steps"),
-    batch_size: v("p-batch"), grad_accum: v("p-grad"),
-    force: c("p-force"), latex: c("p-latex"), code: c("p-code"),
-    image: c("p-image"), dpo: c("p-dpo"), train_lm_head: c("p-lmhead"),
-    dpo_beta: v("p-dpo-beta"),
-  };
-  if (c("p-batchmode")) p.stages = stages();
-  for (const k of Object.keys(p)) if (p[k] === "" || p[k] === false) delete p[k];
-  return p;
-}
-function schedulePreview(){
-  clearTimeout(previewTimer);
-  previewTimer = setTimeout(async () => {
-    try{
-      const {data} = await jpost("/api/preview", collectParams());
-      let text;
-      if (data.ok){
-        // group flag + value pairs, backslash-continued like the Tk preview
-        const a = data.argv.slice(2);       // hide the interpreter prefix
-        const parts = [];
-        for (let i = 0; i < a.length; i++){
-          if (a[i].startsWith("--") && i+1 < a.length && !a[i+1].startsWith("--"))
-            { parts.push(a[i] + " " + a[i+1]); i++; }
-          else parts.push(a[i]);
-        }
-        text = "python -m reforge \\\n    " + parts.join(" \\\n    ");
-      } else {
-        text = "⚠ " + data.message;
-      }
-      $("cmd-preview").textContent = text;
-    }catch(e){ $("cmd-preview").textContent = "preview unavailable"; }
-  }, 400);
-}
-
-/* ── batch stage editor ────────────────────────────────────────────── */
-window._stages = [];
-function renderStages(){
-  const box = $("stage-list");
-  box.innerHTML = "";
-  window._stages.forEach((s, i) => {
-    const row = document.createElement("div");
-    row.className = "stage";
-    row.innerHTML = `
-      <span class="n">${i+1}</span>
-      <input type="text" data-f="name" placeholder="stage name" value="${esc(s.name||"")}">
-      <input type="text" data-f="dataset" placeholder="C:\\…\\data.parquet or org/hf-id" value="${esc(s.dataset||s.hf_dataset||"")}">
-      <input type="text" data-f="epochs" placeholder="epochs" value="${esc(s.epochs??"")}">
-      <input type="text" data-f="steps" placeholder="steps" value="${esc(s.steps??"")}">
-      <button class="ibtn" data-act="up" title="move up">↑</button>
-      <button class="ibtn" data-act="down" title="move down">↓</button>
-      <button class="ibtn" data-act="del" title="remove">✕</button>`;
-    row.addEventListener("change", () => {
-      const ds = row.querySelector('[data-f="dataset"]').value.trim();
-      s.name   = row.querySelector('[data-f="name"]').value.trim();
-      s.epochs = row.querySelector('[data-f="epochs"]').value.trim();
-      s.steps  = row.querySelector('[data-f="steps"]').value.trim();
-      delete s.dataset; delete s.hf_dataset;
-      if (/^[^\\\/]+\//.test(ds) && !/^[A-Za-z]:[\\\/]/.test(ds)) s.hf_dataset = ds;
-      else s.dataset = ds;
-      schedulePreview();
-    });
-    row.querySelector('[data-act="up"]').onclick = () => {
-      if (i > 0){ [window._stages[i-1], window._stages[i]] = [window._stages[i], window._stages[i-1]];
-        renderStages(); schedulePreview(); }
-    };
-    row.querySelector('[data-act="down"]').onclick = () => {
-      if (i < window._stages.length - 1){
-        [window._stages[i+1], window._stages[i]] = [window._stages[i], window._stages[i+1]];
-        renderStages(); schedulePreview(); }
-    };
-    row.querySelector('[data-act="del"]').onclick = () => {
-      window._stages.splice(i, 1); renderStages(); schedulePreview();
-    };
-    box.appendChild(row);
-  });
-}
-$("btn-addstage").onclick = () => { window._stages.push({}); renderStages(); schedulePreview(); };
-$("p-batchmode").onchange = e => {
-  $("batch-editor").hidden = !e.target.checked;
-  if (e.target.checked && !window._stages.length){ window._stages.push({}); renderStages(); }
-  schedulePreview();
-};
-
-/* ── actions ───────────────────────────────────────────────────────── */
-$("btn-start").onclick = async () => {
-  const {code, data} = await jpost("/api/start", collectParams());
-  if (!data.ok) showBanner(data.message || "Could not start.");
-  else { hideBanner(); }
-};
-$("btn-stop").onclick = async () => {
-  const {data} = await jpost("/api/stop");
-  if (!data.ok) showBanner(data.message || "Could not stop.");
-};
-$("btn-again").onclick = () => { hideBanner(); route("idle"); };
-function showBanner(msg){ const b = $("msg-banner"); b.textContent = msg; b.hidden = false; }
-function hideBanner(){ $("msg-banner").hidden = true; }
-
-/* ── views ─────────────────────────────────────────────────────────── */
-function route(state){
-  const setup = $("view-setup"), prog = $("view-progress"), res = $("view-results");
-  setup.hidden = state !== "idle";
-  prog.hidden  = !(state === "running" || state === "stopping");
-  res.hidden   = !(state === "done" || state === "error");
-  $("btn-start").hidden = !(state === "idle" || state === "done" || state === "error");
-  $("btn-stop").hidden  = state !== "running";
-}
-
-function chip(state, s){
-  const el = $("chip");
-  el.className = "chip";
-  let text = "Idle", cls = "";
-  if (state === "running"){ cls = "run"; text = (s.phase || "starting") + "…"; }
-  else if (state === "stopping"){ cls = "stop"; text = "Stopping (saving)…"; }
-  else if (state === "done"){ cls = "done"; text = "Complete"; }
-  else if (state === "error"){ cls = "err"; text = "Failed"; }
-  if (s.interrupted) text += " · interrupted";
-  if (cls) el.classList.add(cls);   // classList.add("") throws a SyntaxError
-  $("chip-text").textContent = text;
-}
-
-/* ── progress rendering ────────────────────────────────────────────── */
-function renderPhases(phases){
-  const box = $("phases");
-  box.innerHTML = "";
-  PHASES.forEach((p, i) => {
-    if (i) { const a = document.createElement("span"); a.className = "arrow"; a.textContent = "→"; box.appendChild(a); }
-    const el = document.createElement("span");
-    const st = phases[p] || "pending";
-    el.className = "ph" + (st === "active" ? " active" : st === "done" ? " done" : st === "failed" ? " failed" : "");
-    el.innerHTML = (st === "active" ? '<span class="spin"></span>' : "") + esc(PHASE_LABEL[p]);
-    box.appendChild(el);
-  });
-}
-
-function renderStats(s){
-  const stats = [];
-  const add = (k, val, gold) => stats.push(
-    `<div class="stat${gold ? " gold" : ""}${k==="STAGE" ? " stagechip" : ""}"><small>${k}</small><span>${val}</span></div>`);
-  add("STEPS", `${s.step}/${s.total_steps || "—"}`);
-  if (s.latest_loss !== null && s.latest_loss !== undefined)
-    add("LOSS", Number(s.latest_loss).toFixed(4), true);
-  if (s.best_loss !== null && s.best_loss !== undefined)
-    add("BEST", Number(s.best_loss).toFixed(4));
-  if (s.latest_acc !== null && s.latest_acc !== undefined)
-    add("ACC", (Number(s.latest_acc) * 100).toFixed(1) + "%", true);
-  add("ETA", fmtHMS(s.eta_sec));
-  if (s.rate_it_s) add("RATE", Number(s.rate_it_s).toFixed(2) + " it/s");
-  if (s.stage) add("STAGE", `${(s.stage.index ?? -1) + 1}/${s.stage.total}`);
-  if (s.training_mode) add("MODE", esc(s.training_mode));
-  $("stats").innerHTML = stats.join("");
-}
-
-function renderTqdm(s){
-  const el = $("tqdm");
-  const bar = $("bar");
-  if (s.pct !== null && s.pct !== undefined){
-    bar.classList.remove("indet");
-    bar.querySelector("i").style.width = Math.min(100, s.pct) + "%";
-    $("bar-cap").textContent = (Number(s.pct).toFixed(1)) + "%";
-  } else {
-    bar.classList.add("indet");
-    $("bar-cap").textContent = "";
-  }
-  const elapsed = s.train_elapsed !== null && s.train_elapsed !== undefined ? fmtHMS(s.train_elapsed) : "--:--";
-  const eta = s.eta_sec !== null && s.eta_sec !== undefined ? fmtHMS(s.eta_sec) : "--:--";
-  const rate = s.rate_it_s ? ` · ${Number(s.rate_it_s).toFixed(2)} it/s` : "";
-  el.textContent = `step ${s.step}/${s.total_steps || "?"}`
-    + (s.pct !== null && s.pct !== undefined ? ` · ${Number(s.pct).toFixed(1)}%` : "")
-    + ` · [${elapsed}<${eta}${rate}]`;
-}
-
-/* ── loss chart ────────────────────────────────────────────────────── */
-function smooth(arr, k){
-  k = Math.max(1, Math.round(k));
-  if (k === 1 || arr.length < 2) return arr.slice();
-  const out = [];
-  for (let i = 0; i < arr.length; i++){
-    let a = Math.max(0, i - (k >> 1)), b = Math.min(arr.length, a + k);
-    a = Math.max(0, b - k);
-    let sum = 0; for (let j = a; j < b; j++) sum += arr[j];
-    out.push(sum / (b - a));
-  }
-  return out;
-}
-function drawChart(s){
-  const cv = $("chart");
-  const raw = s.losses || [];
-  if (!raw.length || cv.clientWidth === 0) return;
-  const dpr = window.devicePixelRatio || 1;
-  if (cv.width !== cv.clientWidth * dpr){
-    cv.width = cv.clientWidth * dpr; cv.height = cv.clientHeight * dpr;
-  }
-  const ctx = cv.getContext("2d");
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  ctx.clearRect(0, 0, cv.clientWidth, cv.clientHeight);
-  const W = cv.clientWidth, H = cv.clientHeight, padL = 46, padR = 12, padT = 12, padB = 20;
-
-  // decimate for drawing
-  let pts = raw;
-  if (raw.length > 4000){
-    const stride = Math.ceil(raw.length / 4000);
-    pts = raw.filter((_, i) => i % stride === 0 || i === raw.length - 1);
-  }
-  const xs = pts.map(p => p.step), ys = pts.map(p => p.loss);
-  let ymin = Math.min(...ys), ymax = Math.max(...ys);
-  if (ymax - ymin < 1e-6){ ymax += 0.5; ymin -= 0.5; }
-  const pad = (ymax - ymin) * 0.08; ymin -= pad; ymax += pad;
-  const xmin = xs[0], xmax = xs[xs.length - 1] || 1;
-  const X = v => padL + (W - padL - padR) * (xmax === xmin ? 0.5 : (v - xmin) / (xmax - xmin));
-  const Y = v => padT + (H - padT - padB) * (1 - (v - ymin) / (ymax - ymin));
-
-  // grid + y labels
-  ctx.strokeStyle = "rgba(255,255,255,.06)"; ctx.fillStyle = "#9096ad";
-  ctx.font = "10px Consolas,monospace";
-  for (let g = 0; g <= 4; g++){
-    const yv = ymin + (ymax - ymin) * g / 4, py = Y(yv);
-    ctx.beginPath(); ctx.moveTo(padL, py); ctx.lineTo(W - padR, py); ctx.stroke();
-    ctx.fillText(yv.toFixed(2), 6, py + 3);
-  }
-
-  const k = Math.max(3, Math.round(raw.length / 50) | 1);
-  const sm = smooth(raw.map(p => p.loss), k);
-  const line = (arr, color, width, alpha) => {
-    ctx.strokeStyle = color; ctx.globalAlpha = alpha; ctx.lineWidth = width;
-    ctx.beginPath();
-    arr.forEach((p, i) => { const x = X(p.step), y = Y(arr === sm ? sm[i] : p.loss);
-      i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
-    ctx.stroke(); ctx.globalAlpha = 1;
-  };
-  line(raw, "#FFBF00", 1, .22);
-  ctx.strokeStyle = "#FFD700"; ctx.lineWidth = 1.8; ctx.beginPath();
-  raw.forEach((p, i) => { const x = X(p.step), y = Y(sm[i]); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
-  ctx.stroke();
-
-  // best marker
-  let bi = 0; raw.forEach((p, i) => { if (p.loss < raw[bi].loss) bi = i; });
-  ctx.fillStyle = "#4caf50";
-  ctx.beginPath(); ctx.arc(X(raw[bi].step), Y(raw[bi].loss), 3.5, 0, 7); ctx.fill();
-
-  ctx.fillStyle = "#9096ad"; ctx.font = "11px Consolas,monospace";
-  ctx.fillText(`step ${raw[raw.length-1].step} | now ${raw[raw.length-1].loss.toFixed(4)} | best ${raw[bi].loss.toFixed(4)} @ ${raw[bi].step}`, padL, H - 6);
-}
-
-/* ── analysis ──────────────────────────────────────────────────────── */
-async function renderAnalysis(){
-  try{ analysis = await jget("/api/analysis"); }catch(e){ return; }
-  const box = $("analysis"), alog = $("alog");
-  if (!analysis || !analysis.ok){
-    box.innerHTML = ""; alog.textContent = analysis && analysis.error ? "analysis: " + esc(analysis.error) : "";
-    return;
-  }
-  const card = (k, v, gold) => `<div class="stat${gold ? " gold" : ""}"><small>${k}</small><span>${esc(v)}</span></div>`;
-  box.innerHTML =
-    card("GRADE", analysis.grade, true) +
-    card("TREND", `${analysis.trend_global} / ${analysis.trend_recent}`) +
-    card("SNR", analysis.snr.toFixed(2)) +
-    card("EXPOSURE", analysis.exposure_pct.toFixed(1) + "%") +
-    card("BEST", `${analysis.best.toFixed(4)} @ ${analysis.best_step}`) +
-    card("SINCE BEST", analysis.since_best);
-  alog.innerHTML =
-    `avg ${analysis.avg} | med ${analysis.med} | std ${analysis.std} | var ${analysis.drop_pct}%<br>` +
-    `slope global ${analysis.slope_global >= 0 ? "+" : ""}${analysis.slope_global}/100 | recent ${analysis.slope_recent >= 0 ? "+" : ""}${analysis.slope_recent}/100<br>` +
-    `est. ideal zone: ${esc(analysis.ideal_zone)}` +
-    (analysis.outliers.length ? ` | outliers: ${analysis.outliers.length}` : "");
-}
-
-/* ── log pane ──────────────────────────────────────────────────────── */
-function renderLog(s, elId){
-  const el = $(elId);
-  const atBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 4;
-  el.textContent = (s.log || []).join("\n");
-  if (elId === "log" && $("log-follow").checked && atBottom) el.scrollTop = el.scrollHeight;
-}
-
-/* ── results view ──────────────────────────────────────────────────── */
-async function renderResults(s){
-  const body = $("res-body"), title = $("res-title");
-  if (s.state === "error"){
-    title.textContent = "Run failed";
-    let html = `<div class="banner">${esc(s.error || "Unknown error")}`
-      + (s.error_code ? ` <span class="chip"><span class="dot"></span>${esc(s.error_code)}</span>` : "")
-      + `</div>`;
-    if (s.hint) html += `<div class="hint">💡 ${esc(s.hint)}</div>`;
-    if (s.interrupted) html += `<div class="banner warn">Run was stopped before completion.</div>`;
-    body.innerHTML = html;
-    renderLog(s, "res-log");
-    return;
-  }
-  title.textContent = "Training complete";
-  const r = s.result || {};
-  const card = (k, v, gold, path) => `<div class="stat${gold ? " gold" : ""}"><small>${k}</small><span${path ? " class=\"path\"" : ""}>${esc(v ?? "—")}</span></div>`;
-  let html = `<div class="res">`
-    + card("Merged to", r.merged_dir || "—", true, true)
-    + card("Final loss", r.final_loss !== null && r.final_loss !== undefined ? Number(r.final_loss).toFixed(4) : null)
-    + card("Best loss", r.best_loss !== null && r.best_loss !== undefined ? Number(r.best_loss).toFixed(4) : null)
-    + card("Steps", `${s.step}/${s.total_steps || "?"}`)
-    + card("Time", fmtHMS(r.time_sec))
-    + `</div>`;
-  if (s.interrupted) html += `<div class="banner warn">Run was stopped before completion — any saved state is in the output dir.</div>`;
-  body.innerHTML = html;
-  try{
-    const rep = await jget("/api/report");
-    if (rep.ok && rep.report){
-      const lo = rep.report.loss || rep.report;
-      const kv = Object.entries(lo).slice(0, 12)
-        .map(([k, v]) => `${k}: ${typeof v === "number" ? (Math.round(v * 10000) / 10000) : JSON.stringify(v)}`)
-        .join("\n");
-      body.innerHTML += `<pre class="kv" style="margin-top:12px">${esc(kv)}</pre>`;
-    }
-  }catch(e){}
-  renderLog(s, "res-log");
-}
-
-/* ── main loop ─────────────────────────────────────────────────────── */
-let viewState = null;
-async function tick(){
-  let s;
-  try{ s = await jget("/api/status"); }
-  catch(e){ chip("unreachable", {}); $("chip-text").textContent = "Server unreachable"; return; }
-  last = s;
-  chip(s.state, s);
-  if (viewState !== s.state){
-    viewState = s.state;
-    hideBanner();
-    route(s.state);
-    if (s.state === "done" || s.state === "error") renderResults(s);
-  }
-  if (s.state === "running" || s.state === "stopping"){
-    renderPhases(s.phases);
-    renderTqdm(s);
-    renderStats(s);
-    drawChart(s);
-    renderLog(s, "log");
-    if (Date.now() - anaTimer > 5000){ anaTimer = Date.now(); renderAnalysis(); }
-    // results render once at the state transition above
-  }
-}
-
-/* ── boot ──────────────────────────────────────────────────────────── */
-document.querySelectorAll("#view-setup input").forEach(el => {
-  el.addEventListener("input", schedulePreview);
-});
-jget("/api/models").then(d => {
-  $("models").innerHTML = (d.models || []).map(m => `<option value="${esc(m)}">`).join("");
-}).catch(() => {});
-route("idle");
-schedulePreview();   // show the base command / first validation hint on load
-setInterval(tick, 1000);
-tick();
-</script>
-</body>
-</html>
-"""

@@ -16,8 +16,9 @@ Event vocabulary
     dataset_loaded        dataset resolved (rows, training mode, column
                           mapping, cleaning mode)
     training_started      total steps, LR, scheduler, early-stop plan
-    step                  progress at every logged step (loss, pct, eta; DPO
-                      runs also carry acc = rewards/accuracies)
+    step                  progress at every logged step (loss, grad_norm,
+                      learning_rate, epoch, pct, eta; DPO runs also carry
+                      acc = rewards/accuracies)
     checkpoint_saved      Trainer checkpoint written
     early_stop_check      periodic early-stopping health snapshot
     early_stop_triggered  early stopping decided to stop the run
@@ -73,7 +74,9 @@ def _now() -> str:
 # v5: Interrupts outside the training loop emit run_interrupted with
 #     error_code "interrupted" and exit 130 (previously run_failed, and
 #     0xC000013A on Windows).
-SCHEMA_VERSION = 5
+# v6: step events carry grad_norm, learning_rate, and epoch so pollers and
+#     the web UI see the same per-step metrics as the console loss rows.
+SCHEMA_VERSION = 6
 
 
 # Status shown in run_state.json after each event type.
@@ -109,6 +112,10 @@ _MIRRORED_FIELDS = {
     "columns", "shuffle_seed", "dpo_beta",
     "batch_dir", "total_stages", "index", "name", "final_merged",
     "resuming", "returncode",
+    # v6 per-step telemetry and early-stopping health, mirrored so
+    # run_state.json pollers see the same numbers as the NDJSON stream.
+    "acc", "grad_norm", "learning_rate", "epoch",
+    "ema", "best_ema", "since_best", "patience", "verdict",
 }
 
 # Substring match (case-insensitive) -> (error_code, hint). First match
@@ -414,6 +421,9 @@ _EVENT_FIELDS = {
             "total_steps": "int",
             "pct": "float — percent complete",
             "loss": "float — current training loss",
+            "grad_norm": "float|null — gradient norm at this step",
+            "learning_rate": "float|null — current LR",
+            "epoch": "float|null — fractional epoch progress",
             "eta_sec": "int|null — estimated seconds remaining",
             "acc": "float|null — rewards/accuracies, DPO runs only",
         },
@@ -836,15 +846,26 @@ class AgentProgressCallback(TrainerCallback):
             if done > 0 and elapsed > 0:
                 eta_sec = round(max(0.0, (total - step) / (done / elapsed)))
 
+        def _metric(key):
+            value = logs.get(key)
+            if value is None:
+                return None
+            try:
+                return round(float(value), 6)
+            except (TypeError, ValueError):
+                return None
+
         self.bridge.emit(
             "step",
             step=step,
             total_steps=total,
             pct=round(100.0 * step / total, 2) if total else None,
             loss=round(float(loss), 6),
+            grad_norm=_metric("grad_norm"),
+            learning_rate=_metric("learning_rate"),
+            epoch=_metric("epoch"),
             eta_sec=eta_sec,
-            acc=(round(float(logs["rewards/accuracies"]), 6)
-                 if logs.get("rewards/accuracies") is not None else None),
+            acc=_metric("rewards/accuracies"),
         )
 
         es = self.early_stop
