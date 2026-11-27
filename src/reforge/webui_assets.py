@@ -2002,7 +2002,10 @@ function renderChip() {
   chip.className = "status-pill " + cls;
   text.textContent = label;
   chip.title = S.offline
-    ? "Lost contact with the local server — retrying every few seconds. Training runs in its own process and is not affected."
+    ? "Lost contact with the server this page was served from ("
+      + location.origin + ") - retrying every few seconds. If you restarted "
+      + "Reforge on a different port, open that address instead. Training "
+      + "runs in its own process and is not affected."
     : "";
   const footer = $("#footer-state");
   if (footer) footer.textContent = S.offline ? "reconnecting" : label.toLowerCase();

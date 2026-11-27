@@ -9,7 +9,8 @@ from .config import TRAINING_CHAIN_PATH, MERGED_DIR, MERGE_SUCCESS_FLAG, OUTPUT_
 from .display import _info, _ok, _warn, _err, _banner
 from .agent import BRIDGE
 from .profiles import resolve_model_profile
-from .tokenization import tokenize, measure_lengths, _map_resilient
+from .tokenization import (tokenize, measure_lengths, _map_resilient,
+                           _pool_workers)
 from .utils import roc, log_dataset, purge_checkpoints
 
 try:
