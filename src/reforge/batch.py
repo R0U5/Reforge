@@ -102,6 +102,7 @@ def global_stage_defaults(parsed_args) -> dict:
     for stage_key, arg_key in (("steps", "steps"),
                                ("batch_size", "batch_size"),
                                ("grad_accum", "grad_accum"),
+                               ("max_length", "max_length"),
                                ("dpo_beta", "dpo_beta")):
         value = getattr(parsed_args, arg_key, None)
         if value is not None:
@@ -157,14 +158,15 @@ def validate_manifest(manifest, base_model):
                     raise _BatchError(f"Stage {i + 1}: '{key}' must be an integer")
                 if stage[key] < lo:
                     raise _BatchError(f"Stage {i + 1}: '{key}' must be >= {lo}")
-        for key in ("batch_size", "grad_accum"):
+        for key in ("batch_size", "grad_accum", "max_length"):
             if key in stage:
                 try:
                     stage[key] = int(stage[key])
                 except (TypeError, ValueError):
                     raise _BatchError(f"Stage {i + 1}: '{key}' must be an integer")
-                if stage[key] < 1:
-                    raise _BatchError(f"Stage {i + 1}: '{key}' must be >= 1")
+                lo = 128 if key == "max_length" else 1
+                if stage[key] < lo:
+                    raise _BatchError(f"Stage {i + 1}: '{key}' must be >= {lo}")
         if "dpo_beta" in stage:
             try:
                 stage["dpo_beta"] = float(stage["dpo_beta"])

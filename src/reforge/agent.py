@@ -400,7 +400,9 @@ _EVENT_FIELDS = {
             "columns": "list[str] — raw dataset columns",
             "mapped_roles": "dict — {question, chosen, rejected, image} -> column",
             "cleaning_mode": 'str — "math", "latex", "code", or "latex+code"',
-            "shuffle_seed": "int — shuffle seed used for the dataset",
+            "shuffle_seed": "int - shuffle seed used for the dataset",
+            "max_length": "int - resolved max sequence length in tokens (auto P95 "
+                          "or the --max_length / REFORGE_MAX_LENGTH override)",
         },
     },
     "dataset_progress": {
@@ -784,7 +786,8 @@ def build_agent_schema(parser=None) -> dict:
                               "merged model is the final output",
                 },
                 "stage_keys": "dataset | hf_dataset (required), plus: name, epochs, steps, "
-                              "force, dpo, dpo_beta, latex, code, batch_size, grad_accum",
+                              "force, dpo, dpo_beta, latex, code, batch_size, grad_accum, "
+                              "max_length (tokens; overrides auto P95; min 128)",
                 "note": "a stage whose dataset has chosen+rejected columns trains as DPO "
                         "automatically - no special batch keys needed",
             },

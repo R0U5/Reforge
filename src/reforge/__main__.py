@@ -638,6 +638,7 @@ def _run_pipeline(parsed_args, image_mode, output_dir, merge_dir, merge_success_
         mapped_roles=schema_info["mapped_roles"],
         cleaning_mode=schema_info["cleaning_mode"],
         shuffle_seed=schema_info["shuffle_seed"],
+        max_length=schema_info.get("max_length"),
     )
 
     model, trainer, training_error = run_training(

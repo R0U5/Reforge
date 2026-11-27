@@ -668,6 +668,7 @@ def load_and_prepare_dataset(dataset_path, cleaning_mode, image_mode=False, base
         },
         "cleaning_mode": effective_mode,
         "shuffle_seed": shuffle_seed,
+        "max_length": auto_len,
     }
     return train_dataset, eval_dataset, tokenizer, training_mode, model_name, processor, schema_info
 
