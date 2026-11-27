@@ -115,6 +115,20 @@ def _validate_stage_list(params: dict, strict: bool) -> "list | None":
     return cleaned
 
 
+def _resume_batch_dir(params: dict) -> "str | None":
+    """A --batch_dir resume target from the form, when it exists on disk."""
+    raw = str(params.get("batch_dir") or "").strip()
+    if not raw:
+        return None
+    if not os.path.isdir(raw):
+        raise ValueError(f"Batch directory not found:\n{raw}")
+    state = os.path.join(raw, "batch_state.json")
+    if not os.path.isfile(state):
+        raise ValueError(
+            f"Not a batch directory (missing batch_state.json):\n{raw}")
+    return raw
+
+
 def build_argv(params: dict, strict: bool = True,
                manifest_path: "str | None" = None) -> "list[str]":
     """Validated child command line; raises ValueError on bad input."""
@@ -125,17 +139,26 @@ def build_argv(params: dict, strict: bool = True,
     base = str(params.get("base_model") or "").strip()
     ds = str(params.get("dataset") or "").strip()
     hf = str(params.get("hf_dataset") or "").strip()
-    stages = _validate_stage_list(params, strict)
-    is_batch = stages is not None
+    # A --batch_dir resume needs neither the form's stages nor its base
+    # model: the child recovers both from the batch's recorded manifest.
+    resume_dir = _resume_batch_dir(params)
+    if resume_dir:
+        stages = None
+    else:
+        stages = _validate_stage_list(params, strict)
+    is_batch = resume_dir is not None or stages is not None
 
     if is_batch:
         # Batch mode: stage 1's base model comes from the manifest.
-        if not base:
-            raise ValueError(
-                "Batch mode requires a Base Model (stage 1's base; batch "
-                "never chains from a previous merged/).")
-        if strict and not os.path.exists(base):
-            raise ValueError(f"Base model not found:\n{base}")
+        if not resume_dir:
+            # A fresh batch needs the form's base model; a resume recovers
+            # it (and every stage override) from the recorded manifest.
+            if not base:
+                raise ValueError(
+                    "Batch mode requires a Base Model (stage 1's base; batch "
+                    "never chains from a previous merged/).")
+            if strict and not os.path.exists(base):
+                raise ValueError(f"Base model not found:\n{base}")
     else:
         if not ds and not hf:
             raise ValueError(
@@ -161,6 +184,16 @@ def build_argv(params: dict, strict: bool = True,
         # Manifest path: the Tk Save-Manifest choice wins; otherwise the
         # default lives in the output dir. Written on strict builds (a real
         # start); a non-strict preview only shows where Start will save it.
+        if resume_dir:
+            # Resume: the CLI recovers the manifest recorded in the batch's
+            # batch_state.json, so no fresh manifest is written here and no
+            # --batch argument is needed.
+            cmd += ["--batch_dir", resume_dir]
+            if strict and str(params.get("output_dir") or "").strip():
+                cmd += ["--output_dir", str(params["output_dir"]).strip()]
+            cmd.append("--no_tqdm")
+            cmd += ["--agent", "--agent_log", os.path.join(out_dir, "agent.ndjson")]
+            return cmd
         path = manifest_path or os.path.join(out_dir, "batch_manifest.json")
         if strict:
             # Global Performance/Flags form values apply to every stage

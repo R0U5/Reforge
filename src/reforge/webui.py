@@ -866,6 +866,61 @@ def _clean_path(path: str) -> str:
     return os.path.abspath(os.path.expandvars(os.path.expanduser(raw)))
 
 
+def _scan_batch_dirs(root: str) -> list:
+    """Existing batch runs under ``root``, newest first.
+
+    A batch directory is any ``batch_*`` folder holding a readable
+    ``batch_state.json``. The web UI uses this to offer one-click resume:
+    the CLI accepts ``--batch_dir <dir>`` alone and recovers the manifest
+    recorded in the state file, so the dashboard never has to reconstruct
+    stage arguments to continue an interrupted run.
+    """
+    if not root or not os.path.isdir(root):
+        return []
+    found = []
+    try:
+        with os.scandir(root) as it:
+            dirs = [e for e in it if e.is_dir() and e.name.startswith("batch_")]
+    except OSError:
+        return []
+    for entry in dirs:
+        state_path = os.path.join(entry.path, "batch_state.json")
+        state = None
+        try:
+            with open(state_path, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict) and isinstance(loaded.get("stages"), list):
+                state = loaded
+        except Exception:
+            continue
+        stages = []
+        for s in state["stages"]:
+            if not isinstance(s, dict):
+                continue
+            stages.append({
+                "index": s.get("index"),
+                "name": s.get("name"),
+                "dataset": s.get("dataset"),
+                "status": s.get("status") or "pending",
+            })
+        try:
+            mtime = entry.stat().st_mtime
+        except OSError:
+            mtime = 0
+        found.append({
+            "batch_dir": entry.path,
+            "name": entry.name,
+            "created_at": state.get("created_at"),
+            "manifest_path": state.get("manifest_path"),
+            "stages": stages,
+            "complete": sum(1 for s in stages if s["status"] == "complete"),
+            "total": len(stages),
+            "mtime": mtime,
+        })
+    found.sort(key=lambda b: b["mtime"], reverse=True)
+    return found
+
+
 def _places() -> dict:
     """Favorites + drive roots shown in the folder-picker sidebar."""
     home = os.path.expanduser("~")
@@ -1105,6 +1160,14 @@ class _Handler(BaseHTTPRequestHandler):
             ))
         elif route == "/api/analysis":
             self._send_json(_analysis())
+        elif route == "/api/batch_status":
+            if not _client_is_local(self):
+                self._send_json({"ok": False, "error": "Local access only."}, 403)
+                return
+            q = parse_qs(parsed.query)
+            root = _clean_path((q.get("path") or [""])[0])
+            batches = _scan_batch_dirs(root)
+            self._send_json({"ok": True, "output_dir": root, "batches": batches})
         elif route == "/api/report":
             self._send_json(_read_report())
         else:

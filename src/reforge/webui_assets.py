@@ -256,6 +256,20 @@ INDEX_HTML = r"""<!doctype html>
   .stage-actions{display:flex;gap:3px;padding-bottom:3px}
   .batch-header{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px;flex-wrap:wrap}
   .batch-mode-toggle{display:flex;align-items:center;gap:8px}
+  .batch-resume{display:flex;flex-direction:column;gap:9px;padding:12px 14px;margin-bottom:12px;
+    border:1px solid rgba(255,214,10,.3);border-radius:11px;background:rgba(255,214,10,.07)}
+  .batch-resume-head{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+  .batch-resume-title{display:flex;align-items:center;gap:8px;font-size:12.5px;font-weight:600;color:var(--ink)}
+  .batch-resume-sub{font-size:11px;color:var(--muted)}
+  .batch-resume-path{font:10.5px var(--mono);color:var(--faint);word-break:break-all}
+  .batch-resume-stages{display:flex;gap:4px;flex-wrap:wrap}
+  .batch-resume-stages i{display:inline-flex;align-items:center;justify-content:center;width:22px;height:18px;
+    border-radius:5px;font:600 9.5px var(--mono);border:1px solid var(--line);
+    background:var(--surface-2);color:var(--faint);font-style:normal}
+  .batch-resume-stages i.done{background:rgba(48,209,88,.14);border-color:rgba(48,209,88,.3);color:var(--ok)}
+  .batch-resume-stages i.active{background:rgba(255,122,69,.14);border-color:rgba(255,122,69,.35);color:var(--accent)}
+  .batch-resume-stages i.failed{background:rgba(255,69,58,.14);border-color:rgba(255,69,58,.3);color:var(--bad)}
+  .batch-resume-actions{display:flex;gap:8px;flex-wrap:wrap}
   .empty-inline{padding:14px;border:1px dashed var(--line);border-radius:9px;
     color:var(--faint);font-size:12px;text-align:center}
   .disclosure{padding:0;overflow:hidden}
@@ -750,6 +764,7 @@ INDEX_HTML = r"""<!doctype html>
             </div>
             <p class="section-copy" id="mode-copy">Train one dataset with one merged output.</p>
             <div id="batch-editor" hidden>
+              <div id="batch-resume" hidden></div>
               <div class="batch-header">
                 <div class="batch-mode-toggle">
                   <button type="button" class="btn ghost small" id="btn-load-manifest">Load manifest.json</button>
@@ -1038,6 +1053,8 @@ const S = {
   view: "setup",
   mode: "single",
   stages: [],
+  batchDir: null,
+  batchStatusTimer: null,
   chartMetric: "loss",
   analysis: null,
   analysisN: 0,
@@ -1329,8 +1346,10 @@ function newRun() {
     return;
   }
   banner("");
+  S.batchDir = null;
   S.view = "setup";
   renderView();
+  if (S.mode === "batch") checkBatchStatus();
   window.scrollTo({ top: 0, behavior: "smooth" });
   setTimeout(() => $("#p-base")?.focus(), 80);
 }
@@ -1395,6 +1414,13 @@ function collectParams() {
     dpo: checked("p-dpo"),
   };
   if (S.mode === "batch") {
+    if (S.batchDir) {
+      // Resume: the child recovers everything from the batch's own state.
+      params.batch_dir = S.batchDir;
+      delete params.dataset;
+      delete params.hf_dataset;
+      return params;
+    }
     delete params.dataset;
     delete params.hf_dataset;
     params.stages = S.stages.map((stage, index) => {
@@ -1450,10 +1476,15 @@ function updateRunSummary() {
   setText("#run-output", out ? baseName(out) : "Default output");
   const badge = $("#run-mode");
   if (badge) {
-    badge.textContent = S.mode === "batch" ? `Batch · ${S.stages.length}` : "Single";
-    badge.className = "badge " + (S.mode === "batch" ? "violet" : "neutral");
+    if (S.mode === "batch" && S.batchDir) {
+      badge.textContent = "Resume batch";
+      badge.className = "badge warn";
+    } else {
+      badge.textContent = S.mode === "batch" ? `Batch · ${S.stages.length}` : "Single";
+      badge.className = "badge " + (S.mode === "batch" ? "violet" : "neutral");
+    }
   }
-  if (S.mode === "batch") {
+  if (S.mode === "batch" && !S.batchDir) {
     const first = S.stages[0] || {};
     const label = first.name || first.dataset || first.hf_dataset;
     setText("#run-dataset", label ? baseName(label) : "Add a stage");
@@ -1484,11 +1515,13 @@ function bindForm() {
       saveForm();
       updateRunSummary();
       schedulePreview();
+      if (id === "p-out") scheduleBatchStatus();
     });
     el.addEventListener("change", () => {
       saveForm();
       updateRunSummary();
       schedulePreview();
+      if (id === "p-out") scheduleBatchStatus();
     });
   }
   $("#p-dpo")?.addEventListener("change", updateRunSummary);
@@ -1576,6 +1609,69 @@ function blankStage() {
   return { name: "", dataset: "", hf_dataset: "", epochs: "", steps: "" };
 }
 
+/* ── batch resume detection ───────────────────────────────────────── */
+async function checkBatchStatus() {
+  if (S.mode !== "batch") { renderBatchResume(null); return; }
+  const out = val("p-out") || S.places?.default_output || "";
+  if (!out) { renderBatchResume(null); return; }
+  const res = await api("/api/batch_status?path=" + encodeURIComponent(out));
+  const batches = (res && res.ok && Array.isArray(res.batches)) ? res.batches : [];
+  // A batch is resumable while any stage is not complete.
+  const resumable = batches.find((b) => b.total && b.complete < b.total) || null;
+  renderBatchResume(resumable);
+}
+
+function scheduleBatchStatus() {
+  clearTimeout(S.batchStatusTimer);
+  S.batchStatusTimer = setTimeout(checkBatchStatus, 350);
+}
+
+function renderBatchResume(batch) {
+  const host = $("#batch-resume");
+  if (!host) return;
+  if (!batch || S.status?.state === "running" || S.status?.state === "stopping") {
+    host.hidden = true;
+    host.innerHTML = "";
+    return;
+  }
+  const done = batch.complete || 0;
+  const total = batch.total || 0;
+  const stages = Array.isArray(batch.stages) ? batch.stages : [];
+  const cells = stages.map((s) => {
+    const cls = s.status === "complete" ? "done"
+      : s.status === "running" ? "active"
+      : s.status === "failed" || s.status === "interrupted" ? "failed" : "";
+    return `<i class="${cls}" title="${esc(s.name || "stage " + ((s.index ?? 0) + 1))} · ${esc(s.status || "pending")}">${(s.index ?? 0) + 1}</i>`;
+  }).join("");
+  host.hidden = false;
+  host.innerHTML = `
+    <div class="batch-resume-head">
+      <div>
+        <div class="batch-resume-title">Existing batch · ${done}/${total} stages complete</div>
+        <div class="batch-resume-sub">Reforge found this run in your output folder. Resuming continues from the first incomplete stage (checkpoints preserved).</div>
+        <div class="batch-resume-path">${esc(batch.batch_dir || "")}</div>
+      </div>
+      <div class="batch-resume-actions">
+        <button type="button" class="btn primary small" id="btn-resume-batch">Resume batch</button>
+        <button type="button" class="btn ghost small" id="btn-fresh-batch">Start fresh</button>
+      </div>
+    </div>
+    <div class="batch-resume-stages">${cells}</div>`;
+  $("#btn-resume-batch")?.addEventListener("click", () => {
+    S.batchDir = batch.batch_dir;
+    updateRunSummary();
+    schedulePreview();
+    startRun();
+  });
+  $("#btn-fresh-batch")?.addEventListener("click", () => {
+    S.batchDir = null;
+    host.hidden = true;
+    updateRunSummary();
+    schedulePreview();
+    toast("Starting a fresh batch run", "info", 2000);
+  });
+}
+
 function setMode(mode) {
   S.mode = mode === "batch" ? "batch" : "single";
   if (S.mode === "batch" && !S.stages.length) S.stages.push(blankStage());
@@ -1594,6 +1690,8 @@ function setMode(mode) {
   renderStages();
   updateRunSummary();
   schedulePreview();
+  if (S.mode === "batch") scheduleBatchStatus();
+  else { S.batchDir = null; renderBatchResume(null); }
   saveForm();
 }
 
@@ -3107,6 +3205,7 @@ async function init() {
     }
   }
   if (places && !places.error) S.places = places;
+  if (S.mode === "batch") checkBatchStatus();
 
   pollNow();
 }
