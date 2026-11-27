@@ -396,8 +396,42 @@ def tokenize(example, tokenizer, training_mode="sft", max_length=750, processor=
     return out
 
 
+def _pool_workers() -> int:
+    """Spawn-worker count for dataset maps, overridable for stability.
+
+    Each spawned worker carries a full copy of the tokenizer; on many-core
+    Windows machines 12 simultaneous dill/spawn workers has been observed
+    corrupting the tokenizers Rust allocator (MemoryError inside
+    SpawnPoolWorker-N). Default is conservative; REFORGE_NUM_PROC overrides.
+    """
+    override = os.environ.get("REFORGE_NUM_PROC", "").strip()
+    if override:
+        try:
+            return max(1, int(override))
+        except ValueError:
+            pass
+    return min(8, os.cpu_count() or 4)
+
+
+def _map_resilient(ds, fn, **kwargs):
+    """datasets.map with a single-process fallback.
+
+    The dill/spawn pool can die with MemoryError / Rust allocator panics on
+    Windows; re-running the same pass with num_proc=1 is slower but
+    reliable, and the map result is cached either way.
+    """
+    num_proc = kwargs.pop("num_proc", _pool_workers())
+    try:
+        return ds.map(fn, num_proc=num_proc, **kwargs)
+    except Exception as e:
+        if isinstance(e, (KeyboardInterrupt, SystemExit)):
+            raise
+        print(f"[WARN] dataset map failed with {num_proc} workers "
+              f"({type(e).__name__}: {e}) - retrying single-process")
+        return ds.map(fn, num_proc=1, **kwargs)
+
+
 def measure_lengths(ds, tokenizer, training_mode=None):
-    _num_proc = min(12, os.cpu_count() or 4)
 
     def _template_len(tokenizer, messages) -> int | None:
         """Token length of a conversation under its chat template, or None."""
@@ -460,7 +494,7 @@ def measure_lengths(ds, tokenizer, training_mode=None):
         )["input_ids"]
         return {"length": len(ids)}
 
-    ds = ds.map(_len_map, num_proc=_num_proc)
+    ds = _map_resilient(ds, _len_map)
     lengths = ds["length"]
     if not lengths:
         raise ValueError("[ERROR] Dataset is empty after processing — no rows to measure lengths from.")
@@ -501,6 +535,8 @@ def _context_limit(tokenizer) -> int:
         limit = int(getattr(tokenizer, "model_max_length", 0) or 0)
     except (TypeError, ValueError):
         limit = 0
-    if 512 <= limit <= 131_072:
+    # Long-context models are real: Qwen ships 262,144. Reject only
+    # sentinel values (1e30 / 1e12 style) and obvious garbage.
+    if 512 <= limit <= 1_000_000:
         return limit
     return 1024

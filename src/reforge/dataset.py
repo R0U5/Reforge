@@ -9,7 +9,7 @@ from .config import TRAINING_CHAIN_PATH, MERGED_DIR, MERGE_SUCCESS_FLAG, OUTPUT_
 from .display import _info, _ok, _warn, _err, _banner
 from .agent import BRIDGE
 from .profiles import resolve_model_profile
-from .tokenization import tokenize, measure_lengths
+from .tokenization import tokenize, measure_lengths, _map_resilient
 from .utils import roc, log_dataset, purge_checkpoints
 
 try:
@@ -422,7 +422,7 @@ def synthesize_prompt_dataset(raw_dataset, col_question, col_chosen, col_rejecte
 def load_and_prepare_dataset(dataset_path, cleaning_mode, image_mode=False, base_model_override=None, output_dir=None, merge_dir=None, merge_success_flag=None, force_dpo=False):
     from transformers import AutoTokenizer, AutoProcessor
 
-    _num_proc = min(12, os.cpu_count() or 4)
+    _num_proc = _pool_workers()
 
     is_hf_hub = (
         not os.path.exists(dataset_path)
@@ -585,7 +585,8 @@ def load_and_prepare_dataset(dataset_path, cleaning_mode, image_mode=False, base
             protected.add("image")
         cols_to_remove = [c for c in processed.column_names if c not in protected]
 
-        tokenized = processed.map(
+        tokenized = _map_resilient(
+            processed,
             lambda e: tokenize(
                 example=e,
                 tokenizer=tokenizer,
