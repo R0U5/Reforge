@@ -1627,9 +1627,9 @@ async function checkBatchStatus() {
   if (!out) { renderBatchResume(null); return; }
   const res = await api("/api/batch_status?path=" + encodeURIComponent(out));
   const batches = (res && res.ok && Array.isArray(res.batches)) ? res.batches : [];
-  // A batch is resumable while any stage is not complete.
-  const resumable = batches.find((b) => b.total && b.complete < b.total) || null;
-  renderBatchResume(resumable);
+  // Newest batch wins; renderBatchResume handles both "resumable" and
+  // "everything already complete".
+  renderBatchResume(batches[0] || null);
 }
 
 function scheduleBatchStatus() {
@@ -1648,6 +1648,7 @@ function renderBatchResume(batch) {
   const done = batch.complete || 0;
   const total = batch.total || 0;
   const stages = Array.isArray(batch.stages) ? batch.stages : [];
+  const next = stages.find((s) => s.status !== "complete") || null;
   const cells = stages.map((s) => {
     const cls = s.status === "complete" ? "done"
       : s.status === "running" ? "active"
@@ -1659,11 +1660,13 @@ function renderBatchResume(batch) {
     <div class="batch-resume-head">
       <div>
         <div class="batch-resume-title">Existing batch · ${done}/${total} stages complete</div>
-        <div class="batch-resume-sub">Reforge found this run in your output folder. Resuming continues from the first incomplete stage (checkpoints preserved).</div>
+        <div class="batch-resume-sub">${next
+          ? `Resuming continues with stage ${(next.index ?? 0) + 1} — ${esc(next.name || "")} (finished stages are skipped, checkpoints preserved).`
+          : "All stages are complete — you can start fresh or review the results."}</div>
         <div class="batch-resume-path">${esc(batch.batch_dir || "")}</div>
       </div>
       <div class="batch-resume-actions">
-        <button type="button" class="btn primary small" id="btn-resume-batch">Resume batch</button>
+        <button type="button" class="btn primary small" id="btn-resume-batch"${next ? "" : " disabled"}>Resume batch</button>
         <button type="button" class="btn ghost small" id="btn-fresh-batch">Start fresh</button>
       </div>
     </div>

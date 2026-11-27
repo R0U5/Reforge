@@ -909,11 +909,21 @@ def _scan_batch_dirs(root: str) -> list:
         for s in state["stages"]:
             if not isinstance(s, dict):
                 continue
+            status = s.get("status") or "pending"
+            # Same crash-recovery rule the batch runner applies on resume:
+            # a stage whose merged/success.txt exists finished, even if the
+            # state file still says interrupted/running (the process died
+            # between the merge and the state write).
+            if status != "complete":
+                stage_dir = os.path.join(
+                    entry.path, f"stage_{(s.get('index') or 0) + 1:02d}")
+                if os.path.isfile(os.path.join(stage_dir, "merged", "success.txt")):
+                    status = "complete"
             stages.append({
                 "index": s.get("index"),
                 "name": s.get("name"),
                 "dataset": s.get("dataset"),
-                "status": s.get("status") or "pending",
+                "status": status,
             })
         try:
             mtime = entry.stat().st_mtime
