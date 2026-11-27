@@ -1496,6 +1496,16 @@ function bindForm() {
       openBrowser("out");
     }
   });
+  // Browse buttons with data-browse attribute
+  document.addEventListener("click", (event) => {
+    const btn = event.target.closest(".browse-btn[data-browse]");
+    if (btn) {
+      const kind = btn.dataset.browse;
+      if (kind === "base" || kind === "out" || kind === "dataset") {
+        openBrowser(kind);
+      }
+    }
+  });
   $("#btn-start")?.addEventListener("click", startRun);
   $("#btn-stop-top")?.addEventListener("click", requestStop);
   $("#btn-copy-command")?.addEventListener("click", () =>
@@ -2979,6 +2989,11 @@ function initBrowser() {
     if (event.target.closest("[data-close='info-modal']")) closeModal(info);
   });
   $("#info-close")?.addEventListener("click", () => closeModal(info));
+
+  const confirm = $("#confirm-modal");
+  confirm?.addEventListener("click", (event) => {
+    if (event.target.closest("[data-close='confirm-modal']")) closeModal(confirm);
+  });
 }
 
 /* ── keyboard ─────────────────────────────────────────────────────── */
