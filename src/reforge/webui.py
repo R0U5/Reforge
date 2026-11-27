@@ -49,7 +49,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
 from .config import DEFAULT_HF_MODELS_DIR, OUTPUT_DIR
-from .display import _info, _title, _warn
+from .display import _info, _title, _warn, _install_safe_streams
 from .webui_assets import INDEX_HTML
 from .webui_config import build_argv, scan_models
 
@@ -1321,6 +1321,13 @@ def launch(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
     """Start the web UI server (blocks until Ctrl-C)."""
     _enable_utf8()
     _title("REFORGE", subtitle="Web dashboard")
+    # Crash evidence: without this, a dying server's traceback only lives in
+    # its console window. Route it to a durable log so a repeat occurrence
+    # can be diagnosed after the fact.
+    try:
+        _install_safe_streams(os.path.join(OUTPUT_DIR, "webui_console.log"))
+    except Exception:
+        pass
     server = ThreadingHTTPServer((host, port), _Handler)
     url = f"http://{host}:{port}"
     print(f"\n  Reforge Web UI is live:  {url}\n")
@@ -1331,7 +1338,18 @@ def launch(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
         except Exception:
             pass
     try:
-        server.serve_forever()
+        while True:
+            try:
+                server.serve_forever(poll_interval=0.5)
+            except KeyboardInterrupt:
+                raise
+            except Exception as e:
+                # The supervisor must outlive a transient fatal-looking
+                # error (e.g. MemoryError while the training child is at
+                # its commit-charge peak). Log it, breathe, serve again.
+                _warn(f"server loop recovered from {type(e).__name__}: {e}")
+                time.sleep(1.0)
+                continue
     except KeyboardInterrupt:
         _info("Shutting down.")
         if JOB.proc is not None:
