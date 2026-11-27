@@ -470,6 +470,8 @@ INDEX_HTML = r"""<!doctype html>
   .sig-text{font-size:11px;color:var(--muted);line-height:1.4;word-break:break-word}
   .sig-time{font:9.5px var(--mono);color:var(--faint)}
   .logpane pre{max-height:330px;min-height:70px}
+  .chev-btn .chev{transition:transform .18s var(--ease)}
+  .chev-btn[aria-expanded="false"] .chev{transform:rotate(-90deg)}
   .check{display:inline-flex;align-items:center;gap:6px;color:var(--muted);cursor:pointer}
   .check input{accent-color:var(--accent);width:14px;height:14px}
   .check.small{font-size:11px}
@@ -895,6 +897,10 @@ INDEX_HTML = r"""<!doctype html>
           <div class="row">
             <button type="button" class="btn ghost small" id="btn-copy-log">Copy</button>
             <label class="check small"><input type="checkbox" id="log-follow" checked> Follow</label>
+            <button type="button" class="icon-btn chev-btn" id="btn-console-toggle"
+              aria-expanded="true" aria-controls="log" title="Show or hide console output (Ctrl+J)">
+              <svg class="chev" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+            </button>
           </div>
         </div>
         <pre id="log"></pre>
@@ -1352,14 +1358,25 @@ function currentCommandText() {
   return text && !text.startsWith("Fill in") ? text : "";
 }
 
-function toggleConsole() {
+function setConsoleCollapsed(collapsed) {
   const card = $("#console-card");
   if (!card) return;
-  card.classList.toggle("collapsed");
-  if (!card.classList.contains("collapsed")) {
+  card.classList.toggle("collapsed", !!collapsed);
+  const btn = $("#btn-console-toggle");
+  if (btn) btn.setAttribute("aria-expanded", String(!collapsed));
+  try {
+    localStorage.setItem("reforge.console.collapsed", collapsed ? "1" : "0");
+  } catch (e) {}
+  if (!collapsed) {
     const pre = $("#log");
     if (pre) pre.scrollTop = pre.scrollHeight;
   }
+}
+
+function toggleConsole() {
+  const card = $("#console-card");
+  if (!card) return;
+  setConsoleCollapsed(!card.classList.contains("collapsed"));
 }
 
 function newRun() {
@@ -1631,6 +1648,7 @@ function bindForm() {
   $("#log-follow")?.addEventListener("change", (event) => {
     S.followLog = event.target.checked;
   });
+  $("#btn-console-toggle")?.addEventListener("click", toggleConsole);
 }
 
 /* ── batch editor ─────────────────────────────────────────────────── */
@@ -2032,7 +2050,11 @@ function progressTitle(st) {
   if (state === "stopping") return "Stopping — saving adapter…";
   if (state === "error") return "Run stopped with an error";
   if (state === "done") return "Wrapping up";
-  if (st.phase === "dataset") return "Preparing dataset";
+  if (st.phase === "dataset") {
+    if (st.dataset_stage === "tokenizing") return "Tokenizing dataset";
+    if (st.dataset_stage === "measuring") return "Measuring sequence lengths";
+    return "Preparing dataset";
+  }
   if (st.phase === "model") return "Loading base model";
   if (st.phase === "train") return "Training";
   if (st.phase === "merge") return "Merging adapter";
@@ -2128,11 +2150,21 @@ function renderProgress(st) {
     if (st.latest_loss != null) tqdm.push(`loss ${fmt(st.latest_loss, 4)}`);
     if (st.latest_acc != null) tqdm.push(`accuracy ${fmt(st.latest_acc, 3)}`);
   } else if (st.phase) {
-    tqdm.push({ dataset: "reading and preparing the dataset…",
-                model: "loading the base model…",
-                train: "waiting for the first training step…",
-                merge: "merging the adapter into the base model…" }[st.phase]
-              || `working on ${st.phase}…`);
+    const phaseCopy = {
+      dataset: "reading and preparing the dataset…",
+      model: "loading the base model…",
+      train: "waiting for the first training step…",
+      merge: "merging the adapter into the base model…",
+    }[st.phase] || `working on ${st.phase}…`;
+    if (st.phase === "dataset" && st.dataset_stage) {
+      const label = st.dataset_stage === "tokenizing"
+        ? "Tokenizing"
+        : "Measuring sequence lengths of";
+      const rows = st.dataset_rows ? ` ${fmtInt(st.dataset_rows)} rows` : "";
+      tqdm.push(`${label}${rows} — large datasets can take a few minutes…`);
+    } else {
+      tqdm.push(phaseCopy);
+    }
   } else {
     tqdm.push("starting the training process…");
   }
@@ -3314,6 +3346,11 @@ function initKeyboard() {
 async function init() {
   loadForm();
   applyTheme(currentThemeChoice());
+  try {
+    if (localStorage.getItem("reforge.console.collapsed") === "1") {
+      setConsoleCollapsed(true);
+    }
+  } catch (e) {}
   initMenus();
   initChart();
   initBrowser();

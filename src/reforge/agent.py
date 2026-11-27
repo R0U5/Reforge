@@ -76,13 +76,17 @@ def _now() -> str:
 #     0xC000013A on Windows).
 # v6: step events carry grad_norm, learning_rate, and epoch so pollers and
 #     the web UI see the same per-step metrics as the console loss rows.
-SCHEMA_VERSION = 6
+# v7: dataset_progress events report the dataset pipeline's sub-steps
+#     (length measurement, tokenization) so pollers can distinguish a
+#     working prepare phase from a stalled one.
+SCHEMA_VERSION = 7
 
 
 # Status shown in run_state.json after each event type.
 _STATUS_BY_EVENT = {
     "run_started":          "starting",
     "dataset_loaded":       "preparing",
+    "dataset_progress":     "preparing",
     "training_started":     "training",
     "step":                 "training",
     "checkpoint_saved":     "training",
@@ -395,6 +399,18 @@ _EVENT_FIELDS = {
             "mapped_roles": "dict — {question, chosen, rejected, image} -> column",
             "cleaning_mode": 'str — "math", "latex", "code", or "latex+code"',
             "shuffle_seed": "int — shuffle seed used for the dataset",
+        },
+    },
+    "dataset_progress": {
+        "description": "Dataset-pipeline sub-step started. Length measurement "
+                       "and tokenization each scan every row and can take "
+                       "minutes on large datasets; this event tells pollers "
+                       "the prepare phase is working, not stalled. "
+                       "dataset_loaded follows when the pipeline finishes.",
+        "stage": "preparing",
+        "fields": {
+            "substep": '"measuring"|"tokenizing" — which scan just started',
+            "rows": "int|null — rows about to be scanned (null when unknown)",
         },
     },
     "training_started": {

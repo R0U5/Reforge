@@ -36,6 +36,7 @@ import json
 import math
 import os
 import platform
+import re
 import signal
 import string
 import subprocess
@@ -84,6 +85,11 @@ def _now() -> str:
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+# tqdm-style gauge inside a progress-bar line: the redraw-match key is the
+# bar's label, i.e. everything before the changing percent figure.
+_BAR_GAUGE_RE = re.compile(r"(\d+)%\|")
+
+
 def _num(value):
     """Finite float or None — agent events must never poison the chart."""
     if value is None:
@@ -130,6 +136,8 @@ class Job:
         self.stage_name = None       # batch mode: human label of the active stage
         self.stage_dataset = None    # batch mode: dataset basename of the active stage
         self.resuming = None         # batch mode: child continued an interrupted batch
+        self.dataset_stage = None    # prepare sub-step: "measuring"|"tokenizing"
+        self.dataset_rows = None     # rows announced by dataset_progress
         self.log = deque(maxlen=MAX_LOG_LINES)
         # Each point: step, loss, grad_norm, lr, epoch (None when absent).
         self.losses = deque(maxlen=MAX_CHART_POINTS)
@@ -217,6 +225,32 @@ class Job:
         with self._lock:
             self.log.append(line.rstrip("\r\n"))
 
+    def update_bar_line(self, line: str):
+        """tqdm-style progress redraw: refresh the matching bar line in place.
+
+        Bars are matched by their label (the text before the ``%|`` gauge):
+        successive redraws of the same bar replace its line, while a new
+        bar (e.g. checkpoint-shard loading after tokenization) appends a
+        fresh line instead of erasing the finished one.
+        """
+        text = line.rstrip("\r\n")
+        m = _BAR_GAUGE_RE.search(text)
+        if not m:
+            self.add_log(text)
+            return
+        label = text[:m.start()].rstrip()
+        with self._lock:
+            last = self.log[-1] if self.log else None
+            last_label = None
+            if last is not None:
+                lm = _BAR_GAUGE_RE.search(last)
+                last_label = last[:lm.start()].rstrip() if lm else None
+            if last is not None and last_label == label:
+                if last != text:
+                    self.log[-1] = text
+            else:
+                self.log.append(text)
+
     def request_stop(self):
         """Atomically move running -> stopping; return the child or None.
 
@@ -284,6 +318,20 @@ class Job:
                 self.run_config = {k: ev.get(k) for k in (
                     "output_dir", "dataset", "hf_dataset", "base_model",
                     "image_mode", "dpo", "dpo_beta", "force", "epoch", "steps")}
+            elif event == "dataset_progress":
+                # Prepare-phase sub-step (measuring/tokenizing). Each scan
+                # touches every row and can run for minutes; without this
+                # the UI cannot tell working from stalled.
+                self.dataset_stage = ev.get("substep") or self.dataset_stage
+                rows = ev.get("rows")
+                if isinstance(rows, int) and rows >= 0:
+                    self.dataset_rows = rows
+                label = ("Measuring" if self.dataset_stage == "measuring"
+                         else "Tokenizing")
+                rows_txt = (f" {self.dataset_rows:,} rows"
+                            if isinstance(self.dataset_rows, int) else "")
+                self._signal("dataset_progress",
+                             f"{label}{rows_txt}…", "info")
             elif event == "dataset_loaded":
                 self.training_mode = ev.get("training_mode")
                 self.dataset = ev.get("dataset") or self.dataset
@@ -518,6 +566,8 @@ class Job:
                 "training_mode": self.training_mode,
                 "base_model": self.base_model,
                 "dataset": self.dataset,
+                "dataset_stage": self.dataset_stage,
+                "dataset_rows": self.dataset_rows,
                 "dataset_info": dict(self.dataset_info),
                 "plan": dict(self.plan),
                 "run_config": dict(self.run_config),
@@ -587,20 +637,44 @@ def _reader_stdout(pipe):
 def _reader_stderr(pipe):
     """Tail child stderr (human output in agent mode) into the log pane.
 
-    Raw per-step loss dicts (the LossLineLogger rows) are dropped — they
-    flood the pane and the same numbers arrive as `step` events for the
-    chart; the stdout reader applies the same rule.
+    Handles both newline-terminated log lines and tqdm-style ``\r``
+    progress bars: bar redraws update the existing bar line in place
+    instead of arriving as one enormous line at completion (readline()
+    only splits on \n, so \r-redrawn bars used to be invisible until the
+    scan finished) or piling up as thousands of log entries. ANSI color
+    escapes from the child's console output are stripped — the pane is
+    plain text. Raw per-step loss dicts are dropped: they flood the pane
+    and the same numbers arrive as `step` events.
     """
+    bar_re = re.compile(r"\d+[%]\|")
+    ansi_re = re.compile('\x1b\[[0-9;]*[A-Za-z]')
+
+    def _handle(part: str):
+        text = ansi_re.sub("", part).rstrip()
+        if not text.strip():
+            return
+        if any(p in text for p in _SUPPRESS_PATTERNS):
+            return
+        if "'loss'" in text or '"loss"' in text:
+            return
+        if bar_re.search(text):
+            JOB.update_bar_line(text)
+        else:
+            JOB.add_log(text)
+
     try:
-        for raw in iter(pipe.readline, b""):
-            line = raw.decode("utf-8", errors="replace").replace("\r", "")
-            if not line.strip():
-                continue
-            if any(p in line for p in _SUPPRESS_PATTERNS):
-                continue
-            if "'loss'" in line or '"loss"' in line:
-                continue
-            JOB.add_log(line)
+        buf = ""
+        while True:
+            chunk = pipe.read(4096)
+            if not chunk:
+                break
+            buf += chunk.decode("utf-8", errors="replace").replace("\r\n", "\n")
+            parts = re.split(r"[\r\n]", buf)
+            buf = parts.pop()          # tail may be incomplete
+            for part in parts:
+                _handle(part)
+        if buf.strip():               # flush any unterminated tail
+            _handle(buf)
     except Exception:
         pass
     finally:

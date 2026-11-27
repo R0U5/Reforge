@@ -7,6 +7,7 @@ from datasets import Dataset, load_dataset, Sequence, Value
 
 from .config import TRAINING_CHAIN_PATH, MERGED_DIR, MERGE_SUCCESS_FLAG, OUTPUT_DIR
 from .display import _info, _ok, _warn, _err, _banner
+from .agent import BRIDGE
 from .profiles import resolve_model_profile
 from .tokenization import tokenize, measure_lengths
 from .utils import roc, log_dataset, purge_checkpoints
@@ -547,6 +548,7 @@ def load_and_prepare_dataset(dataset_path, cleaning_mode, image_mode=False, base
 
     _banner("Tokenization")
     _info("Measuring sequence lengths...")
+    BRIDGE.emit("dataset_progress", substep="measuring", rows=processed.num_rows)
     processed, auto_len = measure_lengths(processed, tokenizer, training_mode=training_mode)
     if image_mode:
         # measure_lengths sees text only. The vision processor expands each
@@ -565,6 +567,7 @@ def load_and_prepare_dataset(dataset_path, cleaning_mode, image_mode=False, base
         train_dataset = processed
     else:
         _info("Tokenizing dataset...")
+        BRIDGE.emit("dataset_progress", substep="tokenizing", rows=processed.num_rows)
         protected = {"length"}
         if image_mode:
             protected.add("image")
