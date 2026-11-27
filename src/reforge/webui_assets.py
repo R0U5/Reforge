@@ -254,6 +254,8 @@ INDEX_HTML = r"""<!doctype html>
   .stage-mini{display:flex;flex-direction:column;gap:5px}
   .stage-mini label{font-size:10px;color:var(--faint)}
   .stage-actions{display:flex;gap:3px;padding-bottom:3px}
+  .batch-header{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px;flex-wrap:wrap}
+  .batch-mode-toggle{display:flex;align-items:center;gap:8px}
   .empty-inline{padding:14px;border:1px dashed var(--line);border-radius:9px;
     color:var(--faint);font-size:12px;text-align:center}
   .disclosure{padding:0;overflow:hidden}
@@ -748,9 +750,15 @@ INDEX_HTML = r"""<!doctype html>
             </div>
             <p class="section-copy" id="mode-copy">Train one dataset with one merged output.</p>
             <div id="batch-editor" hidden>
+              <div class="batch-header">
+                <div class="batch-mode-toggle">
+                  <button type="button" class="btn ghost small" id="btn-load-manifest">Load manifest.json</button>
+                  <input type="file" id="manifest-file" accept=".json" hidden>
+                </div>
+                <p class="hint-block">Stage 1 uses the base model above; each later stage chains from the previous stage's merged output.</p>
+              </div>
               <div id="stage-list"></div>
               <button type="button" class="btn ghost small" id="btn-addstage">+ Add stage</button>
-              <div class="hint-block">Stage 1 uses the base model above; each later stage chains from the previous stage's merged output.</div>
             </div>
           </section>
 
@@ -1514,6 +1522,42 @@ function bindForm() {
   $("#mode-single")?.addEventListener("click", () => setMode("single"));
   $("#mode-batch")?.addEventListener("click", () => setMode("batch"));
   $("#btn-addstage")?.addEventListener("click", () => addStage());
+  // Load manifest file handler
+  $("#btn-load-manifest")?.addEventListener("click", () => {
+    $("#manifest-file").click();
+  });
+  $("#manifest-file")?.addEventListener("change", async (event) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const manifest = JSON.parse(text);
+      if (!manifest || !Array.isArray(manifest.stages)) {
+        throw new Error("Invalid manifest: missing 'stages' array");
+      }
+      // Load base model from manifest if not already set
+      if (manifest.base_model && !val("p-base")) {
+        setVal("p-base", manifest.base_model);
+      }
+      // Populate stages
+      S.stages = manifest.stages.map((s, i) => ({
+        name: s.name || "",
+        dataset: s.dataset || "",
+        hf_dataset: s.hf_dataset || "",
+        epochs: String(s.epochs ?? ""),
+        steps: String(s.steps ?? ""),
+      }));
+      renderStages();
+      updateRunSummary();
+      schedulePreview();
+      saveForm();
+      toast(`Loaded ${manifest.stages.length} stage(s) from manifest`, "ok");
+    } catch (e) {
+      toast("Failed to load manifest: " + e.message, "bad");
+    }
+    // Reset file input so same file can be loaded again
+    event.target.value = "";
+  });
   $("#btn-reveal-ckpt")?.addEventListener("click", () => {
     const path = S.status?.checkpoint?.path;
     if (path) revealPath(path);
