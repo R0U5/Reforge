@@ -364,6 +364,15 @@ INDEX_HTML = r"""<!doctype html>
   .progress-head::before{content:"";position:absolute;inset:-60% 40% auto -10%;height:220px;
     background:radial-gradient(ellipse,rgba(255,122,69,.14),transparent 70%);pointer-events:none}
   .phases{display:flex;align-items:center;gap:7px;flex-wrap:wrap;margin-bottom:17px}
+  .stage-chip{display:inline-flex;align-items:center;gap:9px;margin:-8px 0 15px;padding:7px 12px;
+    border:1px solid rgba(167,139,250,.3);border-radius:9px;background:rgba(167,139,250,.08);
+    font-size:12px;color:var(--ink-2)}
+  .stage-chip b{font-weight:600;color:var(--ink)}
+  .stage-chip .mono{font-size:11px;color:var(--violet)}
+  .stage-chip .resumed{font-size:10px;color:var(--warn);border:1px solid rgba(255,214,10,.3);
+    border-radius:999px;padding:1px 7px}
+  .stage-chip .stage-ds{font:11px var(--mono);color:var(--muted);max-width:280px;
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .phase{display:inline-flex;align-items:center;gap:7px;height:27px;padding:0 10px;
     border:1px solid var(--line);border-radius:999px;color:var(--faint);
     font-size:11px;font-weight:550;letter-spacing:.01em;transition:all .18s var(--ease)}
@@ -813,6 +822,7 @@ INDEX_HTML = r"""<!doctype html>
     <section id="view-progress" class="view" hidden>
       <section class="card progress-head">
         <div class="phases" id="phases"></div>
+        <div class="stage-chip" id="stage-chip" hidden></div>
         <div class="progress-main">
           <div>
             <div class="eyebrow" id="progress-eyebrow">LIVE RUN</div>
@@ -855,9 +865,9 @@ INDEX_HTML = r"""<!doctype html>
           <section class="card health-card">
             <div class="card-head"><h2>Early stopping</h2><span class="badge neutral" id="es-verdict">waiting</span></div>
             <div class="health-grid">
-              <div><span>EMA</span><b id="es-ema">—</b></div>
-              <div><span>Best EMA</span><b id="es-best">—</b></div>
-              <div><span>Since best</span><b id="es-since">—</b></div>
+              <div><span>Smoothed loss (EMA)</span><b id="es-ema">—</b></div>
+              <div><span>Best smoothed</span><b id="es-best">—</b></div>
+              <div><span>Steps since best</span><b id="es-since">—</b></div>
               <div><span>Patience</span><b id="es-patience">—</b></div>
             </div>
             <div class="patience"><i id="patience-fill"></i></div>
@@ -1014,8 +1024,9 @@ const fmtDuration = (v) => {
   if (n === null) return "—";
   const s = Math.max(0, Math.round(n));
   const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), r = s % 60;
-  return h ? `${h}:${String(m).padStart(2, "0")}:${String(r).padStart(2, "0")}`
-           : `${m}:${String(r).padStart(2, "0")}`;
+  if (h) return `${h}h ${String(m).padStart(2, "0")}m ${String(r).padStart(2, "0")}s`;
+  if (m) return `${m}m ${String(r).padStart(2, "0")}s`;
+  return `${r}s`;
 };
 const fmtClock = (iso) => {
   if (!iso) return "";
@@ -1977,8 +1988,31 @@ function progressTitle(st) {
   return "Starting…";
 }
 
-function metricCard(label, value, tone = "", sub = "") {
-  return `<div class="metric ${tone}">
+function stageIndex(st) {
+  const index = num(st?.stage?.index);
+  return (index == null || index < 0) ? null : index;
+}
+
+function renderStageChip(st) {
+  const chip = $("#stage-chip");
+  if (!chip) return;
+  const index = stageIndex(st);
+  if (index == null || !st.stage) {
+    chip.hidden = true;
+    chip.innerHTML = "";
+    return;
+  }
+  chip.hidden = false;
+  const total = st.stage.total || "?";
+  const name = st.stage_name || "";
+  chip.innerHTML = `<span class="mono">Stage ${index + 1}/${total}</span>`
+    + (name ? `<b>${esc(name)}</b>` : "")
+    + (st.stage_dataset ? `<span class="stage-ds" title="${esc(st.stage_dataset)}">${esc(baseName(st.stage_dataset))}</span>` : "")
+    + (st.resuming ? '<span class="resumed">resumed from checkpoint</span>' : "");
+}
+
+function metricCard(label, value, tone = "", sub = "", help = "") {
+  return `<div class="metric ${tone}"${help ? ` title="${esc(help)}"` : ""}>
     <span class="metric-label">${esc(label)}</span>
     <span class="metric-value">${value}${sub ? `<small> ${esc(sub)}</small>` : ""}</span>
   </div>`;
@@ -1988,25 +2022,39 @@ function renderStats(st) {
   const host = $("#stats");
   if (!host) return;
   const cards = [];
-  cards.push(metricCard("Loss", fmt(st.latest_loss, 4), "accent"));
-  cards.push(metricCard("Grad norm", fmt(st.latest_grad_norm, 3), "violet"));
+  cards.push(metricCard("Loss", fmt(st.latest_loss, 4), "accent", "",
+    "Training loss on the most recent step. Lower is better."));
+  cards.push(metricCard("Grad norm", fmt(st.latest_grad_norm, 3), "violet", "",
+    "How large the weight updates are this step. Spikes here often mean unstable batches."));
   cards.push(metricCard("Learning rate", st.learning_rate == null ? "—"
-    : Number(st.learning_rate).toExponential(2), "cyan"));
-  cards.push(metricCard("Epoch", st.epoch == null ? "—" : Number(st.epoch).toFixed(2)));
-  cards.push(metricCard("Best loss", fmt(st.best_loss, 4), "ok"));
+    : Number(st.learning_rate).toExponential(2), "cyan", "",
+    "Current step size for weight updates (follows the scheduler)."));
+  cards.push(metricCard("Epoch", st.epoch == null ? "—" : Number(st.epoch).toFixed(2), "", "",
+    "How many passes over the dataset have been completed."));
+  cards.push(metricCard("Best loss", fmt(st.best_loss, 4), "ok", "",
+    "The lowest loss recorded in this stage so far."));
   if (st.latest_acc != null) {
     cards.push(metricCard(st.training_mode === "dpo" ? "DPO accuracy" : "Accuracy",
-      fmt(st.latest_acc, 3), "ok"));
+      fmt(st.latest_acc, 3), "ok", "",
+      st.training_mode === "dpo"
+        ? "How often the model prefers the chosen over the rejected reply (0–1)."
+        : "Fraction of recent steps classified correctly (0–1)."));
   }
-  cards.push(metricCard("Checkpoints", fmtInt(st.checkpoint_count)));
-  cards.push(metricCard("Elapsed", fmtDuration(st.train_elapsed ?? st.run_elapsed)));
+  cards.push(metricCard("Checkpoints", fmtInt(st.checkpoint_count), "", "",
+    "Saved training snapshots in the output folder."));
+  cards.push(metricCard("Elapsed", fmtDuration(st.train_elapsed ?? st.run_elapsed), "", "",
+    "Time spent in this stage (falls back to total run time before training starts)."));
   host.innerHTML = cards.join("");
 }
 
 function renderProgress(st) {
   if (!st) return;
   renderPhases(st);
-  const title = progressTitle(st);
+  let title = progressTitle(st);
+  const stageIdx0 = stageIndex(st);
+  if (stageIdx0 != null && st.stage_name && st.phase !== "merge") {
+    title += ` — ${st.stage_name}`;
+  }
   setText("#progress-title", title);
   const eyebrow = $("#progress-eyebrow");
   if (eyebrow) {
@@ -2018,20 +2066,24 @@ function renderProgress(st) {
   const pct = num(st.pct);
   const step = num(st.step) || 0;
   const total = num(st.total_steps) || 0;
+  const stageIdx = stageIndex(st);
   const tqdm = [];
   if (total) {
-    tqdm.push(`step ${fmtInt(step)} / ${fmtInt(total)}`);
-    if (st.stage) {
-      tqdm.push(`stage ${st.stage.index + 1}/${st.stage.total}`);
+    tqdm.push(`step ${fmtInt(step)} of ${fmtInt(total)}`);
+    if (st.epoch != null) {
+      tqdm.push(st.epochs ? `epoch ${Number(st.epoch).toFixed(2)} of ${st.epochs}`
+                          : `epoch ${Number(st.epoch).toFixed(2)}`);
     }
-    if (st.epoch != null) tqdm.push(`epoch ${Number(st.epoch).toFixed(2)}`);
-    if (st.epochs) tqdm.push(`of ${st.epochs}`);
     if (st.latest_loss != null) tqdm.push(`loss ${fmt(st.latest_loss, 4)}`);
-    if (st.latest_acc != null) tqdm.push(`acc ${fmt(st.latest_acc, 3)}`);
+    if (st.latest_acc != null) tqdm.push(`accuracy ${fmt(st.latest_acc, 3)}`);
   } else if (st.phase) {
-    tqdm.push(`waiting for ${st.phase}…`);
+    tqdm.push({ dataset: "reading and preparing the dataset…",
+                model: "loading the base model…",
+                train: "waiting for the first training step…",
+                merge: "merging the adapter into the base model…" }[st.phase]
+              || `working on ${st.phase}…`);
   } else {
-    tqdm.push("waiting for the child…");
+    tqdm.push("starting the training process…");
   }
   setText("#tqdm", tqdm.join("  ·  "));
   setText("#pct-big", pct == null ? "—" : Math.floor(pct) + "%");
@@ -2044,11 +2096,15 @@ function renderProgress(st) {
     if (fill) fill.style.width = indeterminate ? "22%" : clamp(pct || 0, 0, 100) + "%";
   }
 
-  setText("#progress-elapsed", "elapsed " + fmtDuration(st.train_elapsed ?? st.run_elapsed));
-  setText("#progress-eta", "eta " + (st.eta_sec == null ? "—" : fmtDuration(st.eta_sec)));
-  setText("#progress-rate", st.rate_it_s == null ? "— it/s"
-    : Number(st.rate_it_s).toFixed(2) + " it/s");
+  const inBatch = stageIdx != null;
+  setText("#progress-elapsed",
+    (inBatch ? "stage time " : "elapsed ") + fmtDuration(st.train_elapsed ?? st.run_elapsed));
+  setText("#progress-eta", (inBatch ? "stage ETA " : "ETA ")
+    + (st.eta_sec == null ? "unknown yet" : fmtDuration(st.eta_sec)));
+  setText("#progress-rate", st.rate_it_s == null ? "speed: — "
+    : `avg ${Number(st.rate_it_s).toFixed(2)} it/s`);
 
+  renderStageChip(st);
   renderStats(st);
   renderHealth(st);
   renderCheckpoint(st);
@@ -2069,9 +2125,16 @@ function renderHealth(st) {
   const badge = $("#es-verdict");
   if (badge) {
     const verdict = st.verdict || (st.early_stop_triggered ? "stop" : "waiting");
-    badge.textContent = verdict;
+    const label = verdict === "stop" ? "stopping"
+      : verdict === "continue" ? "keep going"
+      : st.early_stop_enabled === false ? "disabled"
+      : "watching";
+    badge.textContent = label;
     badge.className = "badge " + (verdict === "stop" ? "bad"
       : verdict === "continue" ? "ok" : "neutral");
+    badge.title = "Early stopping watches a smoothed (EMA) copy of the loss. "
+      + "If it has not improved for the patience window, training stops "
+      + "early and keeps the best adapter.";
   }
   const fill = $("#patience-fill");
   if (fill) {
@@ -2084,13 +2147,13 @@ function renderHealth(st) {
   if (hint) {
     if (st.early_stop_triggered) {
       const step = st.early_stop_triggered.step;
-      hint.textContent = `Stopped early at step ${fmtInt(step)} — the EMA did not improve within the patience window.`;
+      hint.textContent = `Stopped early at step ${fmtInt(step)}: the smoothed loss had not improved within the patience window, so the best adapter was kept.`;
     } else if (st.early_stop_enabled === false) {
-      hint.textContent = "Early stopping is off (force full run). Training will use the full step budget.";
+      hint.textContent = "Early stopping is off (force full run was checked). Training will run every planned step.";
     } else if (st.ema == null) {
-      hint.textContent = "Checks run every 25 steps. A single noisy loss spike is ignored — only the EMA verdict decides.";
+      hint.textContent = "A smoothed (EMA) loss is checked every 25 steps. One noisy loss spike will not trigger a stop — only a sustained stall does.";
     } else {
-      hint.textContent = `Watching the EMA every ${st.patience || 25} checks. A single noisy loss spike is ignored.`;
+      hint.textContent = `Next check compares the smoothed loss against the best seen. ${fmtInt(st.since_best ?? 0)} steps since the last improvement, patience ${fmtInt(st.patience)}.`;
     }
   }
 }
@@ -2191,6 +2254,15 @@ async function maybeAnalysis() {
   renderAnalysis(S.analysis);
 }
 
+const CHIP_HELP = {
+  "Grade": "Overall training-signal quality: A (clean and still improving) to D (flat or noisy).",
+  "Trend": "Is the loss falling or rising in the recent window?",
+  "Drop": "How far the loss has fallen from its worst point, in percent.",
+  "Signal/noise": "How strongly the recent trend stands out from step-to-step noise. Above 1 means the trend is real, not noise.",
+  "Best step": "The training step with the lowest loss so far.",
+  "Epoch exposure": "How far through the final training pass (epoch) the run is.",
+};
+
 function renderAnalysis(data) {
   const host = $("#analysis");
   const log = $("#alog");
@@ -2203,23 +2275,32 @@ function renderAnalysis(data) {
   const grade = String(data.grade || "?");
   const chips = [
     ["Grade", grade, "grade-" + grade.toLowerCase()],
-    ["Trend", data.trend_recent || "—", ""],
-    ["Drop", data.drop_pct != null ? data.drop_pct + "%" : "—", ""],
-    ["SNR", data.snr != null ? data.snr : "—", ""],
-    ["Best step", data.best_step != null ? fmtInt(data.best_step) : "—", ""],
-    ["Exposure", data.exposure_pct != null ? data.exposure_pct + "%" : "—", ""],
+    ["Trend", data.trend_recent || "\u2014", ""],
+    ["Drop", data.drop_pct != null ? data.drop_pct.toFixed(1) + "%" : "\u2014", ""],
+    ["Signal/noise", data.snr != null ? Number(data.snr).toFixed(2) : "\u2014", ""],
+    ["Best step", data.best_step != null ? fmtInt(data.best_step) : "\u2014", ""],
+    ["Epoch exposure", data.exposure_pct != null ? data.exposure_pct.toFixed(1) + "%" : "\u2014", ""],
   ];
   host.innerHTML = chips.map(([label, value, cls]) =>
-    `<div class="analysis-item ${cls}"><span>${esc(label)}</span><b>${esc(value)}</b></div>`).join("");
-  const lines = [
-    `global ${data.slope_global >= 0 ? "+" : ""}${data.slope_global}/100 steps · recent ${data.slope_recent >= 0 ? "+" : ""}${data.slope_recent}/100 steps`,
-    `avg ${data.avg} · median ${data.med} · std ${data.std} · ${data.n} points`,
-  ];
-  if (data.ideal_zone && data.ideal_zone !== "�") {
-    lines.push(`projection ${data.ideal_zone}`);
+    `<div class="analysis-item ${cls}" title="${esc(CHIP_HELP[label] || "")}">`
+    + `<span>${esc(label)}</span><b>${esc(value)}</b></div>`).join("");
+  const lines = [];
+  const describe = (slope) => {
+    const v = num(slope);
+    if (v == null) return "no data yet";
+    if (v <= -0.1) return `falling about ${fmt(Math.abs(v), 2)} per 100 steps`;
+    if (v >= 0.1) return `rising about ${fmt(v, 2)} per 100 steps`;
+    return "essentially flat";
+  };
+  lines.push(`Overall the loss is ${describe(data.slope_global)}; recently ${describe(data.slope_recent)}.`);
+  if (data.n) {
+    lines.push(`Averaged over ${fmtInt(data.n)} steps: mean ${fmt(data.avg, 4)}, typical step-to-step noise ${fmt(data.std, 4)}.`);
+  }
+  if (data.ideal_zone && !/[\uFFFD]/.test(String(data.ideal_zone)) && data.ideal_zone !== "\u2014") {
+    lines.push(`If the recent trend holds, the loss should be near its best around ${esc(data.ideal_zone)}.`);
   }
   if (Array.isArray(data.outliers) && data.outliers.length) {
-    lines.push(`outliers at ${data.outliers.slice(0, 8).join(", ")}`);
+    lines.push(`Spike-y steps worth ignoring: ${data.outliers.slice(0, 8).map(fmtInt).join(", ")}.`);
   }
   log.textContent = lines.join("\n");
 }

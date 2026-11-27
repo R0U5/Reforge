@@ -127,6 +127,9 @@ class Job:
         self.base_model = None
         self.dataset = None
         self.stage = None            # batch mode: {"index": i, "total": n}
+        self.stage_name = None       # batch mode: human label of the active stage
+        self.stage_dataset = None    # batch mode: dataset basename of the active stage
+        self.resuming = None         # batch mode: child continued an interrupted batch
         self.log = deque(maxlen=MAX_LOG_LINES)
         # Each point: step, loss, grad_norm, lr, epoch (None when absent).
         self.losses = deque(maxlen=MAX_CHART_POINTS)
@@ -428,13 +431,19 @@ class Job:
             elif event == "batch_started":
                 total = ev.get("total_stages")
                 self.stage = {"index": -1, "total": int(total)} if total else None
+                self.stage_name = None
+                self.stage_dataset = None
+                self.resuming = bool(ev.get("resuming"))
                 if total:
                     self._signal("batch_started",
-                                 f"Batch started · {int(total)} stages", "info")
+                                 ("Resuming batch" if self.resuming else "Batch started")
+                                 + f" · {int(total)} stages", "info")
             elif event == "stage_started":
                 if self.stage:
                     self.stage = {"index": int(ev.get("index", 0)),
                                   "total": self.stage.get("total")}
+                self.stage_name = ev.get("name") or self.stage_name
+                self.stage_dataset = ev.get("dataset") or self.stage_dataset
                 # A new batch stage re-enters the pipeline from the top.
                 for p in ("dataset", "model", "train", "merge"):
                     self.phases[p] = "pending"
@@ -525,6 +534,9 @@ class Job:
                 "es_checks": list(self.es_checks),
                 "signals": list(self.signals),
                 "stage": dict(self.stage) if self.stage else None,
+                "stage_name": self.stage_name,
+                "stage_dataset": self.stage_dataset,
+                "resuming": self.resuming,
                 "log": list(self.log)[-LOG_TAIL:],
                 "losses": list(self.losses),
                 "error": self.error,
