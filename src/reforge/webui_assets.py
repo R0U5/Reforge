@@ -1890,8 +1890,13 @@ async function pollNow() {
   if (data && !data.error) {
     S.offline = false;
     S.status = data;
+    const prevView = S.view;
     syncView();
     renderStatus();
+    // A state change (e.g. page loaded mid-run) must also toggle the DOM
+    // sections, not just the chip: renderStatus renders the current view's
+    // contents, renderView owns the section visibility.
+    if (S.view !== prevView) renderView();
   } else {
     S.offline = true;
     renderChip();

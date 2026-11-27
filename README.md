@@ -2,6 +2,16 @@
 
 A modular LoRA fine-tuning pipeline for Hugging Face causal language models and vision-language models. Reforge handles dataset loading, automatic schema detection, text cleaning, tokenization, training with smart early stopping (SFT or DPO preference tuning), LoRA merge, and final model export. Includes a browser-based web UI for interactive control.
 
+## Web UI
+
+Launch with `reforge webui` and open http://127.0.0.1:7861 — a zero-dependency dashboard (stdlib server, vanilla JS, canvas chart) that supervises the same agent-mode process the CLI runs.
+
+| Setup | Preparing dataset | Live training |
+|:---:|:---:|:---:|
+| ![Reforge dashboard — run setup](docs/screenshots/dashboard_setup.png) | ![Reforge dashboard — preparing dataset](docs/screenshots/dashboard_loading.png) | ![Reforge dashboard — live training](docs/screenshots/dashboard_training.png) |
+
+*Setup with a live command preview · phase pills and a truthful "ETA unknown yet" state while the dataset loads · live loss curve with the EMA early-stopping overlay, signal/noise analysis, and human-readable feedback. All screenshots use synthetic demo data.*
+
 ## Project Structure
 
 ```
