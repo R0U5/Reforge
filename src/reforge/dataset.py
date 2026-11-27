@@ -465,13 +465,23 @@ def load_and_prepare_dataset(dataset_path, cleaning_mode, image_mode=False, base
     _banner("Dataset")
     _info(f"Mode: {training_mode.upper()}  |  Cleaning: {cleaning_mode or 'math'}  |  Seed: {shuffle_seed}")
     img_label = "\u2014" if not col_image else col_image
-    q_label = "\u2014" if not col_question else col_question
-    a_label = "\u2014" if not col_chosen else col_chosen
-    r_label = "\u2014" if not col_rejected else col_rejected
-    _info(f"Image    \u2192 {img_label}")
-    _info(f"Question \u2192 {q_label}")
-    _info(f"Answer   \u2192 {a_label}")
-    _info(f"Rejected \u2192 {r_label}")
+    if training_mode == "chat":
+        # Chat rows carry every turn inside one column; the supervised
+        # target is the last assistant response. The SFT/DPO role table
+        # would print "Answer \u2192 \u2014" here and look broken when it is not.
+        conv = col_question or "messages"
+        _info(f"Image        \u2192 {img_label}")
+        _info(f"Conversation \u2192 {conv}")
+        _info("Target       \u2192 the last assistant reply in each "
+              "conversation (earlier turns are masked)")
+    else:
+        q_label = "\u2014" if not col_question else col_question
+        a_label = "\u2014" if not col_chosen else col_chosen
+        r_label = "\u2014" if not col_rejected else col_rejected
+        _info(f"Image    \u2192 {img_label}")
+        _info(f"Question \u2192 {q_label}")
+        _info(f"Answer   \u2192 {a_label}")
+        _info(f"Rejected \u2192 {r_label}")
     effective_mode = cleaning_mode or "math"
     clean = lambda s: clean_string(s, mode=effective_mode)
 
@@ -537,7 +547,9 @@ def load_and_prepare_dataset(dataset_path, cleaning_mode, image_mode=False, base
         # a prompt column (TRL requires one for the chat-template path).
         conversational = bool(getattr(tokenizer, "chat_template", None)) and bool(col_question)
         if conversational:
-            _info("DPO: using the tokenizer's chat template (conversational format)")
+            label = "DPO" if training_mode == "dpo" else "Chat"
+            _info(f"{label}: applying the tokenizer's chat template "
+                  "(conversational format)")
         elif not col_question:
             _warn("DPO: no prompt/question column detected - training on completions with an empty prompt")
         processed = synthesize_prompt_dataset(
