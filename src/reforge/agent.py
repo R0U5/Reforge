@@ -132,8 +132,10 @@ _ERROR_PATTERNS = [
      "rename columns or pick a mode-appropriate dataset."),
     ("out of memory",
      "cuda_oom",
-     "GPU ran out of VRAM. Lower --batch_size (default 1), lower --grad_accum "
-     "does not help VRAM but slows steps, or use a smaller base model."),
+     "GPU ran out of VRAM. Lower --max_length (auto P95 can oversubscribe "
+     "VRAM on small cards; 512-1024 is a good first cut), confirm "
+     "--batch_size is 1 (lower --grad_accum does not help VRAM but slows "
+     "steps), or use a smaller base model."),
     ("not enough data to train",
      "dataset_too_small",
      "Dataset has too few rows for even one optimizer step. Provide more rows "

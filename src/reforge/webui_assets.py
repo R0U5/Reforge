@@ -742,6 +742,7 @@ INDEX_HTML = r"""<!doctype html>
               <div class="field"><label for="p-steps">Fixed steps</label><input type="text" id="p-steps" placeholder="—" inputmode="numeric"><div class="field-hint">Overrides epochs</div></div>
               <div class="field"><label for="p-batch">Batch size</label><input type="text" id="p-batch" placeholder="1" inputmode="numeric"></div>
               <div class="field"><label for="p-grad">Grad accumulation</label><input type="text" id="p-grad" placeholder="Profile default" inputmode="numeric"></div>
+              <div class="field"><label for="p-maxlen">Max length</label><input type="text" id="p-maxlen" placeholder="Auto (P95)" inputmode="numeric"><div class="field-hint">Tokens; lower for VRAM</div></div>
             </div>
             <div class="toggle-grid">
               <label class="toggle"><span class="switch"><input type="checkbox" id="p-force"><span class="track"></span></span><span><b>Force full run</b><small>Disable EMA early stopping</small></span></label>
@@ -1445,6 +1446,7 @@ function collectParams() {
     steps: val("p-steps"),
     batch_size: val("p-batch"),
     grad_accum: val("p-grad"),
+    max_length: val("p-maxlen"),
     dpo_beta: val("p-dpo-beta"),
     force: checked("p-force"),
     train_lm_head: checked("p-lmhead"),

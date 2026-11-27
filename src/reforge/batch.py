@@ -52,6 +52,7 @@ _STAGE_VALUES = {
     "steps": "--steps",
     "batch_size": "--batch_size",
     "grad_accum": "--grad_accum",
+    "max_length": "--max_length",
     "dpo_beta": "--dpo_beta",
 }
 _STAGE_KEYS = set(_STAGE_FLAGS) | set(_STAGE_VALUES) | {"dataset", "hf_dataset", "name"}

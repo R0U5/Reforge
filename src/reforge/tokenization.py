@@ -431,7 +431,7 @@ def _map_resilient(ds, fn, **kwargs):
         return ds.map(fn, num_proc=1, **kwargs)
 
 
-def measure_lengths(ds, tokenizer, training_mode=None):
+def measure_lengths(ds, tokenizer, training_mode=None, max_length_override=None):
 
     def _template_len(tokenizer, messages) -> int | None:
         """Token length of a conversation under its chat template, or None."""
@@ -501,10 +501,14 @@ def measure_lengths(ds, tokenizer, training_mode=None):
     p50 = int(np.percentile(lengths, 50))
     p95 = int(np.percentile(lengths, 95))
     p99 = int(np.percentile(lengths, 99))
-    # Explicit override wins (e.g. REFORGE_MAX_LENGTH=512) — needed on 12 GB
-    # cards where the P95-derived length oversubscribes VRAM via WDDM paging.
-    override = os.environ.get("REFORGE_MAX_LENGTH", "").strip()
-    if override:
+    # Explicit wins, in order: --max_length argument > REFORGE_MAX_LENGTH env
+    # var > auto (P95). The override exists because a 248k-vocab model on a
+    # 12 GB card OOMs at backward when the P95-derived length oversubscribes
+    # VRAM via WDDM paging — the logits chain scales with vocab x seq_len.
+    if max_length_override is not None:
+        auto_len = max(128, int(max_length_override))
+        _info(f"Lengths — p50: {p50}  p95: {p95}  p99: {p99}  →  max_length set by --max_length to {auto_len}")
+    elif (override := os.environ.get("REFORGE_MAX_LENGTH", "")).strip():
         auto_len = max(128, int(override))
         _info(f"Lengths — p50: {p50}  p95: {p95}  p99: {p99}  →  max_length OVERRIDDEN to {auto_len}")
     else:

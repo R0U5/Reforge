@@ -81,6 +81,9 @@ def main():
                         help="Per-device batch size override (default: 1)")
     parser.add_argument('--grad_accum', type=int, default=None,
                         help="Gradient accumulation steps override (default: model profile)")
+    parser.add_argument('--max_length', type=int, default=None,
+                        help="Override auto (P95) max sequence length in tokens; min 128. "
+                             "Lower this on small-VRAM cards when the auto P95 OOMs at backward.")
     parser.add_argument('--image',      action='store_true', help="Enable multimodal (image+text) training")
     parser.add_argument('--dpo',        action='store_true',
                          help="Force DPO training (normally auto-detected from chosen+rejected columns). "
@@ -621,6 +624,7 @@ def _run_pipeline(parsed_args, image_mode, output_dir, merge_dir, merge_success_
         merge_dir=merge_dir_actual,
         merge_success_flag=merge_success_flag,
         force_dpo=bool(parsed_args.dpo),
+        max_length_override=getattr(parsed_args, "max_length", None),
     )
     BRIDGE.emit(
         "dataset_loaded",

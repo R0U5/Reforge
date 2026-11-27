@@ -23,7 +23,7 @@ import sys
 from .config import OUTPUT_DIR
 
 # Numeric fields accepted from the form: name -> (coerce, minimum)
-_INT_FIELDS = ("epoch", "steps", "batch_size", "grad_accum")
+_INT_FIELDS = ("epoch", "steps", "batch_size", "grad_accum", "max_length")
 _FLAG_FIELDS = ("force", "latex", "code", "image", "dpo", "train_lm_head")
 
 
@@ -207,7 +207,7 @@ def build_argv(params: dict, strict: bool = True,
             stage_defaults = {}
             if numeric["epoch"] is not None:
                 stage_defaults["epochs"] = numeric["epoch"]
-            for name in ("steps", "batch_size", "grad_accum"):
+            for name in ("steps", "batch_size", "grad_accum", "max_length"):
                 if numeric[name] is not None:
                     stage_defaults[name] = numeric[name]
             for name in _FLAG_FIELDS:

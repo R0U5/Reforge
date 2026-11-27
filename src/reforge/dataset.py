@@ -420,7 +420,7 @@ def synthesize_prompt_dataset(raw_dataset, col_question, col_chosen, col_rejecte
     return processed
 
 
-def load_and_prepare_dataset(dataset_path, cleaning_mode, image_mode=False, base_model_override=None, output_dir=None, merge_dir=None, merge_success_flag=None, force_dpo=False):
+def load_and_prepare_dataset(dataset_path, cleaning_mode, image_mode=False, base_model_override=None, output_dir=None, merge_dir=None, merge_success_flag=None, force_dpo=False, max_length_override=None):
     from transformers import AutoTokenizer, AutoProcessor
 
     _num_proc = _pool_workers()
@@ -562,7 +562,7 @@ def load_and_prepare_dataset(dataset_path, cleaning_mode, image_mode=False, base
     _banner("Tokenization")
     _info("Measuring sequence lengths...")
     BRIDGE.emit("dataset_progress", substep="measuring", rows=processed.num_rows)
-    processed, auto_len = measure_lengths(processed, tokenizer, training_mode=training_mode)
+    processed, auto_len = measure_lengths(processed, tokenizer, training_mode=training_mode, max_length_override=max_length_override)
     if image_mode:
         # measure_lengths sees text only. The vision processor expands each
         # <|image_n|> tag into hundreds/thousands of image-placeholder
