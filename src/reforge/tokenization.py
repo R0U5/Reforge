@@ -474,6 +474,33 @@ def measure_lengths(ds, tokenizer, training_mode=None):
         auto_len = max(128, int(override))
         _info(f"Lengths — p50: {p50}  p95: {p95}  p99: {p99}  →  max_length OVERRIDDEN to {auto_len}")
     else:
-        auto_len = max(128, min(1024, p95))
-        _info(f"Lengths — p50: {p50}  p95: {p95}  p99: {p99}  →  max_length set to {auto_len}")
+        # Cap at the model's real context, not a legacy constant: the old
+        # min(1024, p95) ceiling silently dropped EVERY row of long-context
+        # datasets (agentic chat with tool calls) and failed the run with
+        # "No usable rows after tokenization". The tokenizer's context is
+        # the honest ceiling; p95 still keeps VRAM tied to what the data
+        # needs, and REFORGE_MAX_LENGTH remains the explicit VRAM escape hatch.
+        ctx = _context_limit(tokenizer)
+        auto_len = max(128, min(p95, ctx))
+        if ctx == p95 and auto_len > 1024:
+            _info(f"Lengths — p50: {p50}  p95: {p95}  p99: {p99}  →  max_length {auto_len} "
+                  f"(model context {ctx:,}; set REFORGE_MAX_LENGTH to lower it for VRAM)")
+        else:
+            _info(f"Lengths — p50: {p50}  p95: {p95}  p99: {p99}  →  max_length set to {auto_len}")
     return ds, auto_len
+
+
+def _context_limit(tokenizer) -> int:
+    """Sane upper bound on sequence length for this tokenizer's model.
+
+    ``model_max_length`` is trusted only when it looks real — some
+    tokenizers carry a huge sentinel (1e30) or 1e12. Unusable values fall
+    back to the legacy 1024 cap.
+    """
+    try:
+        limit = int(getattr(tokenizer, "model_max_length", 0) or 0)
+    except (TypeError, ValueError):
+        limit = 0
+    if 512 <= limit <= 131_072:
+        return limit
+    return 1024

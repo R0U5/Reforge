@@ -665,7 +665,11 @@ def _reader_stderr(pipe):
     try:
         buf = ""
         while True:
-            chunk = pipe.read(4096)
+            # read1: return as soon as ANY data is available. A plain
+            # read(4096) blocks until the full 4096 bytes accumulate, so a
+            # slow tqdm trickle (a few bytes per redraw) would sit undrained
+            # in the buffer for minutes before a single update was parsed.
+            chunk = pipe.read1(4096)
             if not chunk:
                 break
             buf += chunk.decode("utf-8", errors="replace").replace("\r\n", "\n")
