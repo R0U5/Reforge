@@ -178,7 +178,18 @@ def build_argv(params: dict, strict: bool = True,
                 stage_defaults["dpo_beta"] = dpo_beta
             if stage_defaults:
                 stages = [{**stage_defaults, **s} for s in stages]
-            manifest = {"base_model": base or None, "stages": stages}
+            def _norm(p: str) -> str:
+                # Normalize Windows paths to forward slashes for JSON safety
+                return p.replace("\\", "/")
+
+            manifest = {"base_model": _norm(base) if base else None, "stages": []}
+            for s in stages:
+                stage_copy = dict(s)
+                if "dataset" in stage_copy:
+                    stage_copy["dataset"] = _norm(stage_copy["dataset"])
+                if "hf_dataset" in stage_copy:
+                    stage_copy["hf_dataset"] = _norm(stage_copy["hf_dataset"])
+                manifest["stages"].append(stage_copy)
             if not manifest["base_model"]:
                 manifest.pop("base_model")
             try:
