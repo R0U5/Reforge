@@ -2084,7 +2084,7 @@ function renderStageChip(st) {
   chip.innerHTML = `<span class="mono">Stage ${index + 1}/${total}</span>`
     + (name ? `<b>${esc(name)}</b>` : "")
     + (st.stage_dataset ? `<span class="stage-ds" title="${esc(st.stage_dataset)}">${esc(baseName(st.stage_dataset))}</span>` : "")
-    + (st.resuming ? '<span class="resumed">resumed from checkpoint</span>' : "");
+    + (st.stage_resuming ? '<span class="resumed">resumed from checkpoint</span>' : "");
 }
 
 function metricCard(label, value, tone = "", sub = "", help = "") {

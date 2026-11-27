@@ -379,14 +379,22 @@ class BatchRunner:
                 f"[{label}] base for this stage is missing: {base} "
                 f"(stage {i} did not complete; cannot proceed)")
 
+        prior_status = state_entry.get("status")
         state_entry["status"] = "running"
         state_entry["started_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
         _write_state(self.state_path, self.state)
 
         ds_label = state_entry.get("dataset") or "?"
+        # Truthful UI: a stage only resumes from a checkpoint when one
+        # actually exists. A failed-with-no-checkpoint stage restarts fresh.
+        stage_resuming = (
+            prior_status == "interrupted"
+            and os.path.isdir(os.path.join(stage_dir, "checkpoint-last"))
+        )
         BRIDGE.emit("stage_started", stage="loading", index=i, name=label,
                     dataset=ds_label, stage_dir=stage_dir,
-                    base_model=base, batch_dir=self.batch_dir)
+                    base_model=base, batch_dir=self.batch_dir,
+                    resuming=stage_resuming)
         _banner(f"Batch stage {i + 1}/{len(self.stages)}: {label}")
         _info(f"Dataset   : {ds_label}")
         _info(f"Base model: {base}")

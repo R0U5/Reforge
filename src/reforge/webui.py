@@ -135,6 +135,7 @@ class Job:
         self.stage = None            # batch mode: {"index": i, "total": n}
         self.stage_name = None       # batch mode: human label of the active stage
         self.stage_dataset = None    # batch mode: dataset basename of the active stage
+        self.stage_resuming = None   # batch mode: stage actually has checkpoints
         self.resuming = None         # batch mode: child continued an interrupted batch
         self.dataset_stage = None    # prepare sub-step: "measuring"|"tokenizing"
         self.dataset_rows = None     # rows announced by dataset_progress
@@ -481,6 +482,7 @@ class Job:
                 self.stage = {"index": -1, "total": int(total)} if total else None
                 self.stage_name = None
                 self.stage_dataset = None
+                self.stage_resuming = None
                 self.resuming = bool(ev.get("resuming"))
                 if total:
                     self._signal("batch_started",
@@ -492,6 +494,7 @@ class Job:
                                   "total": self.stage.get("total")}
                 self.stage_name = ev.get("name") or self.stage_name
                 self.stage_dataset = ev.get("dataset") or self.stage_dataset
+                self.stage_resuming = bool(ev.get("resuming"))
                 # A new batch stage re-enters the pipeline from the top.
                 for p in ("dataset", "model", "train", "merge"):
                     self.phases[p] = "pending"
@@ -586,6 +589,7 @@ class Job:
                 "stage": dict(self.stage) if self.stage else None,
                 "stage_name": self.stage_name,
                 "stage_dataset": self.stage_dataset,
+                "stage_resuming": self.stage_resuming,
                 "resuming": self.resuming,
                 "log": list(self.log)[-LOG_TAIL:],
                 "losses": list(self.losses),
