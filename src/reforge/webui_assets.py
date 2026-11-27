@@ -1434,16 +1434,20 @@ function collectParams() {
     }
     delete params.dataset;
     delete params.hf_dataset;
-    params.stages = S.stages.map((stage, index) => {
+    params.stages = S.stages.map((stage) => {
+      // Forward every key the stage carries (a loaded manifest's per-stage
+      // dpo/force/beta flags survive), normalizing the five editable ones.
       const out = {};
-      const name = String(stage.name || "").trim();
-      const dataset = String(stage.dataset || "").trim();
-      const hf = String(stage.hf_dataset || "").trim();
-      if (name) out.name = name;
-      if (dataset) out.dataset = dataset;
-      if (hf) out.hf_dataset = hf;
-      if (String(stage.epochs || "").trim()) out.epochs = String(stage.epochs).trim();
-      if (String(stage.steps || "").trim()) out.steps = String(stage.steps).trim();
+      for (const [key, value] of Object.entries(stage || {})) {
+        if (key === "epochs" || key === "steps") {
+          const text = String(value ?? "").trim();
+          if (text) out[key] = text;
+        } else if (typeof value === "boolean") {
+          if (value) out[key] = true;
+        } else if (value !== null && value !== undefined && String(value).trim() !== "") {
+          out[key] = typeof value === "string" ? value.trim() : value;
+        }
+      }
       return out;
     });
   } else {
@@ -1526,13 +1530,13 @@ function bindForm() {
       saveForm();
       updateRunSummary();
       schedulePreview();
-      if (id === "p-out") scheduleBatchStatus();
+      if (id === "p-out") { S.batchDir = null; scheduleBatchStatus(); }
     });
     el.addEventListener("change", () => {
       saveForm();
       updateRunSummary();
       schedulePreview();
-      if (id === "p-out") scheduleBatchStatus();
+      if (id === "p-out") { S.batchDir = null; scheduleBatchStatus(); }
     });
   }
   $("#p-dpo")?.addEventListener("change", updateRunSummary);
@@ -1579,22 +1583,24 @@ function bindForm() {
       if (!manifest || !Array.isArray(manifest.stages)) {
         throw new Error("Invalid manifest: missing 'stages' array");
       }
-      // Load base model from manifest if not already set
-      if (manifest.base_model && !val("p-base")) {
-        setVal("p-base", manifest.base_model);
-      }
-      // Populate stages
-      S.stages = manifest.stages.map((s, i) => ({
-        name: s.name || "",
-        dataset: s.dataset || "",
-        hf_dataset: s.hf_dataset || "",
-        epochs: String(s.epochs ?? ""),
-        steps: String(s.steps ?? ""),
+      // The loaded manifest is the source of truth, exactly like the CLI:
+      // its base model replaces the form's, and every per-stage key
+      // (dpo, force, dpo_beta, …) is preserved — the editor only renders
+      // the five human fields, collectParams forwards the rest verbatim.
+      if (manifest.base_model) setVal("p-base", manifest.base_model);
+      S.stages = manifest.stages.slice(0, 24).map((s) => ({
+        ...(s && typeof s === "object" ? s : {}),
+        name: s?.name || "",
+        dataset: s?.dataset || "",
+        hf_dataset: s?.hf_dataset || "",
+        epochs: s?.epochs != null ? String(s.epochs) : "",
+        steps: s?.steps != null ? String(s.steps) : "",
       }));
       renderStages();
       updateRunSummary();
       schedulePreview();
       saveForm();
+      S.batchDir = null;
       toast(`Loaded ${manifest.stages.length} stage(s) from manifest`, "ok");
     } catch (e) {
       toast("Failed to load manifest: " + e.message, "bad");
@@ -1660,13 +1666,16 @@ function renderBatchResume(batch) {
     <div class="batch-resume-head">
       <div>
         <div class="batch-resume-title">Existing batch · ${done}/${total} stages complete</div>
-        <div class="batch-resume-sub">${next
-          ? `Resuming continues with stage ${(next.index ?? 0) + 1} — ${esc(next.name || "")} (finished stages are skipped, checkpoints preserved).`
-          : "All stages are complete — you can start fresh or review the results."}</div>
+        <div class="batch-resume-sub">${!batch.manifest_ok && next
+          ? "The batch's recorded manifest is missing, so it cannot be resumed from here. Re-run with the original --batch manifest via the CLI, or start fresh."
+          : next
+            ? `Resuming continues with stage ${(next.index ?? 0) + 1} — ${esc(next.name || "")} (finished stages are skipped, checkpoints preserved).`
+            : "All stages are complete — you can start fresh or review the results."}</div>
         <div class="batch-resume-path">${esc(batch.batch_dir || "")}</div>
       </div>
       <div class="batch-resume-actions">
-        <button type="button" class="btn primary small" id="btn-resume-batch"${next ? "" : " disabled"}>Resume batch</button>
+        <button type="button" class="btn primary small" id="btn-resume-batch"${next && batch.manifest_ok !== false ? "" : " disabled"}
+          ${next && batch.manifest_ok === false ? ' title="The batch\'s recorded manifest is missing on disk - resume from the CLI with the original --batch arguments."' : ""}>Resume batch</button>
         <button type="button" class="btn ghost small" id="btn-fresh-batch">Start fresh</button>
       </div>
     </div>
@@ -1913,6 +1922,10 @@ function syncView() {
   } else if ((state === "done" || state === "error")
              && (S.lastState === "running" || S.lastState === "stopping")) {
     S.view = "results";
+    // The resume decision belongs to the next run: dropping it here stops
+    // a stale batch_dir silently hijacking a later Start. The banner
+    // re-detects the (now more complete) batch on "New run".
+    S.batchDir = null;
   } else if (state === "idle" && S.view === "progress") {
     S.view = "setup";
   }
@@ -1926,8 +1939,12 @@ function renderView() {
     if (el) el.hidden = name !== S.view;
   }
   if (S.view === "progress") renderProgress(S.status || {});
-  if (S.view === "results") renderResults(S.status || {});
-  if (S.view === "setup") updateRunSummary();
+  else {
+    // Leave the live per-step tab title behind ("Reforge · 42%").
+    document.title = "Reforge";
+    if (S.view === "results") renderResults(S.status || {});
+    if (S.view === "setup") updateRunSummary();
+  }
 }
 
 function renderChip() {

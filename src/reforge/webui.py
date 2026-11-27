@@ -929,11 +929,13 @@ def _scan_batch_dirs(root: str) -> list:
             mtime = entry.stat().st_mtime
         except OSError:
             mtime = 0
+        manifest_path = state.get("manifest_path")
         found.append({
             "batch_dir": entry.path,
             "name": entry.name,
             "created_at": state.get("created_at"),
-            "manifest_path": state.get("manifest_path"),
+            "manifest_path": manifest_path,
+            "manifest_ok": bool(manifest_path) and os.path.isfile(manifest_path),
             "stages": stages,
             "complete": sum(1 for s in stages if s["status"] == "complete"),
             "total": len(stages),

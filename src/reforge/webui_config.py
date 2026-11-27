@@ -176,8 +176,14 @@ def build_argv(params: dict, strict: bool = True,
 
     out_dir = _resolve_output_dir(params, strict=strict)
 
-    numeric = {name: _parse_int(params, name) for name in _INT_FIELDS}
-    dpo_beta = _parse_dpo_beta(params)
+    # On resume the form's epoch/steps/beta are irrelevant (the recorded
+    # manifest wins) — don't let typos in unused fields block a resume.
+    if resume_dir:
+        numeric = {name: None for name in _INT_FIELDS}
+        dpo_beta = None
+    else:
+        numeric = {name: _parse_int(params, name) for name in _INT_FIELDS}
+        dpo_beta = _parse_dpo_beta(params)
 
     cmd = [sys.executable, "-m", "reforge"]
     if is_batch:
