@@ -1196,8 +1196,13 @@ function closeModal(modal) {
 
 /* ── API ──────────────────────────────────────────────────────────── */
 async function api(path, options) {
+  // Every request is time-bounded: a stalled connection must never hang a
+  // caller (the poller especially - a hung fetch used to freeze the whole
+  // polling loop, leaving the chip stuck on a stale state).
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 8000);
   try {
-    const res = await fetch(path, options);
+    const res = await fetch(path, { ...(options || {}), signal: controller.signal });
     let data = null;
     try { data = await res.json(); } catch (e) {}
     if (!data) data = { ok: false, error: "Empty response (HTTP " + res.status + ")" };
@@ -1206,7 +1211,14 @@ async function api(path, options) {
     }
     return data;
   } catch (e) {
-    return { ok: false, error: "Cannot reach the Reforge server: " + e.message };
+    const timedOut = e && e.name === "AbortError";
+    return {
+      ok: false,
+      error: (timedOut ? "Request timed out" : "Cannot reach the Reforge server")
+        + (e && e.message ? ": " + e.message : ""),
+    };
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -1894,25 +1906,36 @@ let polling = false;
 async function pollNow() {
   if (polling) return;
   polling = true;
-  const data = await api("/api/status");
-  polling = false;
-  if (data && !data.error) {
-    S.offline = false;
-    S.status = data;
-    const prevView = S.view;
-    syncView();
-    renderStatus();
-    // A state change (e.g. page loaded mid-run) must also toggle the DOM
-    // sections, not just the chip: renderStatus renders the current view's
-    // contents, renderView owns the section visibility.
-    if (S.view !== prevView) renderView();
-  } else {
+  try {
+    const data = await api("/api/status");
+    if (data && !data.error) {
+      S.offline = false;
+      S.status = data;
+      const prevView = S.view;
+      syncView();
+      renderStatus();
+      // A state change (e.g. page loaded mid-run) must also toggle the DOM
+      // sections, not just the chip: renderStatus renders the current view's
+      // contents, renderView owns the section visibility.
+      if (S.view !== prevView) renderView();
+    } else {
+      S.offline = true;
+      renderChip();
+    }
+  } catch (e) {
+    // A render bug must never kill the polling loop: settle the chip and
+    // keep polling.
     S.offline = true;
-    renderChip();
+    try { renderChip(); } catch (e2) {}
+  } finally {
+    // Always re-arm, even after a failure - a single bad poll used to end
+    // polling forever, freezing the dashboard on a stale (often "offline")
+    // chip while the server was actually fine.
+    polling = false;
+    clearTimeout(pollTimer);
+    const active = S.status?.state === "running" || S.status?.state === "stopping";
+    pollTimer = setTimeout(pollNow, active ? 900 : 1700);
   }
-  clearTimeout(pollTimer);
-  const active = S.status?.state === "running" || S.status?.state === "stopping";
-  pollTimer = setTimeout(pollNow, active ? 900 : 1700);
 }
 
 function syncView() {
@@ -1953,15 +1976,18 @@ function renderChip() {
   if (!chip || !text) return;
   let label = "Ready", cls = "idle";
   const st = S.status?.state;
-  if (S.offline) { label = "Server offline"; cls = "error"; }
+  if (S.offline) { label = "Reconnecting…"; cls = "stopping"; }
   else if (st === "running") { label = "Training"; cls = "running"; }
   else if (st === "stopping") { label = "Saving…"; cls = "stopping"; }
   else if (st === "done") { label = "Complete"; cls = "done"; }
   else if (st === "error") { label = "Failed"; cls = "error"; }
   chip.className = "status-pill " + cls;
   text.textContent = label;
+  chip.title = S.offline
+    ? "Lost contact with the local server — retrying every few seconds. Training runs in its own process and is not affected."
+    : "";
   const footer = $("#footer-state");
-  if (footer) footer.textContent = label.toLowerCase();
+  if (footer) footer.textContent = S.offline ? "reconnecting" : label.toLowerCase();
   const stop = $("#btn-stop-top");
   if (stop) stop.hidden = !(st === "running" || st === "stopping");
 }
