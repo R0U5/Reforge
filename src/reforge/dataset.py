@@ -586,6 +586,10 @@ def load_and_prepare_dataset(dataset_path, cleaning_mode, image_mode=False, base
             protected.add("image")
         cols_to_remove = [c for c in processed.column_names if c not in protected]
 
+        # Bound the arrow writer by TOKENS, not rows: at p95 15k
+        # tokens, 1,000 rows per batch commits hundreds of MB per
+        # flush and pushed native allocators into commit exhaustion.
+        wbs = 50 if image_mode else max(25, min(1000, 400_000 // max(1, auto_len)))
         tokenized = _map_resilient(
             processed,
             lambda e: tokenize(
@@ -598,7 +602,7 @@ def load_and_prepare_dataset(dataset_path, cleaning_mode, image_mode=False, base
             remove_columns=cols_to_remove,
             batched=False,
             num_proc=1 if image_mode else _num_proc,
-            writer_batch_size=50 if image_mode else 1000,
+            writer_batch_size=wbs,
             keep_in_memory=False,
         )
 
@@ -627,10 +631,16 @@ def load_and_prepare_dataset(dataset_path, cleaning_mode, image_mode=False, base
                 "REFORGE_MAX_LENGTH or provide shorter examples.")
 
         _info("Casting columns to tensor format...")
-        tokenized = tokenized.cast_column("input_ids", Sequence(Value("int64")))
-        tokenized = tokenized.cast_column("attention_mask", Sequence(Value("int64")))
-        tokenized = tokenized.cast_column("labels", Sequence(Value("int64")))
-        if "length" in tokenized.column_names:
+        # Arrow already stores Python ints as int64; only cast when the
+        # feature type actually differs, otherwise a large list column
+        # gets fully materialized for nothing.
+        _long = Sequence(Value("int64"))
+        for _col in ("input_ids", "attention_mask", "labels"):
+            if _col in tokenized.column_names \
+                    and tokenized.features[_col] != _long:
+                tokenized = tokenized.cast_column(_col, _long)
+        if "length" in tokenized.column_names \
+                and tokenized.features["length"] != Value("int32"):
             tokenized = tokenized.cast_column("length", Value("int32"))
 
         fmt_cols = ["input_ids", "attention_mask", "labels"]
