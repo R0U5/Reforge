@@ -99,6 +99,9 @@ python -m reforge dataset.parquet --base_model /path/to/model --agent
 | `--steps N` | Train for exactly N steps (overrides epoch) |
 | `--batch_size N` | Per-device batch size override (default: 1) |
 | `--grad_accum N` | Gradient accumulation steps override (default: model profile) |
+| `--max_length N` | Override auto (P95) max sequence length in tokens; min 128 |
+| `--truncate` | Force keeping rows longer than `--max_length` by left-truncating leading context (the trained reply and its trailing end-of-turn token survive). Default is **auto**: engages whenever any row would otherwise be dropped |
+| `--no_truncate` | Disable auto truncation; restore strict dropping of overlong rows |
 | `--force` | Disable early stopping |
 | `--agent` | Agent mode: NDJSON events on stdout + pollable `run_state.json` |
 | `--agent_schema` | Print the machine-readable agent contract as JSON and exit 0 (also: `reforge agent-schema`) |
@@ -158,7 +161,7 @@ Manifest format:
 }
 ```
 
-Per-stage keys map to the CLI flags: `dataset`/`hf_dataset`, `name`, `epochs`, `steps`, `force`, `dpo`, `dpo_beta`, `latex`, `code`, `batch_size`, `grad_accum`. A stage whose dataset has `chosen`+`rejected` columns trains as DPO automatically.
+Per-stage keys map to the CLI flags: `dataset`/`hf_dataset`, `name`, `epochs`, `steps`, `force`, `dpo`, `dpo_beta`, `latex`, `code`, `batch_size`, `grad_accum`, `max_length`, `truncate`/`no_truncate`. A stage whose dataset has `chosen`+`rejected` columns trains as DPO automatically.
 
 Behavior:
 
@@ -191,6 +194,7 @@ Behavior:
 - **Model profiles** — ships with tuned configs for Phi-2, Phi-3, Phi-3-Vision, and more. Falls back to sensible defaults for unlisted models.
 - **Smart early stopping** — EMA-based loss plateau/worsening detection with exposure floors, LR gates, and dynamic hard caps.
 - **Automatic sequence length** — measures token length distribution (P95) and sets `max_length` accordingly.
+- **Smart long-row handling** — rows longer than `max_length` are kept by left-truncating leading context (the trained reply and its trailing end-of-turn token survive), never silently dropped. Automatic; `--truncate`/`--no_truncate` override.
 - **Checkpoint resumption** — interrupted runs resume from the last checkpoint automatically.
 - **Cross-platform file picker** — native dialogs on all platforms.
 

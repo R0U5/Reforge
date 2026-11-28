@@ -44,6 +44,8 @@ _STAGE_FLAGS = {
     "code": "--code",
     "image": "--image",
     "dpo": "--dpo",
+    "truncate": "--truncate",
+    "no_truncate": "--no-truncate",
     "train_lm_head": "--train_lm_head",
     "no_tqdm": "--no_tqdm",
 }
@@ -108,7 +110,7 @@ def global_stage_defaults(parsed_args) -> dict:
         if value is not None:
             defaults[stage_key] = value
     for stage_key in ("force", "latex", "code", "image", "dpo",
-                      "train_lm_head"):
+                      "truncate", "no_truncate", "train_lm_head"):
         if getattr(parsed_args, stage_key, False):
             defaults[stage_key] = True
     return defaults

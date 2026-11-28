@@ -79,7 +79,7 @@ def _now() -> str:
 # v7: dataset_progress events report the dataset pipeline's sub-steps
 #     (length measurement, tokenization) so pollers can distinguish a
 #     working prepare phase from a stalled one.
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 
 # Status shown in run_state.json after each event type.
@@ -403,6 +403,15 @@ _EVENT_FIELDS = {
             "shuffle_seed": "int - shuffle seed used for the dataset",
             "max_length": "int - resolved max sequence length in tokens (auto P95 "
                           "or the --max_length / REFORGE_MAX_LENGTH override)",
+            "long_row_policy": '"truncate"|"drop" — what happened to rows longer '
+                               'than max_length (truncate = kept by left-trimming '
+                               'leading context; drop = discarded)',
+            "overlong_rows": "int - rows whose measured length exceeded max_length "
+                             "(before the policy was applied)",
+            "truncated_rows": "int - overlong rows kept by left-truncation "
+                              "(0 when the policy was drop)",
+            "dropped_rows": "int - overlong rows discarded (0 when the policy was "
+                            "truncate)",
         },
     },
     "dataset_progress": {

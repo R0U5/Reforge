@@ -84,6 +84,17 @@ def main():
     parser.add_argument('--max_length', type=int, default=None,
                         help="Override auto (P95) max sequence length in tokens; min 128. "
                              "Lower this on small-VRAM cards when the auto P95 OOMs at backward.")
+    parser.add_argument('--truncate', action='store_true',
+                        help="Force keeping rows longer than max_length by LEFT-truncating "
+                             "leading context (the trained reply and its trailing "
+                             "end-of-turn token are preserved). Default is AUTO: this "
+                             "happens automatically whenever any row would otherwise be "
+                             "dropped, which is required for long-context datasets "
+                             "(agent traces) on small-VRAM cards.")
+    parser.add_argument('--no_truncate', '--no-truncate', dest='no_truncate',
+                        action='store_true',
+                        help="Disable the auto truncation policy and restore strict "
+                             "dropping of rows longer than max_length.")
     parser.add_argument('--image',      action='store_true', help="Enable multimodal (image+text) training")
     parser.add_argument('--dpo',        action='store_true',
                          help="Force DPO training (normally auto-detected from chosen+rejected columns). "
@@ -391,6 +402,9 @@ def _dry_run(parsed_args) -> int:
                 "rows": rows,
                 "training_mode": training_mode,
                 "cleaning_mode": _resolve_cleaning_mode(parsed_args),
+                "truncate": ("forced-off" if getattr(parsed_args, "no_truncate", False)
+                             else True if getattr(parsed_args, "truncate", False)
+                             else "auto"),
                 "batch_size": batch_size,
                 "grad_accum": grad_accum,
                 "effective_batch": batch_size * grad_accum,
@@ -625,6 +639,8 @@ def _run_pipeline(parsed_args, image_mode, output_dir, merge_dir, merge_success_
         merge_success_flag=merge_success_flag,
         force_dpo=bool(parsed_args.dpo),
         max_length_override=getattr(parsed_args, "max_length", None),
+        truncate=(False if getattr(parsed_args, "no_truncate", False)
+                  else True if getattr(parsed_args, "truncate", False) else None),
     )
     BRIDGE.emit(
         "dataset_loaded",
@@ -639,6 +655,10 @@ def _run_pipeline(parsed_args, image_mode, output_dir, merge_dir, merge_success_
         cleaning_mode=schema_info["cleaning_mode"],
         shuffle_seed=schema_info["shuffle_seed"],
         max_length=schema_info.get("max_length"),
+        long_row_policy=schema_info.get("long_row_policy"),
+        overlong_rows=schema_info.get("overlong_rows"),
+        truncated_rows=schema_info.get("truncated_rows"),
+        dropped_rows=schema_info.get("dropped_rows"),
     )
 
     model, trainer, training_error = run_training(

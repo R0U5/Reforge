@@ -24,7 +24,7 @@ from .config import OUTPUT_DIR
 
 # Numeric fields accepted from the form: name -> (coerce, minimum)
 _INT_FIELDS = ("epoch", "steps", "batch_size", "grad_accum", "max_length")
-_FLAG_FIELDS = ("force", "latex", "code", "image", "dpo", "train_lm_head")
+_FLAG_FIELDS = ("force", "latex", "code", "image", "dpo", "truncate", "train_lm_head")
 
 
 def _as_bool(v) -> bool:
