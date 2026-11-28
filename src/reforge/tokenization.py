@@ -199,6 +199,25 @@ def _align_boundary(full_ids, prompt_ids, content, tokenizer) -> int:
     return boundary
 
 
+def _truncate_left(input_ids, attention_mask, boundary, max_length):
+    """Keep the tail of a sequence, dropping leading context only.
+
+    Right-truncation would cut the trained reply's trailing end-of-turn
+    token (teaching the model to never stop). Dropping the row loses the
+    data. Left-truncation keeps both the reply and its EOS: only the
+    oldest context is discarded. ``boundary`` (first supervised token
+    index) is shifted by the number of dropped tokens, clamped at 0, so
+    the label mask stays aligned with the reply.
+    """
+    n = len(input_ids)
+    if n <= max_length or max_length <= 0:
+        return input_ids, attention_mask, boundary
+    start = n - max_length
+    new_mask = (list(attention_mask[start:]) if attention_mask
+                else [1] * max_length)
+    return list(input_ids[start:]), new_mask, max(0, boundary - start)
+
+
 def _decode_image(raw):
     if isinstance(raw, PILImage.Image):
         return raw.convert("RGB")
@@ -211,7 +230,15 @@ def _decode_image(raw):
     raise ValueError(f"Cannot decode image from type: {type(raw)}")
 
 
-def tokenize(example, tokenizer, training_mode="sft", max_length=750, processor=None):
+def tokenize(example, tokenizer, training_mode="sft", max_length=750, processor=None,
+             truncate=False):
+    """Tokenize one example to {input_ids, attention_mask, labels}.
+
+    When ``truncate`` is False (default), rows longer than ``max_length``
+    are dropped (empty input_ids) to preserve EOS supervision. When True,
+    such rows are kept by left-truncating the leading context, so the
+    trained reply and its trailing end-of-turn token survive.
+    """
     if processor is not None and training_mode == "multimodal" and "image" in example:
         try:
             image = _decode_image(example["image"])
@@ -293,7 +320,7 @@ def tokenize(example, tokenizer, training_mode="sft", max_length=750, processor=
             # never stop. Overlong rows are dropped instead (see below).
             input_ids, attention_mask = _apply_chat_template_ids(
                 tokenizer, messages, add_generation_prompt=False)
-            if len(input_ids) > max_length:
+            if len(input_ids) > max_length and not truncate:
                 return {"input_ids": [], "attention_mask": [], "labels": [], "length": len(input_ids)}
 
             # Everything before the final assistant message is the prompt.
@@ -308,6 +335,10 @@ def tokenize(example, tokenizer, training_mode="sft", max_length=750, processor=
                 input_ids, attention_mask = _causal_tokenize(
                     _join_chat_text(messages), tokenizer, max_length)
                 boundary = 0
+            elif len(input_ids) > max_length:
+                # Keep the final assistant turn (+ EOS); drop oldest context.
+                input_ids, attention_mask, boundary = _truncate_left(
+                    input_ids, attention_mask, boundary, max_length)
         else:
             # No assistant turn, or no chat template (template-less
             # tokenizers would raise inside apply_chat_template) — train
@@ -344,7 +375,7 @@ def tokenize(example, tokenizer, training_mode="sft", max_length=750, processor=
                 [{"role": "user", "content": question},
                  {"role": "assistant", "content": answer}],
                 add_generation_prompt=False)
-            if len(input_ids) > max_length:
+            if len(input_ids) > max_length and not truncate:
                 return {"input_ids": [], "attention_mask": [], "labels": [], "length": len(input_ids)}
 
             # Tokenize ONLY the user message (question) with same chat template to find boundary
@@ -361,6 +392,10 @@ def tokenize(example, tokenizer, training_mode="sft", max_length=750, processor=
                 # Fallback: causal on full text
                 input_ids, attention_mask = _causal_tokenize(text, tokenizer, max_length)
                 boundary = 0
+            elif len(input_ids) > max_length:
+                # Keep the answer (+ EOS); drop oldest prompt context.
+                input_ids, attention_mask, boundary = _truncate_left(
+                    input_ids, attention_mask, boundary, max_length)
         else:
             # No separator or no question - treat as causal
             input_ids, attention_mask = _causal_tokenize(text, tokenizer, max_length)
@@ -431,7 +466,7 @@ def _map_resilient(ds, fn, **kwargs):
         return ds.map(fn, num_proc=1, **kwargs)
 
 
-def measure_lengths(ds, tokenizer, training_mode=None):
+def measure_lengths(ds, tokenizer, training_mode=None, max_length_override=None):
 
     def _template_len(tokenizer, messages) -> int | None:
         """Token length of a conversation under its chat template, or None."""
@@ -501,10 +536,14 @@ def measure_lengths(ds, tokenizer, training_mode=None):
     p50 = int(np.percentile(lengths, 50))
     p95 = int(np.percentile(lengths, 95))
     p99 = int(np.percentile(lengths, 99))
-    # Explicit override wins (e.g. REFORGE_MAX_LENGTH=512) — needed on 12 GB
-    # cards where the P95-derived length oversubscribes VRAM via WDDM paging.
-    override = os.environ.get("REFORGE_MAX_LENGTH", "").strip()
-    if override:
+    # Explicit wins, in order: --max_length argument > REFORGE_MAX_LENGTH env
+    # var > auto (P95). The override exists because a 248k-vocab model on a
+    # 12 GB card OOMs at backward when the P95-derived length oversubscribes
+    # VRAM via WDDM paging — the logits chain scales with vocab x seq_len.
+    if max_length_override is not None:
+        auto_len = max(128, int(max_length_override))
+        _info(f"Lengths — p50: {p50}  p95: {p95}  p99: {p99}  →  max_length set by --max_length to {auto_len}")
+    elif (override := os.environ.get("REFORGE_MAX_LENGTH", "")).strip():
         auto_len = max(128, int(override))
         _info(f"Lengths — p50: {p50}  p95: {p95}  p99: {p99}  →  max_length OVERRIDDEN to {auto_len}")
     else:

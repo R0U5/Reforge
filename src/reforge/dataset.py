@@ -420,7 +420,7 @@ def synthesize_prompt_dataset(raw_dataset, col_question, col_chosen, col_rejecte
     return processed
 
 
-def load_and_prepare_dataset(dataset_path, cleaning_mode, image_mode=False, base_model_override=None, output_dir=None, merge_dir=None, merge_success_flag=None, force_dpo=False):
+def load_and_prepare_dataset(dataset_path, cleaning_mode, image_mode=False, base_model_override=None, output_dir=None, merge_dir=None, merge_success_flag=None, force_dpo=False, max_length_override=None, truncate=None):
     from transformers import AutoTokenizer, AutoProcessor
 
     _num_proc = _pool_workers()
@@ -562,7 +562,7 @@ def load_and_prepare_dataset(dataset_path, cleaning_mode, image_mode=False, base
     _banner("Tokenization")
     _info("Measuring sequence lengths...")
     BRIDGE.emit("dataset_progress", substep="measuring", rows=processed.num_rows)
-    processed, auto_len = measure_lengths(processed, tokenizer, training_mode=training_mode)
+    processed, auto_len = measure_lengths(processed, tokenizer, training_mode=training_mode, max_length_override=max_length_override)
     if image_mode:
         # measure_lengths sees text only. The vision processor expands each
         # <|image_n|> tag into hundreds/thousands of image-placeholder
@@ -571,6 +571,35 @@ def load_and_prepare_dataset(dataset_path, cleaning_mode, image_mode=False, base
         auto_len = max(auto_len, 4096)
         _info(f"Multimodal: max_length floor 4096 to fit image tokens -> {auto_len}")
 
+    # ---- smart long-row policy --------------------------------------------
+    # Dropping overlong rows (the historical behaviour) preserves EOS only by
+    # throwing the whole row away -- on long-context data (agent traces at 7k+
+    # tokens) that discards nearly everything and fails the run. Instead, keep
+    # them by LEFT-truncating the leading context: the trained reply and its
+    # trailing end-of-turn token both survive. ``truncate`` is tri-state:
+    # None = auto (keep overlong rows when any exist); True/False force it.
+    # Multimodal stays drop-only (image tokens sit at the start; truncating
+    # them would corrupt the vision input).
+    overlong = 0
+    if image_mode:
+        effective_truncate = bool(truncate)
+    else:
+        try:
+            _lengths = processed["length"]
+        except (KeyError, TypeError):
+            _lengths = []
+        overlong = sum(1 for _l in _lengths if _l > auto_len)
+        effective_truncate = (overlong > 0) if truncate is None else bool(truncate)
+        if overlong:
+            _pct = 100.0 * overlong / max(1, len(_lengths))
+            if effective_truncate:
+                _info(f"Long rows: {overlong:,} ({_pct:.1f}%) exceed max_length="
+                      f"{auto_len} -> kept by left-truncation (reply + EOS preserved)")
+            else:
+                _info(f"Long rows: {overlong:,} ({_pct:.1f}%) exceed max_length="
+                      f"{auto_len} -> dropped")
+
+    dropped_actual = 0
     if training_mode == "dpo":
         # TRL's DPOTrainer tokenizes prompt/chosen/rejected internally
         # (applying the chat template for conversational rows). The P95
@@ -597,7 +626,8 @@ def load_and_prepare_dataset(dataset_path, cleaning_mode, image_mode=False, base
                 tokenizer=tokenizer,
                 training_mode=training_mode,
                 max_length=auto_len,
-                processor=processor
+                processor=processor,
+                truncate=effective_truncate,
             ),
             remove_columns=cols_to_remove,
             batched=False,
@@ -621,8 +651,12 @@ def load_and_prepare_dataset(dataset_path, cleaning_mode, image_mode=False, base
                 lambda e: len(e["input_ids"]) > 0
             )
             dropped = before - len(tokenized)
+            dropped_actual = dropped
             if dropped:
-                _warn(f"Dropped {dropped} rows longer than max_length (kept out to preserve <|im_end|> supervision)")
+                _warn(f"Dropped {dropped} rows longer than max_length (kept out to preserve <|im_end|> supervision); pass --truncate to keep them")
+            elif effective_truncate and overlong:
+                _info(f"Kept {overlong:,} overlong rows by left-truncating leading "
+                      "context (reply + end-of-turn token preserved)")
 
         if len(tokenized) == 0:
             raise ValueError(
@@ -668,6 +702,11 @@ def load_and_prepare_dataset(dataset_path, cleaning_mode, image_mode=False, base
         },
         "cleaning_mode": effective_mode,
         "shuffle_seed": shuffle_seed,
+        "max_length": auto_len,
+        "long_row_policy": "truncate" if effective_truncate else "drop",
+        "overlong_rows": overlong,
+        "truncated_rows": overlong if effective_truncate else 0,
+        "dropped_rows": 0 if effective_truncate else dropped_actual,
     }
     return train_dataset, eval_dataset, tokenizer, training_mode, model_name, processor, schema_info
 

@@ -742,6 +742,7 @@ INDEX_HTML = r"""<!doctype html>
               <div class="field"><label for="p-steps">Fixed steps</label><input type="text" id="p-steps" placeholder="—" inputmode="numeric"><div class="field-hint">Overrides epochs</div></div>
               <div class="field"><label for="p-batch">Batch size</label><input type="text" id="p-batch" placeholder="1" inputmode="numeric"></div>
               <div class="field"><label for="p-grad">Grad accumulation</label><input type="text" id="p-grad" placeholder="Profile default" inputmode="numeric"></div>
+              <div class="field"><label for="p-maxlen">Max length</label><input type="text" id="p-maxlen" placeholder="Auto (P95)" inputmode="numeric"><div class="field-hint">Tokens; lower for VRAM</div></div>
             </div>
             <div class="toggle-grid">
               <label class="toggle"><span class="switch"><input type="checkbox" id="p-force"><span class="track"></span></span><span><b>Force full run</b><small>Disable EMA early stopping</small></span></label>
@@ -756,6 +757,7 @@ INDEX_HTML = r"""<!doctype html>
               <label class="toggle"><span class="switch"><input type="checkbox" id="p-code"><span class="track"></span></span><span><b>Preserve code</b><small>Keep indentation and formatting</small></span></label>
               <label class="toggle"><span class="switch"><input type="checkbox" id="p-image"><span class="track"></span></span><span><b>Multimodal</b><small>Image + text training</small></span></label>
               <label class="toggle"><span class="switch"><input type="checkbox" id="p-dpo"><span class="track"></span></span><span><b>DPO</b><small>Preference-pair tuning</small></span></label>
+              <label class="toggle"><span class="switch"><input type="checkbox" id="p-truncate"><span class="track"></span></span><span><b>Truncate long rows</b><small>Keep the reply, drop oldest context</small></span></label>
             </div>
             <div class="field dpo-field">
               <label for="p-dpo-beta">DPO beta</label>
@@ -1062,7 +1064,7 @@ const THEME_KEY = "reforge.theme";
 const PERSIST_INPUTS = ["p-base", "p-out", "p-ds", "p-hf", "p-epoch",
   "p-steps", "p-batch", "p-grad", "p-dpo-beta"];
 const PERSIST_CHECKS = ["p-force", "p-lmhead", "p-latex", "p-code",
-  "p-image", "p-dpo"];
+  "p-image", "p-dpo", "p-truncate"];
 
 const S = {
   status: null,
@@ -1445,6 +1447,7 @@ function collectParams() {
     steps: val("p-steps"),
     batch_size: val("p-batch"),
     grad_accum: val("p-grad"),
+    max_length: val("p-maxlen"),
     dpo_beta: val("p-dpo-beta"),
     force: checked("p-force"),
     train_lm_head: checked("p-lmhead"),
@@ -1452,6 +1455,7 @@ function collectParams() {
     code: checked("p-code"),
     image: checked("p-image"),
     dpo: checked("p-dpo"),
+    truncate: checked("p-truncate"),
   };
   if (S.mode === "batch") {
     if (S.batchDir) {
@@ -2277,6 +2281,13 @@ function renderPlan(st) {
   if (info.eval_rows != null) rows.push(kvRow("Eval rows", fmtInt(info.eval_rows)));
   if (info.columns != null) rows.push(kvRow("Columns", String(info.columns)));
   if (info.cleaning_mode) rows.push(kvRow("Cleaning", info.cleaning_mode));
+  if (info.max_length != null) rows.push(kvRow("Max length", fmtInt(info.max_length) + " tok"));
+  if (info.long_row_policy) {
+    const pol = info.long_row_policy === "truncate"
+      ? `truncate · kept ${fmtInt(info.truncated_rows || 0)}`
+      : `drop · ${fmtInt(info.dropped_rows || 0)} lost`;
+    rows.push(kvRow("Long rows", pol));
+  }
   if (plan.lr != null) rows.push(kvRow("Learning rate", Number(plan.lr).toExponential(2)));
   if (plan.batch_size != null) rows.push(kvRow("Batch size", String(plan.batch_size)));
   if (plan.grad_accum != null) rows.push(kvRow("Grad accum", String(plan.grad_accum)));

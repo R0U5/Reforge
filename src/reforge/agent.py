@@ -79,7 +79,7 @@ def _now() -> str:
 # v7: dataset_progress events report the dataset pipeline's sub-steps
 #     (length measurement, tokenization) so pollers can distinguish a
 #     working prepare phase from a stalled one.
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 9
 
 
 # Status shown in run_state.json after each event type.
@@ -132,8 +132,10 @@ _ERROR_PATTERNS = [
      "rename columns or pick a mode-appropriate dataset."),
     ("out of memory",
      "cuda_oom",
-     "GPU ran out of VRAM. Lower --batch_size (default 1), lower --grad_accum "
-     "does not help VRAM but slows steps, or use a smaller base model."),
+     "GPU ran out of VRAM. Lower --max_length (auto P95 can oversubscribe "
+     "VRAM on small cards; 512-1024 is a good first cut), confirm "
+     "--batch_size is 1 (lower --grad_accum does not help VRAM but slows "
+     "steps), or use a smaller base model."),
     ("not enough data to train",
      "dataset_too_small",
      "Dataset has too few rows for even one optimizer step. Provide more rows "
@@ -398,7 +400,18 @@ _EVENT_FIELDS = {
             "columns": "list[str] — raw dataset columns",
             "mapped_roles": "dict — {question, chosen, rejected, image} -> column",
             "cleaning_mode": 'str — "math", "latex", "code", or "latex+code"',
-            "shuffle_seed": "int — shuffle seed used for the dataset",
+            "shuffle_seed": "int - shuffle seed used for the dataset",
+            "max_length": "int - resolved max sequence length in tokens (auto P95 "
+                          "or the --max_length / REFORGE_MAX_LENGTH override)",
+            "long_row_policy": '"truncate"|"drop" — what happened to rows longer '
+                               'than max_length (truncate = kept by left-trimming '
+                               'leading context; drop = discarded)',
+            "overlong_rows": "int - rows whose measured length exceeded max_length "
+                             "(before the policy was applied)",
+            "truncated_rows": "int - overlong rows kept by left-truncation "
+                              "(0 when the policy was drop)",
+            "dropped_rows": "int - overlong rows discarded (0 when the policy was "
+                            "truncate)",
         },
     },
     "dataset_progress": {
@@ -695,7 +708,90 @@ def build_agent_schema(parser=None) -> dict:
             "REFORGE_AGENT": '"1" enables agent mode (same as --agent)',
             "REFORGE_MODELS_DIR": "model scan dir (default ~/HF_Models)",
             "REFORGE_OUTPUT_DIR": "default output dir (default ~/Reforge_Output)",
+            "REFORGE_MAX_LENGTH": "token cap overriding the auto (P95) max_length; "
+                                 "--max_length flag takes precedence over this",
             "HF_HOME": "HF cache root (default ~/.cache/huggingface)",
+        },
+        "vram_and_memory": {
+            "why_this_section": "LoRA fine-tuning OOMs at BACKWARD, not at load: a "
+                                "run can pass step 1 and die on step 2. Read this "
+                                "before launching anything on a small card.",
+            "built_in_mitigations": [
+                "4-bit NF4 double-quantized base via bitsandbytes (bf16 compute)",
+                "LoRA on attention projections only (q/k/v/o); lm_head frozen "
+                "unless --train_lm_head",
+                "gradient checkpointing (use_reentrant=False) + paged_adamw_8bit "
+                "(optimizer states page to CPU)",
+                "chunked cross-entropy: the loss is computed in 128-token chunks so "
+                "the fp32 [batch, seq, vocab] loss tensor never materializes whole",
+                "max_length auto-set to the P95 of tokenized row lengths (capped by "
+                "the model context), so sequence length follows the data",
+            ],
+            "what_scales_with_vocab": "The model forward materializes bf16 logits "
+                                      "[1, max_length, vocab] BEFORE the chunked loss "
+                                      "runs, and backward adds a contiguous copy plus a "
+                                      "gradient of the same shape. On a 248k-vocab model "
+                                      "that chain is ~0.5 GB per 1024 tokens of "
+                                      "max_length. This is the primary OOM lever.",
+            "max_length_rules": [
+                "Precedence: --max_length flag > REFORGE_MAX_LENGTH env var > auto P95 "
+                "(min 128). The resolved value is emitted in the dataset_loaded event "
+                "as max_length — check it BEFORE the first step, not after an OOM.",
+                "Auto P95 is honest for small-vocab models but can oversubscribe VRAM "
+                "on 12 GB cards with large-vocab (200k+) models, especially under "
+                "Windows WDDM paging where the desktop holds ~1-1.5 GB outside PyTorch.",
+                "On a 12 GB card with a large-vocab model, set --max_length 768-1024 "
+                "up front. It is cheap insurance; rows longer than max_length are "
+                "DROPPED (not truncated) to preserve EOS supervision, so a lower cap "
+                "costs data coverage, not correctness.",
+                "Raising max_length mid-chain is a data tradeoff: measure the "
+                "dropped-row rate from the dataset_loaded rows count before/after.",
+            ],
+            "other_rules": [
+                "batch_size must be 1 on 12 GB cards. grad_accum does NOT reduce "
+                "VRAM — it only scales effective batch; lower it only to slow steps "
+                "down, never to fix an OOM.",
+                "On an OOM: confirm nothing else holds VRAM (an idle LLM server with "
+                "a loaded model can eat several GB — unload it first), then lower "
+                "--max_length before touching anything else.",
+                "An OOM mid-training saves an emergency_adapter/ in the stage dir; "
+                "training resumes from checkpoint-last, not from the emergency "
+                "adapter.",
+            ],
+        },
+        "batch_operations": {
+            "when_to_batch": "Multi-dataset rounds that chain on one base: stage N "
+                             "trains on stage N-1's merged model. Use a manifest for "
+                             "per-stage control; inline dataset lists share global flags.",
+            "manifest": "JSON: {base_model, stages: [{dataset|hf_dataset, name, epochs, "
+                        "steps, batch_size, grad_accum, max_length, dpo_beta, force, "
+                        "latex, code, ...}]}. Per-stage keys override global CLI flags.",
+            "launch_rules": [
+                "Launch long or merge-touching runs OS-owned (Scheduled Task + a "
+                "hidden window wrapper), never as a child of a single tool call: a "
+                "child process is killed when the call ends, and a kill mid-merge "
+                "leaves merged/ with config but no weights — indistinguishable from "
+                "a real merge failure unless you check for the wrapper's EXITCODE.",
+                "Poll progress by reading the --agent_log NDJSON tail or run_state.json "
+                "on a delay; never hold one exec session open across a multi-hour run.",
+                "Stage failure triage order: 1) tail the stage's agent.ndjson / "
+                "run_state.json error field — the real error (e.g. cuda_oom) is there "
+                "even when the dashboard only shows a frozen progress bar; "
+                "2) check batch_state.json for which stage failed; 3) resume with "
+                "--batch_dir <dir> (completed stages skip, the failed stage resumes "
+                "from its own checkpoint-last).",
+                "Each stage writes its own <stage_dir>/run_state.json and agent.ndjson; "
+                "the batch root also gets batch_state.json + run_state.json.",
+            ],
+            "chaining_rules": [
+                "A stage chains onto the previous merged model only if that stage's "
+                "merged/success.txt exists. No marker = the round did not land; "
+                "Reforge refuses to overwrite and the batch stops.",
+                "Never delete a merged/ that holds the only copy of a model — rename "
+                "it aside for inspection.",
+                "Loading a NEW dataset name purges existing checkpoints in the stage "
+                "output dir at load time; copy irreplaceable adapters out first.",
+            ],
         },
         "exit_codes": _EXIT_CODES_DOC,
         "events": _EVENT_FIELDS,
@@ -782,7 +878,8 @@ def build_agent_schema(parser=None) -> dict:
                               "merged model is the final output",
                 },
                 "stage_keys": "dataset | hf_dataset (required), plus: name, epochs, steps, "
-                              "force, dpo, dpo_beta, latex, code, batch_size, grad_accum",
+                              "force, dpo, dpo_beta, latex, code, batch_size, grad_accum, "
+                              "max_length (tokens; overrides auto P95; min 128)",
                 "note": "a stage whose dataset has chosen+rejected columns trains as DPO "
                         "automatically - no special batch keys needed",
             },

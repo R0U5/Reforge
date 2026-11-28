@@ -339,12 +339,27 @@ class Job:
                 self.base_model = ev.get("base_model") or self.base_model
                 self.dataset_info = {k: ev.get(k) for k in (
                     "rows", "eval_rows", "columns", "mapped_roles",
-                    "cleaning_mode", "shuffle_seed")}
+                    "cleaning_mode", "shuffle_seed", "max_length",
+                    "long_row_policy", "overlong_rows", "truncated_rows",
+                    "dropped_rows")}
                 rows = ev.get("rows")
                 rows_txt = f" · {rows:,} rows" if isinstance(rows, int) else ""
                 mode = ev.get("training_mode") or "dataset"
                 self._signal("dataset_loaded",
                              f"Dataset ready{rows_txt} · {mode}", "info")
+                _policy = ev.get("long_row_policy")
+                _long = ev.get("overlong_rows")
+                if _policy == "truncate" and _long:
+                    self._signal(
+                        "long_rows",
+                        f"Kept {_long:,} long rows by left-truncation "
+                        f"(max_length {ev.get('max_length')}) — reply + EOS preserved",
+                        "warn")
+                elif _policy == "drop" and ev.get("dropped_rows"):
+                    self._signal(
+                        "long_rows",
+                        f"Dropped {ev['dropped_rows']:,} rows longer than "
+                        f"max_length {ev.get('max_length')}", "warn")
             elif event == "training_started":
                 self._reset_training_metrics()
                 self.total_steps = int(ev.get("total_steps") or 0)

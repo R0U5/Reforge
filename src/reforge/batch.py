@@ -44,6 +44,8 @@ _STAGE_FLAGS = {
     "code": "--code",
     "image": "--image",
     "dpo": "--dpo",
+    "truncate": "--truncate",
+    "no_truncate": "--no-truncate",
     "train_lm_head": "--train_lm_head",
     "no_tqdm": "--no_tqdm",
 }
@@ -52,6 +54,7 @@ _STAGE_VALUES = {
     "steps": "--steps",
     "batch_size": "--batch_size",
     "grad_accum": "--grad_accum",
+    "max_length": "--max_length",
     "dpo_beta": "--dpo_beta",
 }
 _STAGE_KEYS = set(_STAGE_FLAGS) | set(_STAGE_VALUES) | {"dataset", "hf_dataset", "name"}
@@ -101,12 +104,13 @@ def global_stage_defaults(parsed_args) -> dict:
     for stage_key, arg_key in (("steps", "steps"),
                                ("batch_size", "batch_size"),
                                ("grad_accum", "grad_accum"),
+                               ("max_length", "max_length"),
                                ("dpo_beta", "dpo_beta")):
         value = getattr(parsed_args, arg_key, None)
         if value is not None:
             defaults[stage_key] = value
     for stage_key in ("force", "latex", "code", "image", "dpo",
-                      "train_lm_head"):
+                      "truncate", "no_truncate", "train_lm_head"):
         if getattr(parsed_args, stage_key, False):
             defaults[stage_key] = True
     return defaults
@@ -156,14 +160,15 @@ def validate_manifest(manifest, base_model):
                     raise _BatchError(f"Stage {i + 1}: '{key}' must be an integer")
                 if stage[key] < lo:
                     raise _BatchError(f"Stage {i + 1}: '{key}' must be >= {lo}")
-        for key in ("batch_size", "grad_accum"):
+        for key in ("batch_size", "grad_accum", "max_length"):
             if key in stage:
                 try:
                     stage[key] = int(stage[key])
                 except (TypeError, ValueError):
                     raise _BatchError(f"Stage {i + 1}: '{key}' must be an integer")
-                if stage[key] < 1:
-                    raise _BatchError(f"Stage {i + 1}: '{key}' must be >= 1")
+                lo = 128 if key == "max_length" else 1
+                if stage[key] < lo:
+                    raise _BatchError(f"Stage {i + 1}: '{key}' must be >= {lo}")
         if "dpo_beta" in stage:
             try:
                 stage["dpo_beta"] = float(stage["dpo_beta"])

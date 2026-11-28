@@ -156,6 +156,16 @@ how your columns were mapped (`mapped_roles`) and which cleaning mode ran
 Note: cleaning strips LaTeX, HTML, markdown artifacts, emoji, and e-commerce
 noise by default — pass `--latex` or `--code` when that content is the point.
 
+**Long rows.** A row longer than the resolved `max_length` is kept by
+**left-truncating its leading context** (the trained reply and its trailing
+`<|im_end|>` both survive — EOS supervision stays intact). This is automatic
+whenever any row would otherwise be dropped; `--truncate` forces it on and
+`--no_truncate` restores strict dropping. The `dataset_loaded` event reports
+`long_row_policy` (`"truncate"`/`"drop"`), `overlong_rows`, `truncated_rows`,
+and `dropped_rows`, so agents can verify what happened without guessing. Use
+the auto policy for long-context data (agent traces); a lower `max_length`
+then costs context length, not rows.
+
 ## 7. Preflight before a real run
 
 ```bash
