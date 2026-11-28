@@ -135,6 +135,16 @@ def main():
     parser.add_argument('--no_tqdm', action='store_true',
                         help="Disable the tqdm progress bar and emit clean loss lines instead "
                              "(the web UI sets this automatically)")
+    parser.add_argument('--watchdog', action='store_true',
+                        help="Agent/batch mode: supervise this run with the training watchdog "
+                             "(auto-resume on crash, graceful stop via `reforge watchdog stop`, "
+                             "see docs/watchdog-fmea.md)")
+    parser.add_argument('--watchdog_stale', type=int, default=180,
+                        help="Watchdog: seconds without a run_state heartbeat before the run "
+                             "is considered hung/dead (default: 180)")
+    parser.add_argument('--watchdog_grace', type=int, default=1200,
+                        help="Watchdog: startup grace in seconds before staleness checks apply "
+                             "(covers dataset loading/tokenization; default: 1200)")
     parsed_args, _unknown_args = parser.parse_known_args()
     image_mode = parsed_args.image
 
@@ -178,6 +188,46 @@ def main():
                  f"--batch_dir {parsed_args.batch_dir}")
             raise SystemExit(2)
         parsed_args.batch = [_recorded]
+
+    # --watchdog: supervise this batch run instead of running it bare. The
+    # watchdog re-spawns the identical command (minus --watchdog*) as a child
+    # process and owns crash recovery, manual stop, and relaunch gating.
+    # See docs/watchdog-fmea.md for the failure-mode analysis it implements.
+    if getattr(parsed_args, "watchdog", False):
+        if not agent_mode or not parsed_args.batch:
+            _err("--watchdog requires agent/batch mode: --agent --batch <manifest.json>")
+            raise SystemExit(2)
+        from reforge.watchdog import Watchdog
+        _extra: list[str] = []
+        for _flag, _val in (("--force", parsed_args.force), ("--latex", parsed_args.latex),
+                            ("--code", parsed_args.code), ("--image", parsed_args.image),
+                            ("--dpo", parsed_args.dpo), ("--train_lm_head", parsed_args.train_lm_head),
+                            ("--no_truncate", parsed_args.no_truncate), ("--no_tqdm", parsed_args.no_tqdm)):
+            if _val:
+                _extra.append(_flag)
+        if parsed_args.truncate:
+            _extra.append("--truncate")
+        for _key in ("epoch", "steps", "batch_size", "grad_accum", "max_length", "dpo_beta"):
+            _val = getattr(parsed_args, _key, None)
+            if _val is not None:
+                _extra += [f"--{_key}", str(_val)]
+        if parsed_args.hf_dataset:
+            _extra += ["--hf_dataset", parsed_args.hf_dataset]
+        if parsed_args.output_dir:
+            _extra += ["--output_dir", parsed_args.output_dir]
+        _wd = Watchdog(argparse.Namespace(
+            batch=parsed_args.batch[0],
+            batch_dir=parsed_args.batch_dir,
+            base_model=parsed_args.base_model,
+            agent_log=parsed_args.agent_log,
+            stop_file=None,
+            startup_grace=parsed_args.watchdog_grace,
+            stale_threshold=parsed_args.watchdog_stale,
+            dry_run=False,
+            extra_child_args=_extra,
+            discover_root=str(OUTPUT_DIR),
+        ))
+        raise SystemExit(_wd.run())
 
     # `--dry_run`: non-interactive preflight, also keeps stdout pure JSON.
     if parsed_args.dry_run:
